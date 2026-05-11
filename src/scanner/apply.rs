@@ -1,0 +1,518 @@
+//! Evidence-to-device merge helpers for scanner phases.
+//!
+//! Protocol collectors return small, protocol-shaped records. This module is
+//! the boundary where those records become the common `Device` model: raw
+//! evidence is preserved, best guesses are updated by confidence, and services
+//! are attached without letting one protocol erase another.
+
+use crate::{
+    dhcp, enrich,
+    model::Device,
+    probes::{deep, smb, snmp, upnp},
+};
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::IpAddr,
+};
+
+pub(super) fn apply_mdns_info(device: &mut Device, mdns: enrich::MdnsInfo) {
+    // mDNS is usually name-rich and often model-rich. Store the raw model as
+    // evidence before promoting it so identity rules can still inspect it even
+    // if another source later wins the best-guess slot.
+    for name in mdns.names {
+        device.add_name(name, "mdns", 0.9);
+    }
+    if let Some(model) = mdns.model {
+        device.add_evidence("mdns", "model", model.clone(), 0.85);
+        device.set_model_guess(model.clone(), "mdns", 0.85);
+        device.set_device_type_guess(model, "mdns", 0.65);
+    }
+    if let Some(os) = mdns.os {
+        device.set_os_guess(os, "mdns", 0.85);
+    }
+    for service in mdns.services {
+        device.add_service(service.name, "mdns", service.port, 0.75);
+    }
+}
+
+pub(super) fn apply_upnp_info(device: &mut Device, info: upnp::UpnpInfo) {
+    // UPnP descriptions provide both human labels and structured device types.
+    // Keep the raw URN in evidence and expose the friendly type as the guess.
+    for name in info.names {
+        device.add_name(name, "upnp", 0.85);
+    }
+    if let Some(manufacturer) = info.manufacturer {
+        device.set_make_guess(manufacturer.clone(), "upnp", 0.8);
+        device.add_evidence("upnp", "manufacturer", manufacturer, 0.8);
+    }
+    if let Some(model) = info.model {
+        device.set_model_guess(model.clone(), "upnp", 0.85);
+        device.add_evidence("upnp", "model", model.clone(), 0.85);
+        device.set_device_type_guess(model, "upnp", 0.6);
+    }
+    if let Some(device_type) = info.device_type {
+        let friendly = upnp::friendly_device_type(&device_type);
+        device.add_evidence("upnp", "device_type", device_type, 0.8);
+        device.set_device_type_guess(friendly, "upnp", 0.75);
+    }
+    if let Some(server) = info.server {
+        device.add_evidence("upnp", "server", server.clone(), 0.65);
+        if let Some((hint, confidence)) = deep::os_hint_from_banner("http", &server) {
+            device.set_os_guess(hint, "upnp", confidence);
+        }
+    }
+    if let Some(location) = info.location {
+        device.add_evidence("upnp", "location", location, 0.55);
+    }
+    for usn in info.usns {
+        device.add_evidence("upnp", "usn", usn, 0.55);
+    }
+    for service in info.services {
+        device.add_service(service, "upnp", None, 0.7);
+    }
+}
+
+pub(super) fn apply_deep_probes(device: &mut Device, probes: Vec<deep::PortProbe>) {
+    for probe in probes {
+        // An open port is weak identity by itself, but it is still useful as a
+        // service signal and as input to built-in identity rules.
+        device.add_service(probe.service.clone(), "deep", Some(probe.port), 0.7);
+        if let Some((device_type, confidence)) = deep::device_type_hint_from_port(probe.port) {
+            device.set_device_type_guess(device_type, "deep", confidence);
+        }
+        if probe.port == 445 || probe.port == 139 {
+            device.set_os_guess("Windows/SMB capable", "deep", 0.45);
+        }
+        if let Some(banner) = probe.banner {
+            device.add_evidence(
+                "deep",
+                &format!("{}_banner", probe.service),
+                banner.clone(),
+                0.75,
+            );
+            if let Some(server) = deep::http_server_from_banner(&banner) {
+                device.add_evidence("deep", "http_server", server, 0.7);
+            }
+            if let Some((os, confidence)) = deep::os_hint_from_banner(&probe.service, &banner) {
+                device.set_os_guess(os, "deep", confidence);
+            }
+        }
+        for header in probe.http_headers {
+            // HTTP headers get their own source because they often outlive the
+            // generic TCP probe in exports and rule matching.
+            let key = deep::header_evidence_key(&header.name);
+            device.add_evidence("http", &key, header.value.clone(), 0.75);
+            if header.name == "server" {
+                device.add_evidence("http", "http_server", header.value.clone(), 0.75);
+                if let Some((os, confidence)) = deep::os_hint_from_banner("http", &header.value) {
+                    device.set_os_guess(os, "http", confidence);
+                }
+            }
+        }
+        if let Some(favicon) = probe.favicon {
+            device.add_evidence("http", "favicon_sha256", favicon.sha256, 0.72);
+            device.add_evidence("http", "favicon_url", favicon.url, 0.55);
+            device.add_evidence("http", "favicon_bytes", favicon.bytes.to_string(), 0.5);
+        }
+        if let Some(tls) = probe.tls {
+            device.add_evidence("tls", "tls_cert_sha256", tls.sha256, 0.72);
+            if let Some(subject) = tls.subject {
+                device.add_evidence("tls", "tls_subject", subject, 0.7);
+            }
+            if let Some(issuer) = tls.issuer {
+                device.add_evidence("tls", "tls_issuer", issuer, 0.65);
+            }
+            if let Some(not_after) = tls.not_after {
+                device.add_evidence("tls", "tls_not_after", not_after, 0.55);
+            }
+        }
+    }
+}
+
+pub(super) fn apply_dhcp_lease(
+    device: &mut Device,
+    lease: dhcp::DhcpLease,
+    oui_db: Option<&HashMap<String, String>>,
+) {
+    // DHCP is passive and sometimes stale. It can fill missing MAC/vendor/name
+    // fields, but it must not replace direct ARP or protocol evidence.
+    if let Some(mac) = lease.mac {
+        if device.mac.is_none() {
+            device.mac = Some(mac.clone());
+        }
+        if device.vendor.is_none()
+            && let Some(oui_db) = oui_db
+        {
+            device.vendor = enrich::lookup_vendor(&mac, oui_db);
+        }
+        device.add_evidence("dhcp", "mac", mac, 0.55);
+    }
+    if let Some(hostname) = lease.hostname {
+        device.add_name(hostname, "dhcp", 0.72);
+    }
+    if let Some(client_id) = lease.client_id {
+        device.add_evidence("dhcp", "client_id", client_id, 0.55);
+    }
+    if let Some(vendor_class) = lease.vendor_class {
+        device.add_evidence("dhcp", "vendor_class", vendor_class, 0.65);
+    }
+    if let Some(source) = lease.source {
+        device.add_evidence("dhcp", "lease_source", source.display().to_string(), 0.35);
+    }
+}
+
+pub(super) fn apply_snmp_info(device: &mut Device, info: snmp::SnmpInfo) {
+    // SNMP system group fields are high-signal for routers, switches, printers,
+    // and NAS devices. Preserve every field so site-specific rules can refine
+    // classification later.
+    device.add_service("snmp", "snmp", Some(161), 0.75);
+    if let Some(sys_name) = info.sys_name {
+        device.add_name(sys_name.clone(), "snmp", 0.82);
+        device.add_evidence("snmp", "sysName", sys_name, 0.82);
+    }
+    if let Some(description) = info.sys_descr {
+        device.add_evidence("snmp", "sysDescr", description.clone(), 0.9);
+        device.set_os_guess(description, "snmp", 0.85);
+    }
+    if let Some(object_id) = info.sys_object_id {
+        device.add_evidence("snmp", "sysObjectID", object_id, 0.85);
+    }
+    if let Some(sys_services) = info.sys_services {
+        device.add_evidence("snmp", "sysServices", sys_services.to_string(), 0.75);
+        if sys_services & 0b100 != 0 {
+            device.set_device_type_guess("network-device", "snmp", 0.55);
+        }
+    }
+    if let Some(contact) = info.sys_contact {
+        device.add_evidence("snmp", "sysContact", contact, 0.45);
+    }
+    if let Some(location) = info.sys_location {
+        device.add_evidence("snmp", "sysLocation", location, 0.45);
+    }
+}
+
+pub(super) fn apply_smb_info(device: &mut Device, info: smb::SmbInfo) {
+    // SMB negotiate/session-setup data is intentionally shallow: it identifies
+    // the server stack and host names without authenticating or enumerating
+    // shares.
+    device.add_service("smb", "smb", Some(445), 0.78);
+    if let Some(dialect) = info.dialect {
+        device.add_evidence("smb", "smb_dialect", dialect, 0.78);
+    }
+    if let Some(signing_required) = info.signing_required {
+        device.add_evidence(
+            "smb",
+            "smb_signing_required",
+            signing_required.to_string(),
+            0.65,
+        );
+    }
+    if let Some(guid) = info.server_guid {
+        device.add_evidence("smb", "smb_server_guid", guid, 0.65);
+    }
+    if let Some(native_os) = info.native_os {
+        device.add_evidence("smb", "smb_native_os", native_os.clone(), 0.85);
+        if native_os.to_ascii_lowercase().contains("windows") {
+            device.set_os_guess("Windows", "smb", 0.78);
+        }
+    }
+    if let Some(native_lanman) = info.native_lanman {
+        device.add_evidence("smb", "smb_native_lanman", native_lanman.clone(), 0.78);
+        if native_lanman.to_ascii_lowercase().contains("samba") {
+            device.set_os_guess("Unix-like", "smb", 0.68);
+        }
+    }
+    if let Some(dns_name) = info.dns_computer_name {
+        device.add_name(dns_name.clone(), "smb", 0.86);
+        device.add_evidence("smb", "smb_dns_computer_name", dns_name, 0.86);
+    }
+    if let Some(netbios_name) = info.netbios_computer_name {
+        device.add_name(netbios_name.clone(), "smb", 0.82);
+        device.add_evidence("smb", "smb_netbios_computer_name", netbios_name, 0.82);
+    }
+}
+
+pub(super) fn apply_oui(devices: &mut BTreeMap<IpAddr, Device>, oui_db: &HashMap<String, String>) {
+    for device in devices.values_mut() {
+        if let Some(mac) = &device.mac {
+            device.vendor = enrich::lookup_vendor(mac, oui_db);
+        }
+    }
+}
+
+pub(super) fn merge_devices_by_interface_ip(devices: Vec<Device>) -> Vec<Device> {
+    // Parallel enrichment paths can produce partial snapshots for the same host.
+    // Collapse by interface/IP after all phases so multi-interface scans still
+    // keep overlapping addresses separate.
+    let mut merged = BTreeMap::<(String, IpAddr), Device>::new();
+    for device in devices {
+        let key = (device.interface.clone().unwrap_or_default(), device.ip);
+        if let Some(existing) = merged.get_mut(&key) {
+            merge_device(existing, device);
+        } else {
+            merged.insert(key, device);
+        }
+    }
+    merged.into_values().collect()
+}
+
+fn merge_device(existing: &mut Device, mut incoming: Device) {
+    // Merge as a union of observations. Optional scalar identity fields only
+    // fill blanks; confidence-bearing guesses go through Device's normal
+    // highest-confidence replacement rules.
+    if existing.mac.is_none() {
+        existing.mac = incoming.mac.take();
+    }
+    if existing.vendor.is_none() {
+        existing.vendor = incoming.vendor.take();
+    }
+    for name in incoming.names {
+        existing.add_name(name.name, &name.source, name.confidence);
+    }
+    if let Some(make) = incoming.make {
+        existing.set_make_guess(make.value, &make.source, make.confidence);
+    }
+    if let Some(model) = incoming.model {
+        existing.set_model_guess(model.value, &model.source, model.confidence);
+    }
+    if let Some(os) = incoming.os {
+        existing.set_os_guess(os.value, &os.source, os.confidence);
+    }
+    if let Some(device_type) = incoming.device_type {
+        existing.set_device_type_guess(
+            device_type.value,
+            &device_type.source,
+            device_type.confidence,
+        );
+    }
+    for service in incoming.services {
+        existing.add_service(
+            service.name,
+            &service.source,
+            service.port,
+            service.confidence,
+        );
+    }
+    for evidence in incoming.evidence {
+        existing.add_evidence(
+            evidence.source.as_str(),
+            evidence.key.as_str(),
+            evidence.value,
+            evidence.confidence,
+        );
+    }
+    existing.first_seen = existing.first_seen.min(incoming.first_seen);
+    existing.last_seen = existing.last_seen.max(incoming.last_seen);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::enrich::MdnsService;
+    use chrono::{TimeZone, Utc};
+
+    fn device() -> Device {
+        Device::new(
+            "192.168.1.10".parse().unwrap(),
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        )
+    }
+
+    fn has_evidence(device: &Device, source: &str, key: &str, value: &str) -> bool {
+        device
+            .evidence
+            .iter()
+            .any(|item| item.source == source && item.key == key && item.value == value)
+    }
+
+    #[test]
+    fn multicast_identity_adds_names_services_and_raw_evidence() {
+        let mut device = device();
+
+        apply_mdns_info(
+            &mut device,
+            enrich::MdnsInfo {
+                names: vec!["printer.local".to_string()],
+                os: Some("AirPrint OS".to_string()),
+                model: Some("OfficeJet Pro".to_string()),
+                services: vec![MdnsService {
+                    name: "_ipp._tcp.local".to_string(),
+                    port: Some(631),
+                }],
+            },
+        );
+        apply_upnp_info(
+            &mut device,
+            upnp::UpnpInfo {
+                names: vec!["Office Printer".to_string()],
+                manufacturer: Some("HP".to_string()),
+                model: Some("OfficeJet Pro 9010".to_string()),
+                device_type: Some("urn:schemas-upnp-org:device:Printer:1".to_string()),
+                server: Some("Linux UPnP".to_string()),
+                location: Some("http://192.168.1.10/root.xml".to_string()),
+                services: vec!["urn:schemas-upnp-org:service:PrintBasic:1".to_string()],
+                usns: vec!["uuid:printer::upnp:rootdevice".to_string()],
+            },
+        );
+
+        assert_eq!(device.hostname.as_deref(), Some("printer"));
+        assert_eq!(
+            device.make.as_ref().map(|guess| guess.value.as_str()),
+            Some("HP")
+        );
+        assert_eq!(
+            device.model.as_ref().map(|guess| guess.value.as_str()),
+            Some("OfficeJet Pro")
+        );
+        assert!(
+            device
+                .services
+                .iter()
+                .any(|service| service.source == "mdns" && service.port == Some(631))
+        );
+        assert!(has_evidence(&device, "mdns", "model", "OfficeJet Pro"));
+        assert!(has_evidence(&device, "upnp", "manufacturer", "HP"));
+        assert!(has_evidence(&device, "upnp", "model", "OfficeJet Pro 9010"));
+        assert!(has_evidence(
+            &device,
+            "upnp",
+            "location",
+            "http://192.168.1.10/root.xml"
+        ));
+    }
+
+    #[test]
+    fn deep_snmp_and_smb_keep_protocol_specific_evidence() {
+        let mut device = device();
+
+        apply_deep_probes(
+            &mut device,
+            vec![deep::PortProbe {
+                port: 443,
+                service: "https".to_string(),
+                banner: Some("HTTP 200 | server: OpenWrt".to_string()),
+                http_headers: vec![deep::HttpHeader {
+                    name: "server".to_string(),
+                    value: "uhttpd".to_string(),
+                }],
+                favicon: Some(deep::FaviconFingerprint {
+                    url: "https://192.168.1.10/favicon.ico".to_string(),
+                    sha256: "abc123".to_string(),
+                    bytes: 42,
+                }),
+                tls: Some(deep::TlsCertificate {
+                    sha256: "def456".to_string(),
+                    subject: Some("CN=router".to_string()),
+                    issuer: None,
+                    not_before: None,
+                    not_after: Some("2028-01-01".to_string()),
+                }),
+            }],
+        );
+        apply_snmp_info(
+            &mut device,
+            snmp::SnmpInfo {
+                sys_descr: Some("Linux router 6.1".to_string()),
+                sys_object_id: Some("1.3.6.1.4.1.8072".to_string()),
+                sys_services: Some(4),
+                ..snmp::SnmpInfo::default()
+            },
+        );
+        apply_smb_info(
+            &mut device,
+            smb::SmbInfo {
+                dialect: Some("SMB 3.1.1".to_string()),
+                signing_required: Some(true),
+                server_guid: None,
+                native_os: Some("Windows Server".to_string()),
+                native_lanman: None,
+                netbios_computer_name: Some("FILES".to_string()),
+                dns_computer_name: Some("files.local".to_string()),
+            },
+        );
+
+        assert!(has_evidence(
+            &device,
+            "http",
+            "http_header_server",
+            "uhttpd"
+        ));
+        assert!(has_evidence(&device, "http", "favicon_sha256", "abc123"));
+        assert!(has_evidence(&device, "tls", "tls_cert_sha256", "def456"));
+        assert!(has_evidence(
+            &device,
+            "snmp",
+            "sysObjectID",
+            "1.3.6.1.4.1.8072"
+        ));
+        assert!(has_evidence(&device, "smb", "smb_dialect", "SMB 3.1.1"));
+        assert!(
+            device
+                .services
+                .iter()
+                .any(|service| service.source == "snmp" && service.port == Some(161))
+        );
+        assert!(
+            device
+                .services
+                .iter()
+                .any(|service| service.source == "smb" && service.port == Some(445))
+        );
+    }
+
+    #[test]
+    fn dhcp_lease_fills_missing_identity_without_replacing_existing_mac() {
+        let mut device = device();
+        device.mac = Some("00:11:22:33:44:55".to_string());
+        let ip = device.ip;
+        let oui_db = HashMap::from([("AABBCC".to_string(), "Example Vendor".to_string())]);
+
+        apply_dhcp_lease(
+            &mut device,
+            dhcp::DhcpLease {
+                ip,
+                mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+                hostname: Some("workstation".to_string()),
+                client_id: Some("client-1".to_string()),
+                vendor_class: Some("MSFT 5.0".to_string()),
+                source: Some("/tmp/leases".into()),
+            },
+            Some(&oui_db),
+        );
+
+        assert_eq!(device.mac.as_deref(), Some("00:11:22:33:44:55"));
+        assert_eq!(device.vendor.as_deref(), Some("Example Vendor"));
+        assert_eq!(device.hostname.as_deref(), Some("workstation"));
+        assert!(has_evidence(&device, "dhcp", "mac", "aa:bb:cc:dd:ee:ff"));
+        assert!(has_evidence(&device, "dhcp", "vendor_class", "MSFT 5.0"));
+    }
+
+    #[test]
+    fn merged_devices_keep_all_evidence_for_the_same_interface_ip() {
+        let early = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let late = Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 0).unwrap();
+        let mut left = Device::new("192.168.1.10".parse().unwrap(), early);
+        left.interface = Some("en0".to_string());
+        left.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+        left.add_name("left", "mdns", 0.9);
+
+        let mut right = Device::new(left.ip, late);
+        right.interface = Some("en0".to_string());
+        right.add_service("http", "deep", Some(80), 0.7);
+        right.add_evidence("http", "server", "nginx", 0.7);
+
+        let merged = merge_devices_by_interface_ip(vec![left, right]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].first_seen, early);
+        assert_eq!(merged[0].last_seen, late);
+        assert_eq!(merged[0].hostname.as_deref(), Some("left"));
+        assert!(
+            merged[0]
+                .services
+                .iter()
+                .any(|service| service.name == "http")
+        );
+        assert!(has_evidence(&merged[0], "http", "server", "nginx"));
+    }
+}
