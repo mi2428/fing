@@ -1,0 +1,116 @@
+# fing
+
+A generic Fing - like Rust TUI application that scans local IPv4 networks and uses ARP, OUI, DNS, mDNS, NetBIOS, UPnP, DHCP, SNMP, SMB, HTTP, and TLS evidence as device fingerprints.
+
+## Installation
+
+Install Rust and Cargo first, then build and install the binary with `make install`.
+By default, the binary is installed to `~/.local/bin/fing`.
+Set `INSTALL_BINDIR` if you want to install it somewhere else.
+
+```console
+$ git clone https://github.com/mi2428/fing
+$ make -C fing install
+```
+
+>[!TIP]
+> Prebuilt binaries are also available from GitHub Releases for macOS and Linux, with amd64 and arm64 builds for each platform.
+> Pick the asset that matches your machine, make it executable, and place it on your `PATH`.
+>
+> ```console
+> $ curl -L -o fing https://github.com/mi2428/fing/releases/download/v0.9.0/fing-v0.9.0-darwin-arm64
+> $ chmod +x ./fing
+> ```
+
+## Usage
+
+```console
+$ fing scan --help
+
+Generic Fing - scan local IPv4 networks and enrich device identities
+
+Usage: fing scan [OPTIONS] <Interfaces>...
+
+Arguments:
+  <Interfaces>...  Interfaces to scan, such as en0, eth0, or en0.100
+
+Options:
+      --scan.range <CIDR>               Limit scanning to one or more IPv4 CIDR ranges. Can be repeated or comma-separated
+      --scan.profile <PROFILE>          Scan profile [default: normal] [possible values: fast, normal, deep]
+      --scan.interval <MS>              Delay between continuous scan rounds in milliseconds. Zero starts the next round immediately [default: 0]
+      --scan.timeout <MS>               Per-protocol timeout in milliseconds
+      --scan.concurrency <CONCURRENCY>  Concurrent scan/probe worker limit [default: 128]
+      --output.format <FORMAT>          Output format [default: table] [possible values: table, json, csv]
+      --output.live <LIVE>              Live TUI mode: auto uses it only for interactive table output [default: auto] [possible values: auto, always, never]
+      --output.mask-mac                 Mask the lower 24 bits of MAC addresses in output
+  -h, --help                            Print help
+
+Fingerprint Options:
+      --fingerprint.source <SOURCE>
+          Limit fingerprint sources. Defaults to all sources when omitted [possible values: oui, rdns, mdns, netbios, upnp, snmp, dhcp]
+      --dhcp.leases <DHCP_LEASES>
+          Read DHCP leases from an explicit lease file. Can be repeated
+      --snmp.community <SNMP_COMMUNITY>
+          SNMP community used when SNMP fingerprinting is enabled [default: public]
+```
+
+Scan one or more interfaces. Raw ARP discovery may require elevated privileges on some systems.
+
+```console
+$ sudo fing scan en0
+$ sudo fing scan en0 --scan.range 192.168.1.0/24
+$ sudo fing scan en0 --scan.profile deep --output.format json --output.live never
+```
+
+Update the local IEEE OUI vendor database:
+
+```console
+$ fing oui update
+$ fing oui update --output.path ./oui.json
+```
+
+## Development
+
+`make release TAG=vX.Y.Z` builds four local release binaries, pushes the Git tag, creates or updates the GitHub Release with generated release notes, and uploads the release artifacts.
+The default release matrix is macOS/Linux for amd64/arm64.
+Before releasing, this repository must have a clean working tree.
+
+```console
+$ make
+
+Development
+  build             Build the host binary into bin/
+  install           Build and install the host binary into INSTALL_BINDIR
+  fmt               Format Rust sources. Use CHECK_ONLY=1 to check without writing
+  lint              Run clippy with warnings treated as errors
+  doc               Build rustdoc with warnings treated as errors
+  test              Run unit tests
+  check             Run formatting, lint, rustdoc, and tests
+  clean             Remove local build artifacts
+
+Distribution
+  release           Build 4 local dist binaries, push the tag, and publish a GitHub release. Requires TAG=vX.Y.Z
+  dist              Build release binaries into dist/. Use OS=darwin,linux and ARCH=amd64,arm64
+  dist-smoke        Smoke-test Linux dist binaries in a Debian container
+  checksums         Write SHA-256 checksums for dist artifacts
+
+Help
+  help              Show this help message
+
+Variables:
+  TAG               Release tag for make release, for example v0.1.0
+  GIT_REMOTE        Release git remote, defaults to origin
+  OS                Release OS list for make dist, defaults to darwin,linux
+  ARCH              Release arch list for make dist, defaults to amd64,arm64
+  INSTALL_BINDIR    Install directory, defaults to /Users/teo/.local/bin
+
+Examples:
+  make fmt CHECK_ONLY=1                         # Check formatting without writing
+  make check                                    # Run local quality gates
+  make dist OS=darwin,linux ARCH=amd64,arm64    # Build release binaries and checksums
+  make release TAG=v0.1.0                       # Publish a GitHub release with local artifacts
+```
+
+## License
+
+MIT
