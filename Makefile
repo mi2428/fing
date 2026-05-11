@@ -43,6 +43,8 @@ LINUX_arm64_SUFFIX   := linux-arm64
 LINUX_BUILD_IMAGE    ?= rust:1.95-bookworm
 LINUX_SMOKE_IMAGE    ?= debian:bookworm-slim
 LINUX_CACHE_KEY      := $(shell printf '%s' '$(LINUX_BUILD_IMAGE)' | sed 's/[^A-Za-z0-9_.-]/-/g')
+LINUX_OPENSSL_STATIC ?= 1
+LINUX_PKG_CONFIG_ALL_STATIC ?= 1
 DOCKER_UID           ?= $(shell id -u)
 DOCKER_GID           ?= $(shell id -g)
 HOST_OS              := $(shell uname -s)
@@ -249,8 +251,8 @@ dist: ## Build release binaries into dist/. Use OS=darwin,linux and ARCH=amd64,a
 			$(MAKE) _dist.$$os.$$arch || exit $$?; \
 		done; \
 	done; \
-	$(MAKE) dist-smoke; \
-	$(MAKE) checksums
+	$(MAKE) dist-smoke || exit $$?; \
+	$(MAKE) checksums || exit $$?
 
 .PHONY: dist-smoke
 dist-smoke: ## Smoke-test Linux dist binaries in a Debian container
@@ -340,6 +342,8 @@ _dist.linux.$(1): _docker-check
 		-e HOME=/workspace/.home-linux/$(LINUX_CACHE_KEY)/$(1) \
 		-e CARGO_HOME=/workspace/.cargo-linux/$(1) \
 		-e CARGO_TARGET_DIR=/workspace/target/linux-$(1)-$(LINUX_CACHE_KEY) \
+		-e OPENSSL_STATIC=$(LINUX_OPENSSL_STATIC) \
+		-e PKG_CONFIG_ALL_STATIC=$(LINUX_PKG_CONFIG_ALL_STATIC) \
 		-v "$(CURDIR):/workspace" \
 		-w /workspace \
 		$(LINUX_BUILD_IMAGE) \
