@@ -14,10 +14,15 @@ RELEASE_MAKE     ?= $(MAKE)
 INSTALL    ?= install
 DOCKER     ?= docker
 GIT_REMOTE ?= origin
+VHS        ?= vhs
+VHS_DEMO_DELAY_SCALE ?= 4
 
 APP     := fing
 BINDIR  := bin
 DISTDIR := dist
+VHSDIR  := .vhs
+VHS_TAPE   := $(VHSDIR)/fing.tape
+VHS_OUTPUT := screencast.gif
 PACKAGE_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 DIST_TAG        ?= $(if $(TAG),$(TAG),v$(PACKAGE_VERSION))
 DIST_APP        := $(APP)-$(DIST_TAG)
@@ -99,8 +104,55 @@ check: ## Run formatting, lint, rustdoc, and tests
 
 .PHONY: clean
 clean: ## Remove local build artifacts
-	@rm -rf $(BINDIR) $(DISTDIR) .cargo-linux .home-linux
+	@rm -rf $(BINDIR) $(DISTDIR) $(VHSDIR) .cargo-linux .home-linux
 	@$(CARGO_ENV) $(CARGO) clean
+
+##@ Demo
+
+.PHONY: vhs
+vhs: ## Record the README live TUI demo GIF with VHS
+	@command -v "$(VHS)" >/dev/null 2>&1 || { \
+		echo "vhs is required to record $(VHS_OUTPUT): https://github.com/charmbracelet/vhs" >&2; \
+		exit 1; \
+	}
+	@$(CARGO_ENV) $(CARGO) build --example tui_demo
+	@mkdir -p "$(VHSDIR)/bin" "$$(dirname "$(VHS_OUTPUT)")"
+	@printf '%s\n' \
+		'#!/bin/sh' \
+		'FING_DEMO_DELAY_SCALE="$(VHS_DEMO_DELAY_SCALE)" exec "$(CURDIR)/target/debug/examples/tui_demo" "$$@"' \
+		> "$(VHSDIR)/bin/$(APP)"
+	@chmod +x "$(VHSDIR)/bin/$(APP)"
+	@printf '%s\n' \
+		'Output $(VHS_OUTPUT)' \
+		'Require $(APP)' \
+		'' \
+		'Set Shell "bash"' \
+		'Set Theme "Builtin Dark"' \
+		'Set FontSize 16' \
+		'Set Width 1664' \
+		'Set Height 936' \
+		'Set Padding 14' \
+		'Set Framerate 24' \
+		'Set PlaybackSpeed 1.0' \
+		'Set TypingSpeed 45ms' \
+		'Set CursorBlink false' \
+		'' \
+		'Type "$(APP) scan en0 en7 --scan.range 192.0.2.0/24,198.51.100.0/24 --output.live always"' \
+		'Sleep 500ms' \
+		'Enter' \
+		'Wait+Screen@30s /status=complete/' \
+		'Sleep 1.2s' \
+		'Ctrl+C' \
+		'Sleep 500ms' \
+		> "$(VHS_TAPE)"
+	@rm -f "$(VHS_OUTPUT)"
+	@env -u NO_COLOR PATH="$(CURDIR)/$(VHSDIR)/bin:$(PATH)" TERM=xterm-truecolor COLORTERM=truecolor "$(VHS)" "$(VHS_TAPE)"
+	@test -f "$(VHS_OUTPUT)" || { \
+		echo "VHS completed but $(VHS_OUTPUT) was not written" >&2; \
+		exit 1; \
+	}
+	@rm -rf "$(VHSDIR)"
+	@printf 'Wrote %s\n' "$(VHS_OUTPUT)"
 
 ##@ Distribution
 
@@ -385,8 +437,11 @@ help: ## Show this help message
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "OS" "Release OS list for make dist, defaults to $(OS)"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "ARCH" "Release arch list for make dist, defaults to $(ARCH)"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "INSTALL_BINDIR" "Install directory, defaults to $(INSTALL_BINDIR)"
+	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "VHS" "VHS command for make vhs, defaults to $(VHS)"
+	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "VHS_DEMO_DELAY_SCALE" "Demo scan delay scale for make vhs, defaults to $(VHS_DEMO_DELAY_SCALE)"
 	@printf "\n\033[1mExamples:\033[0m\n"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_EXAMPLE_WIDTH)" "make fmt CHECK_ONLY=1" "# Check formatting without writing"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_EXAMPLE_WIDTH)" "make check" "# Run local quality gates"
+	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_EXAMPLE_WIDTH)" "make vhs" "# Record screencast.gif from deterministic demo data"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_EXAMPLE_WIDTH)" "make dist OS=darwin,linux ARCH=amd64,arm64" "# Build release binaries and checksums"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_EXAMPLE_WIDTH)" "make release TAG=v0.1.0" "# Publish a GitHub release with local artifacts"

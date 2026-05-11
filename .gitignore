@@ -1,5 +1,6 @@
 bin/
 dist/
+.vhs/
 .cargo-linux/
 
 # Created by https://www.toptal.com/developers/gitignore/api/macos,linux,visualstudiocode,vim,rust,rust-analyzer
