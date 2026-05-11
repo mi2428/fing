@@ -36,20 +36,22 @@ DARWIN_amd64_SUFFIX := darwin-amd64
 DARWIN_arm64_TARGET := aarch64-apple-darwin
 DARWIN_arm64_SUFFIX := darwin-arm64
 
-LINUX_amd64_PLATFORM := linux/amd64
-LINUX_amd64_SUFFIX   := linux-amd64
-LINUX_arm64_PLATFORM := linux/arm64
-LINUX_arm64_SUFFIX   := linux-arm64
-LINUX_BUILD_IMAGE    ?= rust:1.95-bookworm
-LINUX_SMOKE_IMAGE    ?= debian:bookworm-slim
-LINUX_CACHE_KEY      := $(shell printf '%s' '$(LINUX_BUILD_IMAGE)' | sed 's/[^A-Za-z0-9_.-]/-/g')
-LINUX_OPENSSL_STATIC ?= 1
+LINUX_amd64_PLATFORM        := linux/amd64
+LINUX_amd64_SUFFIX          := linux-amd64
+LINUX_arm64_PLATFORM        := linux/arm64
+LINUX_arm64_SUFFIX          := linux-arm64
+LINUX_BUILD_IMAGE           ?= rust:1.95-bookworm
+LINUX_SMOKE_IMAGE           ?= debian:bookworm-slim
+LINUX_CACHE_KEY             := $(shell printf '%s' '$(LINUX_BUILD_IMAGE)' | sed 's/[^A-Za-z0-9_.-]/-/g')
+LINUX_OPENSSL_STATIC        ?= 1
 LINUX_PKG_CONFIG_ALL_STATIC ?= 1
-DOCKER_UID           ?= $(shell id -u)
-DOCKER_GID           ?= $(shell id -g)
-HOST_OS              := $(shell uname -s)
-HELP_NAME_WIDTH      := 18
-HELP_EXAMPLE_WIDTH   := 46
+
+DOCKER_UID ?= $(shell id -u)
+DOCKER_GID ?= $(shell id -g)
+HOST_OS    := $(shell uname -s)
+
+HELP_NAME_WIDTH    := 18
+HELP_EXAMPLE_WIDTH := 46
 
 ##@ Development
 
