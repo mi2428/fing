@@ -1,6 +1,6 @@
 # fing
 
-A generic Fing - like Rust TUI application that scans local IPv4 networks and uses ARP, OUI, DNS, mDNS, NetBIOS, UPnP, DHCP, SNMP, SMB, HTTP, and TLS evidence as device fingerprints.
+A generic Fing made of Rust TUI - scans local IPv4 networks and uses ARP, OUI, DNS, mDNS, NetBIOS, UPnP, DHCP, SNMP, SMB, HTTP, and TLS evidence as device fingerprints.
 
 ## Installation
 
@@ -88,6 +88,9 @@ Development
   check             Run formatting, lint, rustdoc, and tests
   clean             Remove local build artifacts
 
+Demo
+  vhs               Record the README live TUI demo GIF with VHS
+
 Distribution
   release           Build 4 local dist binaries, push the tag, and publish a GitHub release. Requires TAG=vX.Y.Z
   dist              Build release binaries into dist/. Use OS=darwin,linux and ARCH=amd64,arm64
@@ -103,10 +106,12 @@ Variables:
   OS                Release OS list for make dist, defaults to darwin,linux
   ARCH              Release arch list for make dist, defaults to amd64,arm64
   INSTALL_BINDIR    Install directory, defaults to /Users/teo/.local/bin
+  VHS               VHS command for make vhs, defaults to vhs
 
 Examples:
   make fmt CHECK_ONLY=1                         # Check formatting without writing
   make check                                    # Run local quality gates
+  make vhs                                      # Record screencast.gif from deterministic demo data
   make dist OS=darwin,linux ARCH=amd64,arm64    # Build release binaries and checksums
   make release TAG=v0.1.0                       # Publish a GitHub release with local artifacts
 ```
