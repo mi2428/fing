@@ -14,6 +14,7 @@ use std::{io::IsTerminal, path::PathBuf, time::Duration};
 
 #[derive(Debug, Parser)]
 #[command(name = "fing")]
+#[command(version)]
 #[command(about = "Generic Fing - scan local IPv4 networks and enrich device identities")]
 struct Cli {
     #[command(subcommand)]
