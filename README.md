@@ -2,6 +2,8 @@
 
 A generic Fing made of Rust TUI - scans local IPv4 networks and uses ARP, OUI, DNS, mDNS, NetBIOS, UPnP, DHCP, SNMP, SMB, HTTP, and TLS evidence as device fingerprints.
 
+[![](https://github.com/mi2428/fing/blob/main/screencast.gif?raw=true)](https://github.com/mi2428/fing/blob/main/screencast.gif)
+
 ## Installation
 
 Install Rust and Cargo first, then build and install the binary with `make install`.
