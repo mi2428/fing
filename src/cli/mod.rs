@@ -64,6 +64,8 @@ enum FingerprintSourceArg {
     Netbios,
     Upnp,
     Snmp,
+    Lldp,
+    Cdp,
     Dhcp,
 }
 
@@ -75,11 +77,13 @@ struct FingerprintSelection {
     netbios: bool,
     upnp: bool,
     snmp: bool,
+    lldp: bool,
+    cdp: bool,
     dhcp: bool,
 }
 
 impl FingerprintSelection {
-    fn from_args(sources: &[FingerprintSourceArg]) -> Self {
+    fn from_args(sources: &[FingerprintSourceArg], profile: ScanProfile) -> Self {
         if sources.is_empty() {
             return Self {
                 oui: true,
@@ -88,6 +92,8 @@ impl FingerprintSelection {
                 netbios: true,
                 upnp: true,
                 snmp: true,
+                lldp: profile.includes_lldp_fingerprints(),
+                cdp: profile.includes_cdp_fingerprints(),
                 dhcp: true,
             };
         }
@@ -99,6 +105,8 @@ impl FingerprintSelection {
             netbios: sources.contains(&FingerprintSourceArg::Netbios),
             upnp: sources.contains(&FingerprintSourceArg::Upnp),
             snmp: sources.contains(&FingerprintSourceArg::Snmp),
+            lldp: sources.contains(&FingerprintSourceArg::Lldp),
+            cdp: sources.contains(&FingerprintSourceArg::Cdp),
             dhcp: sources.contains(&FingerprintSourceArg::Dhcp),
         }
     }
@@ -138,7 +146,7 @@ struct ScanArgs {
     #[arg(long = "output.mask-mac")]
     mask_mac: bool,
 
-    /// Limit fingerprint sources. Defaults to all sources when omitted.
+    /// Limit fingerprint sources. Defaults to profile-appropriate sources when omitted.
     #[arg(
         long = "fingerprint.source",
         value_enum,
@@ -302,7 +310,7 @@ fn scan_configs_from_args(args: &ScanArgs, timeout: Duration) -> Result<Vec<Scan
         .map(Some)
         .collect::<Vec<_>>();
     let targets = scan_targets_from_args(args)?;
-    let fingerprints = FingerprintSelection::from_args(&args.fingerprints);
+    let fingerprints = FingerprintSelection::from_args(&args.fingerprints, args.profile);
 
     // Build the interface x target matrix explicitly. Each config maps to one
     // L2 interface and one CIDR so evidence never crosses VLAN or range bounds.
@@ -326,6 +334,8 @@ fn scan_configs_from_args(args: &ScanArgs, timeout: Duration) -> Result<Vec<Scan
                     upnp: fingerprints.upnp,
                     snmp: fingerprints.snmp,
                     snmp_community: args.snmp_community.clone(),
+                    lldp: fingerprints.lldp,
+                    cdp: fingerprints.cdp,
                     dhcp: fingerprints.dhcp,
                     dhcp_paths: args.dhcp_leases.clone(),
                     cache_enabled: true,
@@ -508,7 +518,20 @@ mod tests {
         assert!(configs[0].netbios);
         assert!(configs[0].upnp);
         assert!(configs[0].snmp);
+        assert!(!configs[0].lldp);
+        assert!(!configs[0].cdp);
         assert!(configs[0].dhcp);
+    }
+
+    #[test]
+    fn deep_scan_enables_l2_neighbor_protocols_by_default() {
+        let mut args = scan_args();
+        args.profile = ScanProfile::Deep;
+
+        let configs = scan_configs_from_args(&args, Duration::from_millis(1)).unwrap();
+
+        assert!(configs[0].lldp);
+        assert!(configs[0].cdp);
     }
 
     #[test]
@@ -599,7 +622,7 @@ mod tests {
             "fing",
             "scan",
             "--fingerprint.source",
-            "dhcp,mdns",
+            "dhcp,mdns,lldp,cdp",
             "--fingerprint.source",
             "snmp",
             "en0",
@@ -615,6 +638,8 @@ mod tests {
             vec![
                 FingerprintSourceArg::Dhcp,
                 FingerprintSourceArg::Mdns,
+                FingerprintSourceArg::Lldp,
+                FingerprintSourceArg::Cdp,
                 FingerprintSourceArg::Snmp,
             ]
         );
@@ -626,6 +651,8 @@ mod tests {
         assert!(!configs[0].netbios);
         assert!(!configs[0].upnp);
         assert!(configs[0].snmp);
+        assert!(configs[0].lldp);
+        assert!(configs[0].cdp);
         assert!(configs[0].dhcp);
     }
 

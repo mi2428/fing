@@ -6,8 +6,10 @@
 
 use super::{ScanConfig, ScanEvent};
 use crate::{
+    discovery::l2,
     enrich,
     model::Device,
+    net::InterfaceInfo,
     probes::{deep, snmp, upnp},
 };
 use anyhow::{Context, Result};
@@ -17,10 +19,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     time::Duration,
 };
-use tokio::sync::{
-    mpsc::{UnboundedReceiver, UnboundedSender},
-    watch,
-};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 pub(super) type MdnsRun = Result<BTreeMap<IpAddr, enrich::MdnsInfo>>;
 pub(super) type UpnpRun = Result<BTreeMap<IpAddr, upnp::UpnpInfo>>;
@@ -28,6 +27,12 @@ pub(super) type RdnsRun = HashMap<IpAddr, String>;
 pub(super) type NetbiosRun = HashMap<IpAddr, Vec<String>>;
 pub(super) type DeepRun = HashMap<IpAddr, Vec<deep::PortProbe>>;
 pub(super) type SnmpRun = HashMap<IpAddr, snmp::SnmpInfo>;
+pub(super) type L2Run = Result<l2::L2Advertisements>;
+
+pub(super) struct L2Discovery {
+    pub updates: UnboundedReceiver<l2::L2Advertisement>,
+    pub listener: tokio::task::JoinHandle<L2Run>,
+}
 
 pub(super) enum MulticastUpdate {
     Mdns(IpAddr, enrich::MdnsInfo),
@@ -44,38 +49,27 @@ pub(super) enum ProbeUpdate {
     Snmp(IpAddr, snmp::SnmpInfo),
 }
 
+const DEEP_LLDP_LISTEN_TIMEOUT: Duration = Duration::from_secs(30);
+const CDP_LISTEN_TIMEOUT: Duration = Duration::from_secs(65);
+
+fn lldp_listen_timeout(config: &ScanConfig) -> Duration {
+    if config.profile.includes_lldp_fingerprints() {
+        config.timeout.max(DEEP_LLDP_LISTEN_TIMEOUT)
+    } else {
+        config.timeout
+    }
+}
+
+fn cdp_listen_timeout(config: &ScanConfig) -> Duration {
+    if config.cdp {
+        config.timeout.max(CDP_LISTEN_TIMEOUT)
+    } else {
+        config.timeout
+    }
+}
+
 pub(super) fn idle_phase(interval: Duration, round: u64) -> Option<String> {
     (!interval.is_zero()).then(|| format!("idle {}ms after round {round}", interval.as_millis()))
-}
-
-pub(super) async fn wait_until_resumed(
-    pause_rx: &mut watch::Receiver<bool>,
-    events: &UnboundedSender<ScanEvent>,
-) {
-    if !*pause_rx.borrow() {
-        return;
-    }
-    // Pausing is cooperative: the live UI controls a watch channel, and scan
-    // phases check it between network steps so raw socket tasks are not aborted
-    // mid-packet.
-    let _ = events.send(ScanEvent::Phase("paused".to_string()));
-    while *pause_rx.borrow_and_update() {
-        if pause_rx.changed().await.is_err() {
-            return;
-        }
-    }
-}
-
-pub(super) async fn wait_interval_or_pause(
-    interval: Duration,
-    pause_rx: &mut watch::Receiver<bool>,
-) {
-    tokio::select! {
-        _ = tokio::time::sleep(interval) => {}
-        changed = pause_rx.changed() => {
-            let _ = changed;
-        }
-    }
 }
 
 pub(super) async fn forward_child_events(
@@ -116,6 +110,45 @@ pub(super) async fn forward_child_events(
             ScanEvent::Finished { .. } => {}
         }
     }
+}
+
+pub(super) fn start_l2_discovery(
+    config: &ScanConfig,
+    iface: InterfaceInfo,
+    events: &Option<UnboundedSender<ScanEvent>>,
+) -> Option<L2Discovery> {
+    let protocols = l2::L2Protocols {
+        lldp: config.lldp,
+        cdp: config.cdp,
+    };
+    if !protocols.any() {
+        return None;
+    }
+
+    let mut timeout = Duration::ZERO;
+    if config.lldp {
+        timeout = timeout.max(lldp_listen_timeout(config));
+    }
+    if config.cdp {
+        timeout = timeout.max(cdp_listen_timeout(config));
+    }
+    emit(
+        events,
+        ScanEvent::Phase(format!(
+            "{} discovery ({}ms)",
+            protocols.label(),
+            timeout.as_millis()
+        )),
+    );
+
+    let (tx, updates) = tokio::sync::mpsc::unbounded_channel();
+    let listener = tokio::task::spawn_blocking(move || {
+        l2::listen_with_callback(&iface, protocols, timeout, move |advertisement| {
+            let _ = tx.send(advertisement.clone());
+        })
+    });
+
+    Some(L2Discovery { updates, listener })
 }
 
 pub(super) async fn run_multicast_enrichment(
@@ -504,6 +537,8 @@ mod tests {
             upnp: false,
             snmp: false,
             snmp_community: "public".to_string(),
+            lldp: false,
+            cdp: false,
             dhcp: false,
             dhcp_paths: Vec::new(),
             cache_enabled: false,

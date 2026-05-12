@@ -5,7 +5,9 @@
 //! compact and gives most width to the high-churn device/log views.
 
 use super::{
-    layout::{fit_cell, shrink_widths_to_fit, table_spacing_width},
+    layout::{
+        PANEL_FRAME_WIDTH, fit_cell, panel_content_width, shrink_widths_to_fit, table_spacing_width,
+    },
     theme::NeonTheme,
 };
 use crate::net::InterfaceInfo;
@@ -291,9 +293,7 @@ fn allocate_interface_columns(
     panel: &LiveInterfacePanel,
     options: super::super::OutputOptions,
 ) -> Vec<InterfaceTableColumn> {
-    let inner_width = width
-        .saturating_sub(2)
-        .saturating_sub(table_spacing_width(kinds.len()));
+    let inner_width = panel_content_width(width).saturating_sub(table_spacing_width(kinds.len()));
     let mut widths = kinds
         .iter()
         .map(|kind| desired_interface_column_width(*kind, panel, options))
@@ -317,7 +317,7 @@ pub(super) fn desired_interface_panel_width(
         .map(|kind| desired_interface_column_width(*kind, panel, options))
         .sum::<u16>()
         .saturating_add(table_spacing_width(kinds.len()))
-        .saturating_add(2)
+        .saturating_add(PANEL_FRAME_WIDTH)
 }
 
 fn desired_interface_column_width(

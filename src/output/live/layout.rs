@@ -5,6 +5,12 @@
 //! scan is running.
 
 pub(super) const TABLE_COLUMN_SPACING: u16 = 2;
+pub(super) const PANEL_HORIZONTAL_PADDING: u16 = 1;
+pub(super) const PANEL_FRAME_WIDTH: u16 = 2 + PANEL_HORIZONTAL_PADDING * 2;
+
+pub(super) fn panel_content_width(width: u16) -> u16 {
+    width.saturating_sub(PANEL_FRAME_WIDTH)
+}
 
 pub(super) fn fit_cell(value: String, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {

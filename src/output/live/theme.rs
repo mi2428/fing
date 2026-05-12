@@ -3,9 +3,10 @@
 //! Keeping the palette in one module avoids subtle drift between the live scan,
 //! device table, interface panel, and footer when new widgets are added.
 
+use super::layout::PANEL_HORIZONTAL_PADDING;
 use ratatui::{
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders},
+    widgets::{Block, Borders, Padding},
 };
 
 pub(super) struct NeonTheme;
@@ -63,6 +64,7 @@ impl NeonTheme {
     pub(super) fn block(title: &'static str) -> Block<'static> {
         Block::default()
             .borders(Borders::ALL)
+            .padding(Padding::horizontal(PANEL_HORIZONTAL_PADDING))
             .title(title)
             .style(Self::panel())
             .border_style(Self::border())

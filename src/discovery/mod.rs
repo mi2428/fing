@@ -4,6 +4,10 @@
 //! Reading the OS ARP/neighbor table is a best-effort fallback that can discover
 //! recently contacted hosts even when raw socket access is unavailable.
 
+pub mod cdp;
+pub mod l2;
+pub mod lldp;
+
 use crate::net::InterfaceInfo;
 use anyhow::{Context, Result, anyhow};
 use ipnet::Ipv4Net;
