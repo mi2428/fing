@@ -6,8 +6,10 @@
 
 use super::{ScanConfig, ScanEvent};
 use crate::{
+    discovery::lldp,
     enrich,
     model::Device,
+    net::InterfaceInfo,
     probes::{deep, snmp, upnp},
 };
 use anyhow::{Context, Result};
@@ -28,6 +30,12 @@ pub(super) type RdnsRun = HashMap<IpAddr, String>;
 pub(super) type NetbiosRun = HashMap<IpAddr, Vec<String>>;
 pub(super) type DeepRun = HashMap<IpAddr, Vec<deep::PortProbe>>;
 pub(super) type SnmpRun = HashMap<IpAddr, snmp::SnmpInfo>;
+pub(super) type LldpRun = Result<Vec<lldp::LldpInfo>>;
+
+pub(super) struct LldpDiscovery {
+    pub updates: UnboundedReceiver<lldp::LldpInfo>,
+    pub listener: tokio::task::JoinHandle<LldpRun>,
+}
 
 pub(super) enum MulticastUpdate {
     Mdns(IpAddr, enrich::MdnsInfo),
@@ -42,6 +50,16 @@ pub(super) enum NameUpdate {
 pub(super) enum ProbeUpdate {
     Deep(IpAddr, deep::PortProbe),
     Snmp(IpAddr, snmp::SnmpInfo),
+}
+
+const DEEP_LLDP_LISTEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn lldp_listen_timeout(config: &ScanConfig) -> Duration {
+    if config.profile.includes_lldp_fingerprints() {
+        config.timeout.max(DEEP_LLDP_LISTEN_TIMEOUT)
+    } else {
+        config.timeout
+    }
 }
 
 pub(super) fn idle_phase(interval: Duration, round: u64) -> Option<String> {
@@ -116,6 +134,31 @@ pub(super) async fn forward_child_events(
             ScanEvent::Finished { .. } => {}
         }
     }
+}
+
+pub(super) fn start_lldp_discovery(
+    config: &ScanConfig,
+    iface: InterfaceInfo,
+    events: &Option<UnboundedSender<ScanEvent>>,
+) -> Option<LldpDiscovery> {
+    if !config.lldp {
+        return None;
+    }
+
+    let timeout = lldp_listen_timeout(config);
+    emit(
+        events,
+        ScanEvent::Phase(format!("LLDP discovery ({}ms)", timeout.as_millis())),
+    );
+
+    let (tx, updates) = tokio::sync::mpsc::unbounded_channel();
+    let listener = tokio::task::spawn_blocking(move || {
+        lldp::listen_with_callback(&iface, timeout, move |info| {
+            let _ = tx.send(info.clone());
+        })
+    });
+
+    Some(LldpDiscovery { updates, listener })
 }
 
 pub(super) async fn run_multicast_enrichment(
@@ -504,6 +547,7 @@ mod tests {
             upnp: false,
             snmp: false,
             snmp_community: "public".to_string(),
+            lldp: false,
             dhcp: false,
             dhcp_paths: Vec::new(),
             cache_enabled: false,

@@ -20,17 +20,28 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use apply::{
-    apply_deep_probes, apply_dhcp_lease, apply_mdns_info, apply_oui, apply_smb_info,
-    apply_snmp_info, apply_upnp_info, merge_devices_by_interface_ip,
+    apply_deep_probes, apply_dhcp_lease, apply_lldp_info, apply_mdns_info, apply_oui,
+    apply_smb_info, apply_snmp_info, apply_upnp_info, merge_devices_by_interface_ip,
 };
 use chrono::Utc;
 use phases::{
-    MulticastUpdate, NameUpdate, ProbeUpdate, emit, emit_device, forward_child_events, idle_phase,
-    run_deep_and_snmp_enrichment, run_multicast_enrichment, run_name_enrichment,
-    scan_target_summary, target_contains_ip, wait_interval_or_pause, wait_until_resumed,
+    LldpDiscovery, LldpRun, MulticastUpdate, NameUpdate, ProbeUpdate, emit, emit_device,
+    forward_child_events, idle_phase, run_deep_and_snmp_enrichment, run_multicast_enrichment,
+    run_name_enrichment, scan_target_summary, start_lldp_discovery, target_contains_ip,
+    wait_interval_or_pause, wait_until_resumed,
 };
-use std::{collections::BTreeMap, net::IpAddr, sync::Arc, time::Duration};
-use tokio::sync::{Semaphore, mpsc::UnboundedSender, watch};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    net::IpAddr,
+    sync::Arc,
+    time::Duration,
+};
+use tokio::sync::{
+    Semaphore,
+    mpsc::{UnboundedReceiver, UnboundedSender},
+    watch,
+};
 
 pub async fn scan_many(configs: Vec<ScanConfig>) -> Result<ScanResult> {
     scan_many_inner(configs, None, true).await
@@ -295,6 +306,16 @@ async fn scan_inner(
     }
     finish_devices_update(&events, devices.values_mut(), &identity_rules);
 
+    let lldp_context = LldpApplyContext {
+        now: scanned_at,
+        interface: &iface.name,
+        target,
+        oui_db: config.oui.then_some(&oui_db),
+        events: &events,
+        rules: &identity_rules,
+    };
+    let mut lldp_discovery = start_lldp_discovery(&config, iface.clone(), &events);
+
     if config.dhcp {
         emit(
             &events,
@@ -306,10 +327,15 @@ async fn scan_inner(
             config.dhcp_paths.clone()
         };
         if !paths.is_empty() {
-            let (leases, dhcp_warnings) =
-                tokio::task::spawn_blocking(move || dhcp::read_leases(&paths))
-                    .await
-                    .context("DHCP lease worker failed")?;
+            let dhcp_worker = tokio::task::spawn_blocking(move || dhcp::read_leases(&paths));
+            let (leases, dhcp_warnings) = await_with_lldp(
+                dhcp_worker,
+                &mut lldp_discovery,
+                &mut devices,
+                &lldp_context,
+            )
+            .await
+            .context("DHCP lease worker failed")?;
             for warning in dhcp_warnings {
                 warnings.push(warning.clone());
                 emit(&events, ScanEvent::Warning(warning));
@@ -328,20 +354,31 @@ async fn scan_inner(
         }
     }
 
-    let (mdns_result, upnp_result) =
-        run_multicast_enrichment(&config, iface.ip, target, &events, |update| match update {
+    let (multicast_tx, mut multicast_rx) = tokio::sync::mpsc::unbounded_channel();
+    let multicast_future =
+        run_multicast_enrichment(&config, iface.ip, target, &events, move |update| {
+            let _ = multicast_tx.send(update);
+        });
+    let (mdns_result, upnp_result) = await_with_lldp_and_phase_updates(
+        multicast_future,
+        &mut multicast_rx,
+        &mut lldp_discovery,
+        &mut devices,
+        &lldp_context,
+        |devices, update| match update {
             MulticastUpdate::Mdns(ip, mdns) => {
-                let device = upsert_device(&mut devices, ip, scanned_at, &iface.name);
+                let device = upsert_device(devices, ip, scanned_at, &iface.name);
                 apply_mdns_info(device, mdns);
                 finish_device_update(&events, device, &identity_rules);
             }
             MulticastUpdate::Upnp(ip, info) => {
-                let device = upsert_device(&mut devices, ip, scanned_at, &iface.name);
+                let device = upsert_device(devices, ip, scanned_at, &iface.name);
                 apply_upnp_info(device, info);
                 finish_device_update(&events, device, &identity_rules);
             }
-        })
-        .await;
+        },
+    )
+    .await;
 
     if let Some(Err(err)) = mdns_result {
         let warning = format!("mDNS enrichment failed: {err}");
@@ -356,36 +393,58 @@ async fn scan_inner(
     }
 
     let ips = devices.keys().copied().collect::<Vec<_>>();
-    let _ = run_name_enrichment(&config, ips.clone(), &events, |update| match update {
-        NameUpdate::Rdns(ip, name) => {
-            let device = upsert_device(&mut devices, ip, scanned_at, &iface.name);
-            device.add_name(name, "rdns", 0.65);
-            finish_device_update(&events, device, &identity_rules);
-        }
-        NameUpdate::Netbios(ip, names) => {
-            let device = upsert_device(&mut devices, ip, scanned_at, &iface.name);
-            for name in names {
-                device.add_name(name, "netbios", 0.8);
+    let (name_tx, mut name_rx) = tokio::sync::mpsc::unbounded_channel();
+    let name_future = run_name_enrichment(&config, ips.clone(), &events, move |update| {
+        let _ = name_tx.send(update);
+    });
+    let _ = await_with_lldp_and_phase_updates(
+        name_future,
+        &mut name_rx,
+        &mut lldp_discovery,
+        &mut devices,
+        &lldp_context,
+        |devices, update| match update {
+            NameUpdate::Rdns(ip, name) => {
+                let device = upsert_device(devices, ip, scanned_at, &iface.name);
+                device.add_name(name, "rdns", 0.65);
+                finish_device_update(&events, device, &identity_rules);
             }
-            device.set_os_guess("Windows/SMB capable", "netbios", 0.45);
-            finish_device_update(&events, device, &identity_rules);
-        }
-    })
+            NameUpdate::Netbios(ip, names) => {
+                let device = upsert_device(devices, ip, scanned_at, &iface.name);
+                for name in names {
+                    device.add_name(name, "netbios", 0.8);
+                }
+                device.set_os_guess("Windows/SMB capable", "netbios", 0.45);
+                finish_device_update(&events, device, &identity_rules);
+            }
+        },
+    )
     .await;
 
     let ips = devices.keys().copied().collect::<Vec<_>>();
-    let _ = run_deep_and_snmp_enrichment(&config, ips.clone(), &events, |update| match update {
-        ProbeUpdate::Deep(ip, probe) => {
-            let device = upsert_device(&mut devices, ip, scanned_at, &iface.name);
-            apply_deep_probes(device, vec![probe]);
-            finish_device_update(&events, device, &identity_rules);
-        }
-        ProbeUpdate::Snmp(ip, info) => {
-            let device = upsert_device(&mut devices, ip, scanned_at, &iface.name);
-            apply_snmp_info(device, info);
-            finish_device_update(&events, device, &identity_rules);
-        }
-    })
+    let (probe_tx, mut probe_rx) = tokio::sync::mpsc::unbounded_channel();
+    let probe_future = run_deep_and_snmp_enrichment(&config, ips.clone(), &events, move |update| {
+        let _ = probe_tx.send(update);
+    });
+    let _ = await_with_lldp_and_phase_updates(
+        probe_future,
+        &mut probe_rx,
+        &mut lldp_discovery,
+        &mut devices,
+        &lldp_context,
+        |devices, update| match update {
+            ProbeUpdate::Deep(ip, probe) => {
+                let device = upsert_device(devices, ip, scanned_at, &iface.name);
+                apply_deep_probes(device, vec![probe]);
+                finish_device_update(&events, device, &identity_rules);
+            }
+            ProbeUpdate::Snmp(ip, info) => {
+                let device = upsert_device(devices, ip, scanned_at, &iface.name);
+                apply_snmp_info(device, info);
+                finish_device_update(&events, device, &identity_rules);
+            }
+        },
+    )
     .await;
 
     if config.profile.includes_deep_probes() {
@@ -404,18 +463,37 @@ async fn scan_inner(
             .collect::<Vec<_>>();
         if !smb_ips.is_empty() {
             emit(&events, ScanEvent::Phase("SMB fingerprinting".to_string()));
-            let _ = smb::probe_hosts_with_callback(
+            let (smb_tx, mut smb_rx) = tokio::sync::mpsc::unbounded_channel();
+            let smb_future = smb::probe_hosts_with_callback(
                 smb_ips,
                 config.timeout,
                 config.concurrency,
-                |ip, info| {
-                    let device = upsert_device(&mut devices, ip, scanned_at, &iface.name);
+                move |ip, info| {
+                    let _ = smb_tx.send((ip, info));
+                },
+            );
+            let _ = await_with_lldp_and_phase_updates(
+                smb_future,
+                &mut smb_rx,
+                &mut lldp_discovery,
+                &mut devices,
+                &lldp_context,
+                |devices, (ip, info)| {
+                    let device = upsert_device(devices, ip, scanned_at, &iface.name);
                     apply_smb_info(device, info);
                     finish_device_update(&events, device, &identity_rules);
                 },
             )
             .await;
         }
+    }
+
+    if let Some(Err(err)) =
+        finish_lldp_discovery(lldp_discovery.take(), &mut devices, &lldp_context).await
+    {
+        let warning = format!("LLDP discovery failed: {err}");
+        warnings.push(warning.clone());
+        emit(&events, ScanEvent::Warning(warning));
     }
 
     let mut devices = devices.into_values().collect::<Vec<_>>();
@@ -479,6 +557,213 @@ fn upsert_device<'a>(
         device.interface = Some(interface.to_string());
     }
     device
+}
+
+async fn await_with_lldp<F, T>(
+    future: F,
+    lldp: &mut Option<LldpDiscovery>,
+    devices: &mut BTreeMap<IpAddr, Device>,
+    context: &LldpApplyContext<'_>,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    let mut lldp_open = lldp.is_some();
+    tokio::pin!(future);
+
+    loop {
+        tokio::select! {
+            result = &mut future => {
+                drain_lldp_updates(lldp, devices, context);
+                return result;
+            }
+            info = recv_lldp_update(lldp), if lldp_open => {
+                if let Some(info) = info {
+                    apply_lldp_discovery_update(devices, info, context);
+                } else {
+                    lldp_open = false;
+                }
+            }
+        }
+    }
+}
+
+async fn await_with_lldp_and_phase_updates<F, T, U, ApplyUpdate>(
+    future: F,
+    phase_rx: &mut UnboundedReceiver<U>,
+    lldp: &mut Option<LldpDiscovery>,
+    devices: &mut BTreeMap<IpAddr, Device>,
+    context: &LldpApplyContext<'_>,
+    mut apply_update: ApplyUpdate,
+) -> T
+where
+    F: Future<Output = T>,
+    ApplyUpdate: FnMut(&mut BTreeMap<IpAddr, Device>, U),
+{
+    let mut phase_open = true;
+    let mut lldp_open = lldp.is_some();
+    tokio::pin!(future);
+
+    loop {
+        tokio::select! {
+            result = &mut future => {
+                drain_phase_updates(phase_rx, devices, &mut apply_update);
+                drain_lldp_updates(lldp, devices, context);
+                return result;
+            }
+            update = phase_rx.recv(), if phase_open => {
+                if let Some(update) = update {
+                    apply_update(devices, update);
+                } else {
+                    phase_open = false;
+                }
+            }
+            info = recv_lldp_update(lldp), if lldp_open => {
+                if let Some(info) = info {
+                    apply_lldp_discovery_update(devices, info, context);
+                } else {
+                    lldp_open = false;
+                }
+            }
+        }
+    }
+}
+
+async fn recv_lldp_update(lldp: &mut Option<LldpDiscovery>) -> Option<discovery::lldp::LldpInfo> {
+    match lldp {
+        Some(discovery) => discovery.updates.recv().await,
+        None => None,
+    }
+}
+
+fn drain_phase_updates<U, ApplyUpdate>(
+    phase_rx: &mut UnboundedReceiver<U>,
+    devices: &mut BTreeMap<IpAddr, Device>,
+    apply_update: &mut ApplyUpdate,
+) where
+    ApplyUpdate: FnMut(&mut BTreeMap<IpAddr, Device>, U),
+{
+    while let Ok(update) = phase_rx.try_recv() {
+        apply_update(devices, update);
+    }
+}
+
+fn drain_lldp_updates(
+    lldp: &mut Option<LldpDiscovery>,
+    devices: &mut BTreeMap<IpAddr, Device>,
+    context: &LldpApplyContext<'_>,
+) {
+    let Some(discovery) = lldp else {
+        return;
+    };
+    while let Ok(info) = discovery.updates.try_recv() {
+        apply_lldp_discovery_update(devices, info, context);
+    }
+}
+
+async fn finish_lldp_discovery(
+    lldp: Option<LldpDiscovery>,
+    devices: &mut BTreeMap<IpAddr, Device>,
+    context: &LldpApplyContext<'_>,
+) -> Option<LldpRun> {
+    let mut discovery = lldp?;
+    let mut updates_open = true;
+
+    Some(loop {
+        tokio::select! {
+            result = &mut discovery.listener => {
+                drain_lldp_receiver(&mut discovery.updates, devices, context);
+                break result
+                    .context("LLDP worker failed")
+                    .and_then(|listener_result| listener_result);
+            }
+            info = discovery.updates.recv(), if updates_open => {
+                if let Some(info) = info {
+                    apply_lldp_discovery_update(devices, info, context);
+                } else {
+                    updates_open = false;
+                }
+            }
+        }
+    })
+}
+
+fn drain_lldp_receiver(
+    updates: &mut UnboundedReceiver<discovery::lldp::LldpInfo>,
+    devices: &mut BTreeMap<IpAddr, Device>,
+    context: &LldpApplyContext<'_>,
+) {
+    while let Ok(info) = updates.try_recv() {
+        apply_lldp_discovery_update(devices, info, context);
+    }
+}
+
+struct LldpApplyContext<'a> {
+    now: chrono::DateTime<Utc>,
+    interface: &'a str,
+    target: ipnet::Ipv4Net,
+    oui_db: Option<&'a std::collections::HashMap<String, String>>,
+    events: &'a Option<UnboundedSender<ScanEvent>>,
+    rules: &'a identity_rules::RuleDb,
+}
+
+fn apply_lldp_discovery_update(
+    devices: &mut BTreeMap<IpAddr, Device>,
+    info: discovery::lldp::LldpInfo,
+    context: &LldpApplyContext<'_>,
+) {
+    for ip in lldp_device_ips(devices, &info, context.target) {
+        let device = upsert_device(devices, ip, context.now, context.interface);
+        apply_lldp_info(device, info.clone(), context.oui_db);
+        finish_device_update(context.events, device, context.rules);
+    }
+}
+
+fn lldp_device_ips(
+    devices: &BTreeMap<IpAddr, Device>,
+    info: &discovery::lldp::LldpInfo,
+    target: ipnet::Ipv4Net,
+) -> Vec<IpAddr> {
+    let mut ips = BTreeSet::new();
+    for ip in &info.management_addresses {
+        if target_contains_ip(target, *ip) {
+            ips.insert(*ip);
+        }
+    }
+
+    for mac in lldp_candidate_macs(info) {
+        if let Some((ip, _)) = devices.iter().find(|(_, device)| {
+            device
+                .mac
+                .as_deref()
+                .is_some_and(|device_mac| same_mac(device_mac, &mac))
+        }) {
+            ips.insert(*ip);
+        }
+    }
+
+    ips.into_iter().collect()
+}
+
+fn lldp_candidate_macs(info: &discovery::lldp::LldpInfo) -> Vec<String> {
+    let mut macs = Vec::new();
+    if let Some(mac) = &info.chassis_mac {
+        macs.push(mac.clone());
+    }
+    macs.push(info.source_mac.clone());
+    macs
+}
+
+fn same_mac(left: &str, right: &str) -> bool {
+    normalize_mac(left) == normalize_mac(right)
+}
+
+fn normalize_mac(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn finish_device_update(

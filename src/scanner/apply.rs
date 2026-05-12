@@ -6,7 +6,9 @@
 //! are attached without letting one protocol erase another.
 
 use crate::{
-    dhcp, enrich,
+    dhcp,
+    discovery::lldp,
+    enrich,
     model::Device,
     probes::{deep, smb, snmp, upnp},
 };
@@ -188,6 +190,89 @@ pub(super) fn apply_snmp_info(device: &mut Device, info: snmp::SnmpInfo) {
     }
     if let Some(location) = info.sys_location {
         device.add_evidence("snmp", "sysLocation", location, 0.45);
+    }
+}
+
+pub(super) fn apply_lldp_info(
+    device: &mut Device,
+    info: lldp::LldpInfo,
+    oui_db: Option<&HashMap<String, String>>,
+) {
+    device.add_service("lldp", "lldp", None, 0.72);
+    if device.mac.is_none() {
+        device.mac = info.chassis_mac.clone().or(Some(info.source_mac.clone()));
+    }
+    if device.vendor.is_none()
+        && let (Some(mac), Some(oui_db)) = (&device.mac, oui_db)
+    {
+        device.vendor = enrich::lookup_vendor(mac, oui_db);
+    }
+
+    device.add_evidence("lldp", "source_mac", info.source_mac, 0.76);
+    if let Some(chassis_id) = info.chassis_id {
+        device.add_evidence("lldp", "chassis_id", chassis_id, 0.82);
+    }
+    if let Some(chassis_id_subtype) = info.chassis_id_subtype {
+        device.add_evidence("lldp", "chassis_id_subtype", chassis_id_subtype, 0.62);
+    }
+    if let Some(chassis_mac) = info.chassis_mac {
+        device.add_evidence("lldp", "chassis_mac", chassis_mac, 0.82);
+    }
+    if let Some(port_id) = info.port_id {
+        device.add_evidence("lldp", "port_id", port_id, 0.7);
+    }
+    if let Some(port_id_subtype) = info.port_id_subtype {
+        device.add_evidence("lldp", "port_id_subtype", port_id_subtype, 0.55);
+    }
+    if let Some(ttl) = info.ttl {
+        device.add_evidence("lldp", "ttl", ttl.to_string(), 0.45);
+    }
+    if let Some(port_description) = info.port_description {
+        device.add_evidence("lldp", "port_description", port_description, 0.65);
+    }
+    if let Some(system_name) = info.system_name {
+        device.add_name(system_name.clone(), "lldp", 0.88);
+        device.add_evidence("lldp", "system_name", system_name, 0.88);
+    }
+    if let Some(system_description) = info.system_description {
+        device.add_evidence(
+            "lldp",
+            "system_description",
+            system_description.clone(),
+            0.9,
+        );
+        device.set_os_guess(system_description, "lldp", 0.82);
+    }
+    for capability in &info.system_capabilities {
+        device.add_evidence("lldp", "system_capability", capability.as_str(), 0.7);
+    }
+    for capability in &info.enabled_capabilities {
+        device.add_evidence("lldp", "enabled_capability", capability.as_str(), 0.82);
+    }
+    for address in info.management_addresses {
+        device.add_evidence("lldp", "management_address", address.to_string(), 0.84);
+    }
+
+    if info
+        .enabled_capabilities
+        .iter()
+        .any(|capability| capability == "wlan-access-point")
+    {
+        device.set_device_type_guess("wireless-ap", "lldp", 0.88);
+    } else if info
+        .enabled_capabilities
+        .iter()
+        .any(|capability| capability == "router")
+    {
+        device.set_device_type_guess("router", "lldp", 0.86);
+    } else if info
+        .enabled_capabilities
+        .iter()
+        .any(|capability| capability == "bridge")
+    {
+        device.set_device_type_guess("switch", "lldp", 0.86);
+    } else if !info.enabled_capabilities.is_empty() {
+        device.set_device_type_guess("network-device", "lldp", 0.72);
     }
 }
 
@@ -458,6 +543,53 @@ mod tests {
                 .iter()
                 .any(|service| service.source == "smb" && service.port == Some(445))
         );
+    }
+
+    #[test]
+    fn lldp_adds_network_device_identity() {
+        let mut device = device();
+
+        apply_lldp_info(
+            &mut device,
+            lldp::LldpInfo {
+                source_mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                chassis_id: Some("00:11:22:33:44:55".to_string()),
+                chassis_id_subtype: Some("mac-address".to_string()),
+                chassis_mac: Some("00:11:22:33:44:55".to_string()),
+                port_id: Some("Gi1/0/1".to_string()),
+                port_id_subtype: Some("interface-name".to_string()),
+                ttl: Some(120),
+                port_description: Some("uplink".to_string()),
+                system_name: Some("core-switch".to_string()),
+                system_description: Some("ExampleOS 1.0".to_string()),
+                system_capabilities: vec!["bridge".to_string(), "router".to_string()],
+                enabled_capabilities: vec!["bridge".to_string()],
+                management_addresses: vec!["192.168.1.2".parse().unwrap()],
+            },
+            None,
+        );
+
+        assert_eq!(device.mac.as_deref(), Some("00:11:22:33:44:55"));
+        assert_eq!(device.hostname.as_deref(), Some("core-switch"));
+        assert_eq!(
+            device
+                .device_type
+                .as_ref()
+                .map(|guess| guess.value.as_str()),
+            Some("switch")
+        );
+        assert!(has_evidence(
+            &device,
+            "lldp",
+            "system_description",
+            "ExampleOS 1.0"
+        ));
+        assert!(has_evidence(
+            &device,
+            "lldp",
+            "management_address",
+            "192.168.1.2"
+        ));
     }
 
     #[test]
