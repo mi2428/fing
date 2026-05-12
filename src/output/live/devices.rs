@@ -5,10 +5,11 @@
 //! identity from being erased by later, weaker refreshes.
 
 use super::{
-    layout::{fit_cell, spread_width, table_spacing_width},
+    layout::{fit_cell, panel_content_width, spread_width, table_spacing_width},
     theme::NeonTheme,
 };
 use crate::model::{Device, Guess};
+use chrono::{DateTime, Local, Utc};
 use ratatui::{
     layout::Constraint,
     style::Style,
@@ -149,7 +150,7 @@ impl DeviceColumn {
                 .to_string(),
             Self::Confidence => format!("{:.2}", device.identity_confidence()),
             Self::Sources => super::super::sources::compact_source_summary(device),
-            Self::Seen => device.last_seen.format("%H:%M:%S").to_string(),
+            Self::Seen => local_time(device.last_seen),
         }
     }
 }
@@ -208,9 +209,7 @@ fn visible_column_kinds(width: u16) -> Vec<DeviceColumn> {
 
 #[cfg(test)]
 fn allocate_device_columns(width: u16, kinds: &[DeviceColumn]) -> Vec<DeviceTableColumn> {
-    let inner_width = width
-        .saturating_sub(2)
-        .saturating_sub(table_spacing_width(kinds.len()));
+    let inner_width = panel_content_width(width).saturating_sub(table_spacing_width(kinds.len()));
     let fixed_total = kinds
         .iter()
         .filter_map(|column| column.fixed_width())
@@ -244,9 +243,7 @@ fn allocate_device_columns_for_devices(
     devices: &[&Device],
     options: super::super::OutputOptions,
 ) -> Vec<DeviceTableColumn> {
-    let inner_width = width
-        .saturating_sub(2)
-        .saturating_sub(table_spacing_width(kinds.len()));
+    let inner_width = panel_content_width(width).saturating_sub(table_spacing_width(kinds.len()));
     let fixed_total = kinds
         .iter()
         .filter_map(|column| column.fixed_width())
@@ -423,7 +420,7 @@ pub(super) fn device_log_summary(device: &Device, options: super::super::OutputO
         log_field_value(guess_value(&device.os), 20),
         device.identity_confidence(),
         super::super::sources::compact_source_summary(device),
-        device.last_seen.format("%H:%M:%S"),
+        local_time(device.last_seen),
         device.services.len(),
         device.evidence.len(),
     )
@@ -440,6 +437,13 @@ fn log_field_value(value: &str, max_chars: usize) -> String {
         .join("_")
         .replace(',', ";");
     fit_cell(compact, max_chars)
+}
+
+fn local_time(timestamp: DateTime<Utc>) -> String {
+    timestamp
+        .with_timezone(&Local)
+        .format("%H:%M:%S")
+        .to_string()
 }
 
 fn guess_value(guess: &Option<Guess>) -> &str {

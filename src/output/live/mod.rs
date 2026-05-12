@@ -21,7 +21,7 @@ use devices::{
 };
 pub use interfaces::LiveInterfacePanel;
 use interfaces::{interface_panel_width, render_interfaces, top_panel_height};
-use layout::{TABLE_COLUMN_SPACING, corrected_table_offset};
+use layout::{TABLE_COLUMN_SPACING, corrected_table_offset, panel_content_width};
 use logs::{
     LiveLogEntry, LiveLogLevel, help_bar, key_span, source_legend, styled_log_line, value_span,
 };
@@ -500,7 +500,7 @@ impl LiveTable {
             .constraints([Constraint::Min(0), Constraint::Length(interface_width)])
             .split(chunks[1]);
 
-        frame.render_widget(help_bar(chunks[0].width), chunks[0]);
+        frame.render_widget(help_bar(chunks[0].width, Local::now()), chunks[0]);
         frame.render_widget(self.live_scan(top[0].width), top[0]);
         render_interfaces(frame, top[1], &self.interface_panel, self.options);
         self.render_table(frame, chunks[2]);
@@ -539,7 +539,7 @@ impl LiveTable {
         ])];
         let visible_logs = top_panel_height().saturating_sub(3) as usize;
         let start = self.logs.len().saturating_sub(visible_logs);
-        let log_width = width.saturating_sub(2) as usize;
+        let log_width = panel_content_width(width) as usize;
         lines.extend(
             self.logs
                 .iter()
@@ -620,7 +620,7 @@ mod tests {
             desired_interface_panel_width, interface_column_kinds, interface_panel_height,
             interface_row_style, visible_interface_columns,
         },
-        layout::{fit_cell, table_spacing_width},
+        layout::{fit_cell, panel_content_width, table_spacing_width},
         logs::{help_line, log_style, source_footer_line},
     };
     use crate::net::InterfaceInfo;
@@ -683,7 +683,7 @@ mod tests {
         let min = medium_identity_widths.into_iter().min().unwrap();
         let max = medium_identity_widths.into_iter().max().unwrap();
         assert!(max - min <= 1);
-        assert_eq!(total_device_table_width(&medium), 132_u16.saturating_sub(2));
+        assert_eq!(total_device_table_width(&medium), panel_content_width(132));
     }
 
     #[test]
@@ -699,10 +699,7 @@ mod tests {
         let equal = visible_columns(180);
         let dynamic = visible_columns_for_devices(180, &devices, OutputOptions::default());
 
-        assert_eq!(
-            total_device_table_width(&dynamic),
-            180_u16.saturating_sub(2)
-        );
+        assert_eq!(total_device_table_width(&dynamic), panel_content_width(180));
         assert_eq!(column_width(&dynamic, DeviceColumn::Ip), 15);
         assert!(
             column_width(&dynamic, DeviceColumn::Name) > column_width(&equal, DeviceColumn::Name)
@@ -732,7 +729,22 @@ mod tests {
             ),
             "255.255.255.255"
         );
-        assert_eq!(total_device_table_width(&narrow), 80_u16.saturating_sub(2));
+        assert_eq!(total_device_table_width(&narrow), panel_content_width(80));
+    }
+
+    #[test]
+    fn seen_column_uses_system_timezone() {
+        let seen = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let device = Device::new("192.168.1.10".parse().unwrap(), seen);
+        let column = DeviceTableColumn {
+            kind: DeviceColumn::Seen,
+            width: 8,
+        };
+
+        assert_eq!(
+            column.value(&device, OutputOptions::default()),
+            seen.with_timezone(&Local).format("%H:%M:%S").to_string()
+        );
     }
 
     #[test]
@@ -770,7 +782,10 @@ mod tests {
             18
         );
         assert_eq!(interface_column_width(&columns, InterfaceColumn::Mac), 17);
-        assert_eq!(total_interface_table_width(&columns), width - 2);
+        assert_eq!(
+            total_interface_table_width(&columns),
+            panel_content_width(width)
+        );
     }
 
     #[test]
@@ -874,7 +889,8 @@ mod tests {
         assert!(summary.contains("os=Android_TV"));
         assert!(summary.contains("conf="));
         assert!(summary.contains("sources="));
-        assert!(summary.contains("seen=12:34:56"));
+        let expected_seen = now.with_timezone(&Local).format("%H:%M:%S");
+        assert!(summary.contains(&format!("seen={expected_seen}")));
         assert!(summary.contains("svc=1"));
         assert!(summary.contains("ev=1"));
     }
@@ -958,6 +974,27 @@ mod tests {
         assert!(frame.contains("192.168.1.0/24"));
         assert!(frame.contains("aa:bb:cc:**:**:**"));
         assert!(!frame.contains("aa:bb:cc:dd:ee:ff"));
+    }
+
+    #[test]
+    fn live_tui_panels_pad_content_horizontally() {
+        let mut app = LiveTable::new(OutputOptions::default(), sample_interface_panel());
+        let frame = render_app_to_text(&mut app, 180, 30);
+
+        let status_line = frame.lines().find(|line| line.contains("status=")).unwrap();
+        assert_eq!(char_before_text(status_line, "status="), Some(' '));
+
+        let interface_header = frame
+            .lines()
+            .find(|line| line.contains("Use") && line.contains("Def") && line.contains("IPv4"))
+            .unwrap();
+        assert_eq!(char_before_text(interface_header, "Use"), Some(' '));
+
+        let device_header = frame
+            .lines()
+            .find(|line| line.contains("IP") && line.contains("Iface") && line.contains("Conf"))
+            .unwrap();
+        assert_eq!(char_before_text(device_header, "IP"), Some(' '));
     }
 
     #[test]
@@ -1106,14 +1143,9 @@ mod tests {
         assert_eq!(app.table_state.selected(), Some(0));
 
         let frame = render_app_to_text(&mut app, 140, 30);
-        assert!(
-            frame
-                .lines()
-                .last()
-                .unwrap_or_default()
-                .trim_end()
-                .ends_with("Paused")
-        );
+        let last_row = frame.lines().last().unwrap_or_default();
+        assert!(last_row.trim_end().ends_with("Paused"));
+        assert!(last_row.ends_with(' '));
 
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
@@ -1159,7 +1191,9 @@ mod tests {
 
         let lines = frame.lines().collect::<Vec<_>>();
         let last_row = lines.last().copied().unwrap_or_default();
+        assert!(last_row.starts_with(" Sources:"));
         assert!(last_row.trim_end().ends_with("filter=/apple"));
+        assert!(last_row.ends_with(' '));
         assert!(
             !lines[..lines.len().saturating_sub(1)]
                 .iter()
@@ -1173,9 +1207,37 @@ mod tests {
         let text = line_to_string(&line);
 
         assert_eq!(text.chars().count(), 36);
+        assert!(text.starts_with(" Sources:"));
         assert!(text.trim_end().ends_with("filter=/apple"));
+        assert!(text.ends_with(' '));
         assert!(text.contains('~'));
         assert!(!text.contains("K=Cache"));
+    }
+
+    #[test]
+    fn source_footer_right_indicator_uses_green_chrome() {
+        let filter_line = source_footer_line(80, "filter=/apple".to_string());
+        let filter_spans = filter_line.spans;
+        let filter_start = filter_spans
+            .iter()
+            .position(|span| span.content.as_ref() == "filter=")
+            .unwrap();
+        assert_eq!(
+            filter_spans[filter_start].style.fg,
+            Some(NeonTheme::ACCENT_GREEN)
+        );
+        assert_eq!(
+            filter_spans[filter_start + 1].style.fg,
+            Some(NeonTheme::ACCENT_GREEN)
+        );
+
+        let paused_line = source_footer_line(80, "Paused".to_string());
+        let paused = paused_line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "Paused")
+            .unwrap();
+        assert_eq!(paused.style.fg, Some(NeonTheme::ACCENT_GREEN));
     }
 
     #[test]
@@ -1251,6 +1313,7 @@ mod tests {
         let last_row = frame.lines().last().unwrap_or_default();
 
         assert!(last_row.contains("Sources:"));
+        assert!(last_row.starts_with(" Sources:"));
         assert!(last_row.contains("A=ARP"));
         assert!(last_row.contains("O=OUI"));
         assert!(last_row.contains("M=mDNS"));
@@ -1264,20 +1327,44 @@ mod tests {
         let first_row = frame.lines().next().unwrap_or_default();
 
         assert!(first_row.contains("Keys:"));
-        assert!(first_row.contains("w=Pause scan"));
-        assert!(first_row.contains("Ctrl-D/U=Page"));
+        assert!(first_row.starts_with(" Keys:"));
+        assert!(first_row.contains("w=Pause Esc=Resume"));
+        assert!(first_row.contains("j=Down k=Up"));
+        assert!(first_row.contains("Ctrl-D=PageDown"));
+        assert!(first_row.contains("Ctrl-U=PageUp"));
+        assert!(!first_row.contains("Ctrl-D/U"));
+        assert!(!first_row.contains("Up/Down,j/k"));
+        assert!(!first_row.contains('|'));
         assert!(first_row.contains("Ctrl-C=Quit"));
+        assert!(first_row.contains("Now="));
+        assert!(first_row.ends_with(' '));
         assert!(!first_row.contains("Live Scan"));
     }
 
     #[test]
     fn help_line_truncates_to_available_width() {
-        let line = help_line(32);
+        let now = Local.with_ymd_and_hms(2026, 1, 1, 12, 34, 56).unwrap();
+        let line = help_line(32, now);
         let text = line_to_string(&line);
 
         assert_eq!(text.chars().count(), 32);
-        assert!(text.starts_with("Keys: w=Pause scan"));
-        assert!(text.ends_with('~'));
+        assert!(text.starts_with(" Keys: w=Pause"));
+        assert!(text.contains("Now=12:34:56"));
+        assert!(text.trim_end().ends_with("Now=12:34:56"));
+        assert!(text.ends_with(' '));
+    }
+
+    #[test]
+    fn help_line_styles_keys_label_as_chrome() {
+        let now = Local.with_ymd_and_hms(2026, 1, 1, 12, 34, 56).unwrap();
+        let line = help_line(120, now);
+
+        assert_eq!(line.spans[1].content.as_ref(), "Keys:");
+        assert_eq!(line.spans[1].style.fg, Some(NeonTheme::ACCENT_GREEN));
+        assert_eq!(line.spans[2].style.fg, Some(NeonTheme::TEXT));
+        assert!(line_to_string(&line).contains("Ctrl-D=PageDown"));
+        assert!(line_to_string(&line).contains("Ctrl-U=PageUp"));
+        assert!(line_to_string(&line).contains("Now=12:34:56"));
     }
 
     #[test]
@@ -1308,6 +1395,11 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>()
+    }
+
+    fn char_before_text(line: &str, text: &str) -> Option<char> {
+        let index = line.find(text)?;
+        line[..index].chars().next_back()
     }
 
     fn key(ch: char) -> KeyEvent {
