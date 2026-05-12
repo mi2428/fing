@@ -33,7 +33,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     net::IpAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::{
@@ -107,8 +110,6 @@ pub async fn scan_continuously_with_events(
     }
 }
 
-const CONTINUOUS_PASSIVE_POLL: Duration = Duration::from_secs(5);
-
 #[derive(Debug, Clone)]
 enum ContinuousPassiveUpdate {
     Advertisement {
@@ -119,11 +120,13 @@ enum ContinuousPassiveUpdate {
 }
 
 struct ContinuousPassiveListenerGuard {
+    cancel: Arc<AtomicBool>,
     handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for ContinuousPassiveListenerGuard {
     fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
         for handle in &self.handles {
             handle.abort();
         }
@@ -187,6 +190,7 @@ impl ContinuousPassiveManager {
         };
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
         for interface in interfaces {
             handles.push(tokio::spawn(continuous_l2_listener(
@@ -195,11 +199,16 @@ impl ContinuousPassiveManager {
                     lldp: interface.lldp,
                     cdp: interface.cdp,
                 },
+                Arc::clone(&cancel),
                 tx.clone(),
             )));
         }
 
-        Ok((manager, rx, ContinuousPassiveListenerGuard { handles }))
+        Ok((
+            manager,
+            rx,
+            ContinuousPassiveListenerGuard { cancel, handles },
+        ))
     }
 
     fn observe_scan_event(&mut self, event: ScanEvent) -> ScanEvent {
@@ -340,34 +349,34 @@ fn continuous_passive_interfaces(
 async fn continuous_l2_listener(
     iface: net::InterfaceInfo,
     protocols: discovery::l2::L2Protocols,
+    cancel: Arc<AtomicBool>,
     updates: UnboundedSender<ContinuousPassiveUpdate>,
 ) {
-    loop {
-        let iface_name = iface.name.clone();
-        let worker_iface = iface.clone();
-        let worker_updates = updates.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            discovery::l2::listen_with_callback(
-                &worker_iface,
-                protocols,
-                CONTINUOUS_PASSIVE_POLL,
-                move |advertisement| {
-                    let _ = worker_updates.send(ContinuousPassiveUpdate::Advertisement {
-                        interface: iface_name.clone(),
-                        advertisement: Box::new(advertisement.clone()),
-                    });
-                },
-            )
-        })
-        .await;
+    let iface_name = iface.name.clone();
+    let worker_iface = iface.clone();
+    let stop_updates = updates.clone();
+    let worker_updates = updates.clone();
+    let worker_cancel = Arc::clone(&cancel);
+    let result = tokio::task::spawn_blocking(move || {
+        discovery::l2::listen_until(
+            &worker_iface,
+            protocols,
+            || worker_cancel.load(Ordering::Relaxed) || stop_updates.is_closed(),
+            move |advertisement| {
+                let _ = worker_updates.send(ContinuousPassiveUpdate::Advertisement {
+                    interface: iface_name.clone(),
+                    advertisement: Box::new(advertisement.clone()),
+                });
+            },
+        )
+    })
+    .await;
 
-        if updates.is_closed() {
-            break;
-        }
-        if let Err(warning) = passive_listener_warning(protocols.label(), &iface.name, result) {
-            let _ = updates.send(ContinuousPassiveUpdate::Warning(warning));
-            break;
-        }
+    if cancel.load(Ordering::Relaxed) || updates.is_closed() {
+        return;
+    }
+    if let Err(warning) = passive_listener_warning(protocols.label(), &iface.name, result) {
+        let _ = updates.send(ContinuousPassiveUpdate::Warning(warning));
     }
 }
 

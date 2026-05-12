@@ -13,6 +13,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const READ_TIMEOUT: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct L2Protocols {
     pub lldp: bool,
@@ -50,10 +52,29 @@ pub fn listen_with_callback<F>(
     iface: &InterfaceInfo,
     protocols: L2Protocols,
     timeout: Duration,
+    on_advertisement: F,
+) -> Result<L2Advertisements>
+where
+    F: FnMut(&L2Advertisement),
+{
+    let deadline = Instant::now() + timeout;
+    listen_until(
+        iface,
+        protocols,
+        || Instant::now() >= deadline,
+        on_advertisement,
+    )
+}
+
+pub fn listen_until<F, ShouldStop>(
+    iface: &InterfaceInfo,
+    protocols: L2Protocols,
+    mut should_stop: ShouldStop,
     mut on_advertisement: F,
 ) -> Result<L2Advertisements>
 where
     F: FnMut(&L2Advertisement),
+    ShouldStop: FnMut() -> bool,
 {
     if !protocols.any() {
         return Ok(L2Advertisements::default());
@@ -65,7 +86,7 @@ where
         .ok_or_else(|| anyhow!("interface {} is not available to pnet", iface.name))?;
 
     let config = Config {
-        read_timeout: Some(Duration::from_millis(100)),
+        read_timeout: Some(READ_TIMEOUT),
         read_buffer_size: 65536,
         ..Default::default()
     };
@@ -80,8 +101,7 @@ where
     let mut result = L2Advertisements::default();
     let mut lldp_keys = BTreeSet::new();
     let mut cdp_keys = BTreeSet::new();
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    while !should_stop() {
         let Ok(packet) = rx.next() else {
             continue;
         };
