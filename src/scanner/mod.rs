@@ -12,7 +12,7 @@ mod types;
 pub use types::{ScanConfig, ScanEvent, ScanProfile};
 
 use crate::{
-    dhcp, discovery, identity_rules,
+    dhcp, discovery, enrich, identity_rules,
     model::{Device, ScanResult},
     net,
     probes::smb,
@@ -28,10 +28,10 @@ use phases::{
     CdpDiscovery, CdpRun, LldpDiscovery, LldpRun, MulticastUpdate, NameUpdate, ProbeUpdate, emit,
     emit_device, forward_child_events, idle_phase, run_deep_and_snmp_enrichment,
     run_multicast_enrichment, run_name_enrichment, scan_target_summary, start_cdp_discovery,
-    start_lldp_discovery, target_contains_ip, wait_interval_or_pause, wait_until_resumed,
+    start_lldp_discovery, target_contains_ip,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     net::IpAddr,
     sync::Arc,
@@ -57,14 +57,30 @@ pub async fn scan_continuously_with_events(
         anyhow::bail!("no scan targets configured");
     }
 
+    let (mut passive_manager, mut passive_rx, _passive_listeners) =
+        ContinuousPassiveManager::start(&configs)?;
+    let round_configs = round_scan_configs(&configs);
     let mut round = 1_u64;
     loop {
-        wait_until_resumed(&mut pause_rx, &events).await;
+        wait_until_resumed_with_passive(
+            &mut pause_rx,
+            &events,
+            &mut passive_rx,
+            &mut passive_manager,
+        )
+        .await;
         emit(
             &Some(events.clone()),
             ScanEvent::Phase(format!("scan round {round}")),
         );
-        if let Err(err) = scan_many_inner(configs.clone(), Some(events.clone()), false).await {
+        if let Err(err) = run_scan_round_with_passive_updates(
+            round_configs.clone(),
+            events.clone(),
+            &mut passive_rx,
+            &mut passive_manager,
+        )
+        .await
+        {
             emit(
                 &Some(events.clone()),
                 ScanEvent::Warning(format!("scan round {round} failed: {err}")),
@@ -72,16 +88,641 @@ pub async fn scan_continuously_with_events(
         }
         if let Some(phase) = idle_phase(interval, round) {
             emit(&Some(events.clone()), ScanEvent::Phase(phase));
-            wait_interval_or_pause(interval, &mut pause_rx).await;
+            wait_interval_or_pause_with_passive(
+                interval,
+                &mut pause_rx,
+                &events,
+                &mut passive_rx,
+                &mut passive_manager,
+            )
+            .await;
         } else {
             // A zero interval means "scan continuously": start the next round
             // as soon as the previous discovery/enrichment pass completes.
             // Yielding keeps the async runtime responsive without introducing
             // a user-visible delay.
+            drain_continuous_passive_updates(&events, &mut passive_rx, &mut passive_manager);
             tokio::task::yield_now().await;
         }
         round = round.saturating_add(1);
     }
+}
+
+const CONTINUOUS_PASSIVE_POLL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone)]
+enum ContinuousPassiveUpdate {
+    Lldp {
+        interface: String,
+        info: discovery::lldp::LldpInfo,
+    },
+    Cdp {
+        interface: String,
+        info: discovery::cdp::CdpInfo,
+    },
+    Warning(String),
+}
+
+struct ContinuousPassiveListenerGuard {
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ContinuousPassiveListenerGuard {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ContinuousPassiveInterface {
+    iface: net::InterfaceInfo,
+    targets: Vec<ipnet::Ipv4Net>,
+    oui: bool,
+    lldp: bool,
+    cdp: bool,
+}
+
+struct ContinuousPassiveManager {
+    states: BTreeMap<String, ContinuousPassiveInterfaceState>,
+    rules: identity_rules::RuleDb,
+    oui_db: HashMap<String, String>,
+}
+
+struct ContinuousPassiveInterfaceState {
+    targets: Vec<ipnet::Ipv4Net>,
+    oui: bool,
+    devices: BTreeMap<IpAddr, Device>,
+    pending_lldp: BTreeMap<String, discovery::lldp::LldpInfo>,
+    pending_cdp: BTreeMap<String, discovery::cdp::CdpInfo>,
+}
+
+impl ContinuousPassiveManager {
+    fn start(
+        configs: &[ScanConfig],
+    ) -> Result<(
+        Self,
+        UnboundedReceiver<ContinuousPassiveUpdate>,
+        ContinuousPassiveListenerGuard,
+    )> {
+        let interfaces = continuous_passive_interfaces(configs)?;
+        let mut states = BTreeMap::new();
+        for interface in &interfaces {
+            states.insert(
+                interface.iface.name.clone(),
+                ContinuousPassiveInterfaceState {
+                    targets: interface.targets.clone(),
+                    oui: interface.oui,
+                    devices: BTreeMap::new(),
+                    pending_lldp: BTreeMap::new(),
+                    pending_cdp: BTreeMap::new(),
+                },
+            );
+        }
+
+        let oui_path = configs
+            .first()
+            .map(|config| config.oui_path.clone())
+            .unwrap_or_else(enrich::default_oui_db_path);
+        let manager = Self {
+            states,
+            rules: identity_rules::load_rule_db()?,
+            oui_db: enrich::load_oui_db(&oui_path).unwrap_or_default(),
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handles = Vec::new();
+        for interface in interfaces {
+            if interface.lldp {
+                handles.push(tokio::spawn(continuous_lldp_listener(
+                    interface.iface.clone(),
+                    tx.clone(),
+                )));
+            }
+            if interface.cdp {
+                handles.push(tokio::spawn(continuous_cdp_listener(
+                    interface.iface.clone(),
+                    tx.clone(),
+                )));
+            }
+        }
+
+        Ok((manager, rx, ContinuousPassiveListenerGuard { handles }))
+    }
+
+    fn observe_scan_event(&mut self, event: ScanEvent) -> ScanEvent {
+        match event {
+            ScanEvent::DeviceUpdated(mut device) => {
+                self.observe_device(&mut device);
+                ScanEvent::DeviceUpdated(device)
+            }
+            ScanEvent::Finished {
+                mut devices,
+                warnings,
+            } => {
+                for device in &mut devices {
+                    self.observe_device(device);
+                }
+                ScanEvent::Finished { devices, warnings }
+            }
+            other => other,
+        }
+    }
+
+    fn observe_device(&mut self, device: &mut Device) {
+        let Some(interface) = device.interface.clone() else {
+            return;
+        };
+        let Some(state) = self.states.get_mut(&interface) else {
+            return;
+        };
+        merge_known_device(state, device.clone());
+        let mut merged = state
+            .devices
+            .get(&device.ip)
+            .cloned()
+            .unwrap_or_else(|| device.clone());
+        apply_pending_passive(&mut merged, state, &self.oui_db, &self.rules);
+        state.devices.insert(device.ip, merged.clone());
+        *device = merged;
+    }
+
+    fn apply_passive_update(&mut self, update: ContinuousPassiveUpdate) -> Vec<ScanEvent> {
+        match update {
+            ContinuousPassiveUpdate::Lldp { interface, info } => {
+                self.apply_lldp_update(&interface, info)
+            }
+            ContinuousPassiveUpdate::Cdp { interface, info } => {
+                self.apply_cdp_update(&interface, info)
+            }
+            ContinuousPassiveUpdate::Warning(warning) => vec![ScanEvent::Warning(warning)],
+        }
+    }
+
+    fn apply_lldp_update(
+        &mut self,
+        interface: &str,
+        info: discovery::lldp::LldpInfo,
+    ) -> Vec<ScanEvent> {
+        let Some(state) = self.states.get_mut(interface) else {
+            return Vec::new();
+        };
+        state
+            .pending_lldp
+            .insert(lldp_passive_key(&info), info.clone());
+
+        let mut events = Vec::new();
+        for ip in lldp_target_ips(state, &info) {
+            let device = state
+                .devices
+                .entry(ip)
+                .or_insert_with(|| passive_device(ip, interface));
+            apply_lldp_info(device, info.clone(), state.oui.then_some(&self.oui_db));
+            identity_rules::apply_identity_rules(device, &self.rules);
+            events.push(ScanEvent::DeviceUpdated(Box::new(device.clone())));
+        }
+        events
+    }
+
+    fn apply_cdp_update(
+        &mut self,
+        interface: &str,
+        info: discovery::cdp::CdpInfo,
+    ) -> Vec<ScanEvent> {
+        let Some(state) = self.states.get_mut(interface) else {
+            return Vec::new();
+        };
+        state
+            .pending_cdp
+            .insert(cdp_passive_key(&info), info.clone());
+
+        let mut events = Vec::new();
+        for ip in cdp_target_ips(state, &info) {
+            let device = state
+                .devices
+                .entry(ip)
+                .or_insert_with(|| passive_device(ip, interface));
+            apply_cdp_info(device, info.clone(), state.oui.then_some(&self.oui_db));
+            identity_rules::apply_identity_rules(device, &self.rules);
+            events.push(ScanEvent::DeviceUpdated(Box::new(device.clone())));
+        }
+        events
+    }
+}
+
+fn continuous_passive_interfaces(
+    configs: &[ScanConfig],
+) -> Result<Vec<ContinuousPassiveInterface>> {
+    let mut interfaces = BTreeMap::<String, ContinuousPassiveInterface>::new();
+    for config in configs {
+        if !config.lldp && !config.cdp {
+            continue;
+        }
+        let iface = net::select_interface(config.iface.as_deref())?;
+        let target = net::parse_target(config.target.as_deref(), &iface)?;
+        let entry =
+            interfaces
+                .entry(iface.name.clone())
+                .or_insert_with(|| ContinuousPassiveInterface {
+                    iface: iface.clone(),
+                    targets: Vec::new(),
+                    oui: false,
+                    lldp: false,
+                    cdp: false,
+                });
+        if !entry.targets.contains(&target) {
+            entry.targets.push(target);
+        }
+        entry.oui |= config.oui;
+        entry.lldp |= config.lldp;
+        entry.cdp |= config.cdp;
+    }
+    Ok(interfaces.into_values().collect())
+}
+
+async fn continuous_lldp_listener(
+    iface: net::InterfaceInfo,
+    updates: UnboundedSender<ContinuousPassiveUpdate>,
+) {
+    loop {
+        let iface_name = iface.name.clone();
+        let worker_iface = iface.clone();
+        let worker_updates = updates.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            discovery::lldp::listen_with_callback(
+                &worker_iface,
+                CONTINUOUS_PASSIVE_POLL,
+                move |info| {
+                    let _ = worker_updates.send(ContinuousPassiveUpdate::Lldp {
+                        interface: iface_name.clone(),
+                        info: info.clone(),
+                    });
+                },
+            )
+        })
+        .await;
+
+        if updates.is_closed() {
+            break;
+        }
+        if let Err(warning) = passive_listener_warning("LLDP", &iface.name, result) {
+            let _ = updates.send(ContinuousPassiveUpdate::Warning(warning));
+            break;
+        }
+    }
+}
+
+async fn continuous_cdp_listener(
+    iface: net::InterfaceInfo,
+    updates: UnboundedSender<ContinuousPassiveUpdate>,
+) {
+    loop {
+        let iface_name = iface.name.clone();
+        let worker_iface = iface.clone();
+        let worker_updates = updates.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            discovery::cdp::listen_with_callback(
+                &worker_iface,
+                CONTINUOUS_PASSIVE_POLL,
+                move |info| {
+                    let _ = worker_updates.send(ContinuousPassiveUpdate::Cdp {
+                        interface: iface_name.clone(),
+                        info: info.clone(),
+                    });
+                },
+            )
+        })
+        .await;
+
+        if updates.is_closed() {
+            break;
+        }
+        if let Err(warning) = passive_listener_warning("CDP", &iface.name, result) {
+            let _ = updates.send(ContinuousPassiveUpdate::Warning(warning));
+            break;
+        }
+    }
+}
+
+fn passive_listener_warning<T>(
+    protocol: &str,
+    interface: &str,
+    result: std::result::Result<Result<T>, tokio::task::JoinError>,
+) -> std::result::Result<(), String> {
+    match result {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => Err(format!("{protocol} listener failed on {interface}: {err}")),
+        Err(err) => Err(format!(
+            "{protocol} listener task failed on {interface}: {err}"
+        )),
+    }
+}
+
+fn round_scan_configs(configs: &[ScanConfig]) -> Vec<ScanConfig> {
+    configs
+        .iter()
+        .cloned()
+        .map(|mut config| {
+            config.lldp = false;
+            config.cdp = false;
+            config
+        })
+        .collect()
+}
+
+async fn run_scan_round_with_passive_updates(
+    configs: Vec<ScanConfig>,
+    events: UnboundedSender<ScanEvent>,
+    passive_rx: &mut UnboundedReceiver<ContinuousPassiveUpdate>,
+    passive_manager: &mut ContinuousPassiveManager,
+) -> Result<()> {
+    let (round_tx, mut round_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut round =
+        tokio::spawn(async move { scan_many_inner(configs, Some(round_tx), false).await });
+    let mut round_events_open = true;
+    let mut passive_open = true;
+
+    loop {
+        tokio::select! {
+            result = &mut round => {
+                while let Ok(event) = round_rx.try_recv() {
+                    forward_scan_event(&events, passive_manager, event);
+                }
+                result.context("scan task failed")??;
+                return Ok(());
+            }
+            event = round_rx.recv(), if round_events_open => {
+                if let Some(event) = event {
+                    forward_scan_event(&events, passive_manager, event);
+                } else {
+                    round_events_open = false;
+                }
+            }
+            update = passive_rx.recv(), if passive_open => {
+                if let Some(update) = update {
+                    forward_passive_update(&events, passive_manager, update);
+                } else {
+                    passive_open = false;
+                }
+            }
+        }
+    }
+}
+
+fn forward_scan_event(
+    events: &UnboundedSender<ScanEvent>,
+    passive_manager: &mut ContinuousPassiveManager,
+    event: ScanEvent,
+) {
+    let event = passive_manager.observe_scan_event(event);
+    let _ = events.send(event);
+}
+
+fn forward_passive_update(
+    events: &UnboundedSender<ScanEvent>,
+    passive_manager: &mut ContinuousPassiveManager,
+    update: ContinuousPassiveUpdate,
+) {
+    for event in passive_manager.apply_passive_update(update) {
+        let _ = events.send(event);
+    }
+}
+
+fn drain_continuous_passive_updates(
+    events: &UnboundedSender<ScanEvent>,
+    passive_rx: &mut UnboundedReceiver<ContinuousPassiveUpdate>,
+    passive_manager: &mut ContinuousPassiveManager,
+) {
+    while let Ok(update) = passive_rx.try_recv() {
+        forward_passive_update(events, passive_manager, update);
+    }
+}
+
+async fn wait_interval_or_pause_with_passive(
+    interval: Duration,
+    pause_rx: &mut watch::Receiver<bool>,
+    events: &UnboundedSender<ScanEvent>,
+    passive_rx: &mut UnboundedReceiver<ContinuousPassiveUpdate>,
+    passive_manager: &mut ContinuousPassiveManager,
+) {
+    let sleep = tokio::time::sleep(interval);
+    tokio::pin!(sleep);
+    let mut passive_open = true;
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return,
+            changed = pause_rx.changed() => {
+                let _ = changed;
+                return;
+            }
+            update = passive_rx.recv(), if passive_open => {
+                if let Some(update) = update {
+                    forward_passive_update(events, passive_manager, update);
+                } else {
+                    passive_open = false;
+                }
+            }
+        }
+    }
+}
+
+async fn wait_until_resumed_with_passive(
+    pause_rx: &mut watch::Receiver<bool>,
+    events: &UnboundedSender<ScanEvent>,
+    passive_rx: &mut UnboundedReceiver<ContinuousPassiveUpdate>,
+    passive_manager: &mut ContinuousPassiveManager,
+) {
+    if !*pause_rx.borrow() {
+        drain_continuous_passive_updates(events, passive_rx, passive_manager);
+        return;
+    }
+
+    let _ = events.send(ScanEvent::Phase("paused".to_string()));
+    let mut passive_open = true;
+    while *pause_rx.borrow_and_update() {
+        tokio::select! {
+            changed = pause_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            update = passive_rx.recv(), if passive_open => {
+                if let Some(update) = update {
+                    forward_passive_update(events, passive_manager, update);
+                } else {
+                    passive_open = false;
+                }
+            }
+        }
+    }
+}
+
+fn passive_device(ip: IpAddr, interface: &str) -> Device {
+    let mut device = Device::new(ip, Utc::now());
+    device.interface = Some(interface.to_string());
+    device
+}
+
+fn merge_known_device(state: &mut ContinuousPassiveInterfaceState, incoming: Device) {
+    if let Some(existing) = state.devices.get_mut(&incoming.ip) {
+        merge_device_snapshot(existing, incoming);
+    } else {
+        state.devices.insert(incoming.ip, incoming);
+    }
+}
+
+fn merge_device_snapshot(existing: &mut Device, mut incoming: Device) {
+    if existing.interface.is_none() {
+        existing.interface = incoming.interface.take();
+    }
+    if existing.mac.is_none() {
+        existing.mac = incoming.mac.take();
+    }
+    if existing.vendor.is_none() {
+        existing.vendor = incoming.vendor.take();
+    }
+    if existing.hostname.is_none() {
+        existing.hostname = incoming.hostname.take();
+    }
+    for name in incoming.names {
+        existing.add_name(name.name, &name.source, name.confidence);
+    }
+    if let Some(make) = incoming.make {
+        existing.set_make_guess(make.value, &make.source, make.confidence);
+    }
+    if let Some(model) = incoming.model {
+        existing.set_model_guess(model.value, &model.source, model.confidence);
+    }
+    if let Some(os) = incoming.os {
+        existing.set_os_guess(os.value, &os.source, os.confidence);
+    }
+    if let Some(device_type) = incoming.device_type {
+        existing.set_device_type_guess(
+            device_type.value,
+            &device_type.source,
+            device_type.confidence,
+        );
+    }
+    for service in incoming.services {
+        existing.add_service(
+            service.name,
+            &service.source,
+            service.port,
+            service.confidence,
+        );
+    }
+    for evidence in incoming.evidence {
+        existing.add_evidence(
+            &evidence.source,
+            &evidence.key,
+            evidence.value,
+            evidence.confidence,
+        );
+    }
+    existing.first_seen = existing.first_seen.min(incoming.first_seen);
+    existing.last_seen = existing.last_seen.max(incoming.last_seen);
+}
+
+fn apply_pending_passive(
+    device: &mut Device,
+    state: &ContinuousPassiveInterfaceState,
+    oui_db: &HashMap<String, String>,
+    rules: &identity_rules::RuleDb,
+) {
+    let lldp_matches = state
+        .pending_lldp
+        .values()
+        .filter(|info| lldp_matches_device(info, device))
+        .cloned()
+        .collect::<Vec<_>>();
+    for info in lldp_matches {
+        apply_lldp_info(device, info, state.oui.then_some(oui_db));
+    }
+    let cdp_matches = state
+        .pending_cdp
+        .values()
+        .filter(|info| cdp_matches_device(info, device))
+        .cloned()
+        .collect::<Vec<_>>();
+    for info in cdp_matches {
+        apply_cdp_info(device, info, state.oui.then_some(oui_db));
+    }
+    identity_rules::apply_identity_rules(device, rules);
+}
+
+fn lldp_target_ips(
+    state: &ContinuousPassiveInterfaceState,
+    info: &discovery::lldp::LldpInfo,
+) -> Vec<IpAddr> {
+    let mut ips = BTreeSet::new();
+    for target in &state.targets {
+        ips.extend(lldp_device_ips(&state.devices, info, *target));
+    }
+    ips.into_iter().collect()
+}
+
+fn cdp_target_ips(
+    state: &ContinuousPassiveInterfaceState,
+    info: &discovery::cdp::CdpInfo,
+) -> Vec<IpAddr> {
+    let mut ips = BTreeSet::new();
+    for target in &state.targets {
+        ips.extend(cdp_device_ips(&state.devices, info, *target));
+    }
+    ips.into_iter().collect()
+}
+
+fn lldp_matches_device(info: &discovery::lldp::LldpInfo, device: &Device) -> bool {
+    info.management_addresses.contains(&device.ip)
+        || lldp_candidate_macs(info).iter().any(|mac| {
+            device
+                .mac
+                .as_deref()
+                .is_some_and(|device_mac| same_mac(device_mac, mac))
+        })
+}
+
+fn cdp_matches_device(info: &discovery::cdp::CdpInfo, device: &Device) -> bool {
+    info.management_addresses.contains(&device.ip)
+        || info.addresses.contains(&device.ip)
+        || device
+            .mac
+            .as_deref()
+            .is_some_and(|device_mac| same_mac(device_mac, &info.source_mac))
+}
+
+fn lldp_passive_key(info: &discovery::lldp::LldpInfo) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        info.source_mac,
+        info.chassis_id.as_deref().unwrap_or(""),
+        info.port_id.as_deref().unwrap_or(""),
+        info.management_addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn cdp_passive_key(info: &discovery::cdp::CdpInfo) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        info.source_mac,
+        info.device_id.as_deref().unwrap_or(""),
+        info.port_id.as_deref().unwrap_or(""),
+        info.addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        info.management_addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 async fn scan_many_inner(
@@ -991,5 +1632,107 @@ mod tests {
         let merged = merge_devices_by_interface_ip(vec![left, right]);
 
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn continuous_passive_lldp_update_emits_device_by_management_address() {
+        let mut manager = passive_manager();
+
+        let events = manager.apply_passive_update(ContinuousPassiveUpdate::Lldp {
+            interface: "en0".to_string(),
+            info: discovery::lldp::LldpInfo {
+                source_mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                chassis_id: Some("aa:bb:cc:dd:ee:ff".to_string()),
+                chassis_id_subtype: Some("mac-address".to_string()),
+                chassis_mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+                port_id: Some("Gi1/0/1".to_string()),
+                port_id_subtype: Some("interface-name".to_string()),
+                ttl: Some(120),
+                port_description: None,
+                system_name: Some("edge-switch".to_string()),
+                system_description: None,
+                system_capabilities: vec!["bridge".to_string()],
+                enabled_capabilities: vec!["bridge".to_string()],
+                management_addresses: vec!["192.168.1.2".parse().unwrap()],
+            },
+        });
+
+        let [ScanEvent::DeviceUpdated(device)] = events.as_slice() else {
+            panic!("expected one device update");
+        };
+        assert_eq!(device.ip.to_string(), "192.168.1.2");
+        assert_eq!(device.interface.as_deref(), Some("en0"));
+        assert_eq!(device.hostname.as_deref(), Some("edge-switch"));
+        assert_eq!(
+            device
+                .device_type
+                .as_ref()
+                .map(|guess| guess.value.as_str()),
+            Some("switch")
+        );
+    }
+
+    #[test]
+    fn continuous_passive_cdp_pending_update_enriches_later_scan_device() {
+        let mut manager = passive_manager();
+
+        let events = manager.apply_passive_update(ContinuousPassiveUpdate::Cdp {
+            interface: "en0".to_string(),
+            info: discovery::cdp::CdpInfo {
+                source_mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                version: 2,
+                ttl: 180,
+                device_id: Some("access-switch".to_string()),
+                addresses: Vec::new(),
+                port_id: Some("GigabitEthernet1/0/1".to_string()),
+                capabilities: vec!["switch".to_string()],
+                software_version: Some("Cisco IOS Software".to_string()),
+                platform: Some("cisco WS-C2960X".to_string()),
+                native_vlan: None,
+                duplex: None,
+                management_addresses: Vec::new(),
+            },
+        });
+        assert!(events.is_empty());
+
+        let mut device = Device::new("192.168.1.44".parse().unwrap(), Utc::now());
+        device.interface = Some("en0".to_string());
+        device.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+
+        let event = manager.observe_scan_event(ScanEvent::DeviceUpdated(Box::new(device)));
+        let ScanEvent::DeviceUpdated(device) = event else {
+            panic!("expected device update");
+        };
+
+        assert_eq!(device.hostname.as_deref(), Some("access-switch"));
+        assert_eq!(
+            device.make.as_ref().map(|guess| guess.value.as_str()),
+            Some("Cisco")
+        );
+        assert!(
+            device
+                .evidence
+                .iter()
+                .any(|item| item.source == "cdp" && item.key == "software_version")
+        );
+    }
+
+    fn passive_manager() -> ContinuousPassiveManager {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "en0".to_string(),
+            ContinuousPassiveInterfaceState {
+                targets: vec!["192.168.1.0/24".parse().unwrap()],
+                oui: false,
+                devices: BTreeMap::new(),
+                pending_lldp: BTreeMap::new(),
+                pending_cdp: BTreeMap::new(),
+            },
+        );
+        ContinuousPassiveManager {
+            states,
+            rules: identity_rules::RuleDb::default(),
+            oui_db: HashMap::new(),
+        }
     }
 }

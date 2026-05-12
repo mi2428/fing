@@ -19,10 +19,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     time::Duration,
 };
-use tokio::sync::{
-    mpsc::{UnboundedReceiver, UnboundedSender},
-    watch,
-};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 pub(super) type MdnsRun = Result<BTreeMap<IpAddr, enrich::MdnsInfo>>;
 pub(super) type UpnpRun = Result<BTreeMap<IpAddr, upnp::UpnpInfo>>;
@@ -79,36 +76,6 @@ fn cdp_listen_timeout(config: &ScanConfig) -> Duration {
 
 pub(super) fn idle_phase(interval: Duration, round: u64) -> Option<String> {
     (!interval.is_zero()).then(|| format!("idle {}ms after round {round}", interval.as_millis()))
-}
-
-pub(super) async fn wait_until_resumed(
-    pause_rx: &mut watch::Receiver<bool>,
-    events: &UnboundedSender<ScanEvent>,
-) {
-    if !*pause_rx.borrow() {
-        return;
-    }
-    // Pausing is cooperative: the live UI controls a watch channel, and scan
-    // phases check it between network steps so raw socket tasks are not aborted
-    // mid-packet.
-    let _ = events.send(ScanEvent::Phase("paused".to_string()));
-    while *pause_rx.borrow_and_update() {
-        if pause_rx.changed().await.is_err() {
-            return;
-        }
-    }
-}
-
-pub(super) async fn wait_interval_or_pause(
-    interval: Duration,
-    pause_rx: &mut watch::Receiver<bool>,
-) {
-    tokio::select! {
-        _ = tokio::time::sleep(interval) => {}
-        changed = pause_rx.changed() => {
-            let _ = changed;
-        }
-    }
 }
 
 pub(super) async fn forward_child_events(
