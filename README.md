@@ -1,6 +1,6 @@
 # fing
 
-A generic Fing made of Rust TUI - scans local IPv4 networks and uses ARP, OUI, DNS, mDNS, NetBIOS, UPnP, DHCP, SNMP, SMB, HTTP, and TLS evidence as device fingerprints.
+A generic Fing made of Rust TUI - scans local IPv4 networks and uses ARP, OUI, DNS, mDNS, NetBIOS, UPnP, DHCP, SNMP, LLDP, CDP, SMB, HTTP, and TLS evidence as device fingerprints.
 
 [![](https://github.com/mi2428/fing/blob/main/screencast.gif?raw=true)](https://github.com/mi2428/fing/blob/main/screencast.gif)
 
@@ -49,7 +49,7 @@ Options:
 
 Fingerprint Options:
       --fingerprint.source <SOURCE>
-          Limit fingerprint sources. Defaults to all sources when omitted [possible values: oui, rdns, mdns, netbios, upnp, snmp, dhcp]
+          Limit fingerprint sources. Defaults to profile-appropriate sources when omitted [possible values: oui, rdns, mdns, netbios, upnp, snmp, lldp, cdp, dhcp]
       --dhcp.leases <DHCP_LEASES>
           Read DHCP leases from an explicit lease file. Can be repeated
       --snmp.community <SNMP_COMMUNITY>
@@ -70,6 +70,12 @@ Update the local IEEE OUI vendor database:
 $ fing oui update
 $ fing oui update --output.path ./oui.json
 ```
+
+>[!NOTE]
+> LLDP and CDP collection are passive and run by default with the `deep` profile.
+> In live/continuous mode, both listeners stay up across scan rounds and update matching devices as advertisements arrive.
+> In one-shot output mode, LLDP listens for at least 30 seconds and CDP listens for at least 65 seconds because common Cisco defaults advertise every 60 seconds.
+> You can also request them explicitly with `--fingerprint.source lldp` or `--fingerprint.source cdp`.
 
 ## Development
 
