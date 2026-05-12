@@ -23,7 +23,7 @@ use apply::{
     apply_cdp_info, apply_deep_probes, apply_dhcp_lease, apply_lldp_info, apply_mdns_info,
     apply_oui, apply_smb_info, apply_snmp_info, apply_upnp_info, merge_devices_by_interface_ip,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use phases::{
     L2Discovery, L2Run, MulticastUpdate, NameUpdate, ProbeUpdate, emit, emit_device,
     forward_child_events, idle_phase, run_deep_and_snmp_enrichment, run_multicast_enrichment,
@@ -155,9 +155,13 @@ struct ContinuousPassiveInterfaceState {
     pending_observations: BTreeMap<String, PassiveObservation>,
 }
 
+const DEFAULT_LLDP_TTL: Duration = Duration::from_secs(120);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PassiveObservation {
     key: String,
+    received_at: DateTime<Utc>,
+    ttl: Duration,
     candidate_ips: Vec<IpAddr>,
     candidate_macs: Vec<String>,
     advertisement: discovery::l2::L2Advertisement,
@@ -165,15 +169,29 @@ struct PassiveObservation {
 
 impl PassiveObservation {
     fn from_advertisement(advertisement: discovery::l2::L2Advertisement) -> Self {
+        Self::from_advertisement_at(advertisement, Utc::now())
+    }
+
+    fn from_advertisement_at(
+        advertisement: discovery::l2::L2Advertisement,
+        received_at: DateTime<Utc>,
+    ) -> Self {
         match &advertisement {
             discovery::l2::L2Advertisement::Lldp(info) => Self {
                 key: format!("lldp|{}", info.identity_key()),
+                received_at,
+                ttl: info
+                    .ttl
+                    .map(|ttl| Duration::from_secs(u64::from(ttl)))
+                    .unwrap_or(DEFAULT_LLDP_TTL),
                 candidate_ips: info.management_addresses.clone(),
                 candidate_macs: lldp_candidate_macs(info),
                 advertisement,
             },
             discovery::l2::L2Advertisement::Cdp(info) => Self {
                 key: format!("cdp|{}", info.identity_key()),
+                received_at,
+                ttl: Duration::from_secs(u64::from(info.ttl)),
                 candidate_ips: info
                     .management_addresses
                     .iter()
@@ -184,6 +202,12 @@ impl PassiveObservation {
                 advertisement,
             },
         }
+    }
+
+    fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        now.signed_duration_since(self.received_at)
+            .to_std()
+            .is_ok_and(|age| age >= self.ttl)
     }
 
     fn target_ips(
@@ -316,6 +340,7 @@ impl ContinuousPassiveManager {
         let Some(state) = self.states.get_mut(&interface) else {
             return;
         };
+        prune_expired_observations(state, Utc::now());
         merge_known_device(state, device.clone());
         let mut merged = state
             .devices
@@ -345,6 +370,11 @@ impl ContinuousPassiveManager {
         let Some(state) = self.states.get_mut(interface) else {
             return Vec::new();
         };
+        let now = Utc::now();
+        prune_expired_observations(state, now);
+        if observation.is_expired(now) {
+            return Vec::new();
+        }
         state
             .pending_observations
             .insert(observation.key.clone(), observation.clone());
@@ -355,9 +385,12 @@ impl ContinuousPassiveManager {
                 .devices
                 .entry(ip)
                 .or_insert_with(|| passive_device(ip, interface));
+            let before = device.clone();
             observation.apply_to_device(device, state.oui.then_some(&self.oui_db));
             identity_rules::apply_identity_rules(device, &self.rules);
-            events.push(ScanEvent::DeviceUpdated(Box::new(device.clone())));
+            if *device != before {
+                events.push(ScanEvent::DeviceUpdated(Box::new(device.clone())));
+            }
         }
         events
     }
@@ -645,6 +678,12 @@ fn merge_device_snapshot(existing: &mut Device, mut incoming: Device) {
     }
     existing.first_seen = existing.first_seen.min(incoming.first_seen);
     existing.last_seen = existing.last_seen.max(incoming.last_seen);
+}
+
+fn prune_expired_observations(state: &mut ContinuousPassiveInterfaceState, now: DateTime<Utc>) {
+    state
+        .pending_observations
+        .retain(|_, observation| !observation.is_expired(now));
 }
 
 fn apply_pending_passive(
@@ -1515,6 +1554,86 @@ mod tests {
                 .iter()
                 .any(|item| item.source == "cdp" && item.key == "software_version")
         );
+    }
+
+    #[test]
+    fn continuous_passive_duplicate_observation_does_not_emit_unchanged_update() {
+        let mut manager = passive_manager();
+        let advertisement = discovery::l2::L2Advertisement::Lldp(discovery::lldp::LldpInfo {
+            source_mac: "aa:bb:cc:dd:ee:ff".to_string(),
+            chassis_id: Some("aa:bb:cc:dd:ee:ff".to_string()),
+            chassis_id_subtype: Some("mac-address".to_string()),
+            chassis_mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+            port_id: Some("Gi1/0/1".to_string()),
+            port_id_subtype: Some("interface-name".to_string()),
+            ttl: Some(120),
+            port_description: None,
+            system_name: Some("edge-switch".to_string()),
+            system_description: None,
+            system_capabilities: vec!["bridge".to_string()],
+            enabled_capabilities: vec!["bridge".to_string()],
+            management_addresses: vec!["192.168.1.2".parse().unwrap()],
+        });
+
+        let first = manager.apply_passive_update(passive_update(advertisement.clone()));
+        let second = manager.apply_passive_update(passive_update(advertisement));
+
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn expired_passive_observation_is_not_applied_to_later_scan_device() {
+        let mut manager = passive_manager();
+        let observation = PassiveObservation::from_advertisement_at(
+            discovery::l2::L2Advertisement::Cdp(discovery::cdp::CdpInfo {
+                source_mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                version: 2,
+                ttl: 1,
+                device_id: Some("expired-switch".to_string()),
+                addresses: Vec::new(),
+                port_id: Some("GigabitEthernet1/0/1".to_string()),
+                capabilities: vec!["switch".to_string()],
+                software_version: Some("Cisco IOS Software".to_string()),
+                platform: Some("cisco WS-C2960X".to_string()),
+                native_vlan: None,
+                duplex: None,
+                management_addresses: Vec::new(),
+            }),
+            Utc::now() - chrono::Duration::seconds(10),
+        );
+        manager
+            .states
+            .get_mut("en0")
+            .unwrap()
+            .pending_observations
+            .insert(observation.key.clone(), observation);
+
+        let mut device = Device::new("192.168.1.44".parse().unwrap(), Utc::now());
+        device.interface = Some("en0".to_string());
+        device.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+
+        let event = manager.observe_scan_event(ScanEvent::DeviceUpdated(Box::new(device)));
+        let ScanEvent::DeviceUpdated(device) = event else {
+            panic!("expected device update");
+        };
+
+        assert!(device.hostname.is_none());
+        assert!(
+            manager
+                .states
+                .get("en0")
+                .unwrap()
+                .pending_observations
+                .is_empty()
+        );
+    }
+
+    fn passive_update(advertisement: discovery::l2::L2Advertisement) -> ContinuousPassiveUpdate {
+        ContinuousPassiveUpdate::Observation {
+            interface: "en0".to_string(),
+            observation: Box::new(PassiveObservation::from_advertisement(advertisement)),
+        }
     }
 
     fn passive_manager() -> ContinuousPassiveManager {
