@@ -1,4 +1,4 @@
-# fing
+# Fing
 
 A generic Fing made of Rust TUI - scans local IPv4 networks and uses ARP, OUI, DNS, mDNS, NetBIOS, UPnP, DHCP, SNMP, LLDP, CDP, SMB, HTTP, and TLS evidence as device fingerprints.
 
