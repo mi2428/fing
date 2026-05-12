@@ -22,7 +22,9 @@ use devices::{
 pub use interfaces::LiveInterfacePanel;
 use interfaces::{interface_panel_width, render_interfaces, top_panel_height};
 use layout::{TABLE_COLUMN_SPACING, corrected_table_offset};
-use logs::{LiveLogEntry, LiveLogLevel, key_span, source_legend, styled_log_line, value_span};
+use logs::{
+    LiveLogEntry, LiveLogLevel, help_bar, key_span, source_legend, styled_log_line, value_span,
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -485,24 +487,26 @@ impl LiveTable {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(1),
                 Constraint::Length(top_panel_height()),
                 Constraint::Min(8),
                 Constraint::Length(1),
             ])
             .split(area);
 
-        let interface_width = self.interface_panel_width(chunks[0].width);
+        let interface_width = self.interface_panel_width(chunks[1].width);
         let top = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(0), Constraint::Length(interface_width)])
-            .split(chunks[0]);
+            .split(chunks[1]);
 
+        frame.render_widget(help_bar(chunks[0].width), chunks[0]);
         frame.render_widget(self.live_scan(top[0].width), top[0]);
         render_interfaces(frame, top[1], &self.interface_panel, self.options);
-        self.render_table(frame, chunks[1]);
+        self.render_table(frame, chunks[2]);
         frame.render_widget(
-            source_legend(chunks[2].width, self.footer_indicator()),
-            chunks[2],
+            source_legend(chunks[3].width, self.footer_indicator()),
+            chunks[3],
         );
     }
 
@@ -617,7 +621,7 @@ mod tests {
             interface_row_style, visible_interface_columns,
         },
         layout::{fit_cell, table_spacing_width},
-        logs::{log_style, source_footer_line},
+        logs::{help_line, log_style, source_footer_line},
     };
     use crate::net::InterfaceInfo;
     use crate::{model::Device, output::MacAddressDisplay, scanner::ScanEvent};
@@ -1250,6 +1254,30 @@ mod tests {
         assert!(last_row.contains("A=ARP"));
         assert!(last_row.contains("O=OUI"));
         assert!(last_row.contains("M=mDNS"));
+    }
+
+    #[test]
+    fn live_tui_reserves_top_row_for_keyboard_help() {
+        let mut app = LiveTable::new(OutputOptions::default(), LiveInterfacePanel::default());
+
+        let frame = render_app_to_text(&mut app, 180, 30);
+        let first_row = frame.lines().next().unwrap_or_default();
+
+        assert!(first_row.contains("Keys:"));
+        assert!(first_row.contains("w=Pause scan"));
+        assert!(first_row.contains("Ctrl-D/U=Page"));
+        assert!(first_row.contains("Ctrl-C=Quit"));
+        assert!(!first_row.contains("Live Scan"));
+    }
+
+    #[test]
+    fn help_line_truncates_to_available_width() {
+        let line = help_line(32);
+        let text = line_to_string(&line);
+
+        assert_eq!(text.chars().count(), 32);
+        assert!(text.starts_with("Keys: w=Pause scan"));
+        assert!(text.ends_with('~'));
     }
 
     #[test]

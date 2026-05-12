@@ -85,6 +85,22 @@ pub(super) fn source_legend(width: u16, filter: Option<String>) -> Paragraph<'st
     Paragraph::new(line).style(NeonTheme::panel())
 }
 
+pub(super) fn help_bar(width: u16) -> Paragraph<'static> {
+    Paragraph::new(help_line(width as usize)).style(NeonTheme::panel())
+}
+
+pub(super) fn help_line(width: usize) -> Line<'static> {
+    Line::from(vec![Span::styled(
+        fit_cell(help_text(), width),
+        NeonTheme::value(),
+    )])
+}
+
+fn help_text() -> String {
+    "Keys: w=Pause scan  Esc=Resume  Ctrl-D/U=Page  Up/Down,j/k=Move  /=Filter  Ctrl-C=Quit"
+        .to_string()
+}
+
 pub(super) fn source_footer_line(width: usize, filter: String) -> Line<'static> {
     if width == 0 {
         return Line::from(Vec::<Span<'static>>::new());
