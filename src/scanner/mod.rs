@@ -112,9 +112,9 @@ pub async fn scan_continuously_with_events(
 
 #[derive(Debug, Clone)]
 enum ContinuousPassiveUpdate {
-    Advertisement {
+    Observation {
         interface: String,
-        advertisement: Box<discovery::l2::L2Advertisement>,
+        observation: Box<PassiveObservation>,
     },
     Warning(String),
 }
@@ -152,8 +152,88 @@ struct ContinuousPassiveInterfaceState {
     targets: Vec<ipnet::Ipv4Net>,
     oui: bool,
     devices: BTreeMap<IpAddr, Device>,
-    pending_lldp: BTreeMap<String, discovery::lldp::LldpInfo>,
-    pending_cdp: BTreeMap<String, discovery::cdp::CdpInfo>,
+    pending_observations: BTreeMap<String, PassiveObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PassiveObservation {
+    key: String,
+    candidate_ips: Vec<IpAddr>,
+    candidate_macs: Vec<String>,
+    advertisement: discovery::l2::L2Advertisement,
+}
+
+impl PassiveObservation {
+    fn from_advertisement(advertisement: discovery::l2::L2Advertisement) -> Self {
+        match &advertisement {
+            discovery::l2::L2Advertisement::Lldp(info) => Self {
+                key: format!("lldp|{}", info.identity_key()),
+                candidate_ips: info.management_addresses.clone(),
+                candidate_macs: lldp_candidate_macs(info),
+                advertisement,
+            },
+            discovery::l2::L2Advertisement::Cdp(info) => Self {
+                key: format!("cdp|{}", info.identity_key()),
+                candidate_ips: info
+                    .management_addresses
+                    .iter()
+                    .chain(&info.addresses)
+                    .copied()
+                    .collect(),
+                candidate_macs: vec![info.source_mac.clone()],
+                advertisement,
+            },
+        }
+    }
+
+    fn target_ips(
+        &self,
+        devices: &BTreeMap<IpAddr, Device>,
+        targets: &[ipnet::Ipv4Net],
+    ) -> Vec<IpAddr> {
+        let mut ips = BTreeSet::new();
+        for target in targets {
+            for ip in &self.candidate_ips {
+                if target_contains_ip(*target, *ip) {
+                    ips.insert(*ip);
+                }
+            }
+        }
+
+        for mac in &self.candidate_macs {
+            if let Some((ip, _)) = devices.iter().find(|(_, device)| {
+                device
+                    .mac
+                    .as_deref()
+                    .is_some_and(|device_mac| same_mac(device_mac, mac))
+            }) {
+                ips.insert(*ip);
+            }
+        }
+
+        ips.into_iter().collect()
+    }
+
+    fn matches_device(&self, device: &Device) -> bool {
+        self.candidate_ips.contains(&device.ip)
+            || self.candidate_macs.iter().any(|mac| {
+                device
+                    .mac
+                    .as_deref()
+                    .is_some_and(|device_mac| same_mac(device_mac, mac))
+            })
+    }
+
+    fn apply_to_device(&self, device: &mut Device, oui_db: Option<&HashMap<String, String>>) {
+        match &self.advertisement {
+            discovery::l2::L2Advertisement::Lldp(info) => {
+                apply_lldp_info(device, info.clone(), oui_db);
+            }
+            discovery::l2::L2Advertisement::Cdp(info) => {
+                apply_cdp_info(device, info.clone(), oui_db);
+            }
+        }
+    }
 }
 
 impl ContinuousPassiveManager {
@@ -173,8 +253,7 @@ impl ContinuousPassiveManager {
                     targets: interface.targets.clone(),
                     oui: interface.oui,
                     devices: BTreeMap::new(),
-                    pending_lldp: BTreeMap::new(),
-                    pending_cdp: BTreeMap::new(),
+                    pending_observations: BTreeMap::new(),
                 },
             );
         }
@@ -250,65 +329,33 @@ impl ContinuousPassiveManager {
 
     fn apply_passive_update(&mut self, update: ContinuousPassiveUpdate) -> Vec<ScanEvent> {
         match update {
-            ContinuousPassiveUpdate::Advertisement {
+            ContinuousPassiveUpdate::Observation {
                 interface,
-                advertisement,
-            } => match *advertisement {
-                discovery::l2::L2Advertisement::Lldp(info) => {
-                    self.apply_lldp_update(&interface, info)
-                }
-                discovery::l2::L2Advertisement::Cdp(info) => {
-                    self.apply_cdp_update(&interface, info)
-                }
-            },
+                observation,
+            } => self.apply_observation(&interface, *observation),
             ContinuousPassiveUpdate::Warning(warning) => vec![ScanEvent::Warning(warning)],
         }
     }
 
-    fn apply_lldp_update(
+    fn apply_observation(
         &mut self,
         interface: &str,
-        info: discovery::lldp::LldpInfo,
+        observation: PassiveObservation,
     ) -> Vec<ScanEvent> {
         let Some(state) = self.states.get_mut(interface) else {
             return Vec::new();
         };
         state
-            .pending_lldp
-            .insert(lldp_passive_key(&info), info.clone());
+            .pending_observations
+            .insert(observation.key.clone(), observation.clone());
 
         let mut events = Vec::new();
-        for ip in lldp_target_ips(state, &info) {
+        for ip in observation.target_ips(&state.devices, &state.targets) {
             let device = state
                 .devices
                 .entry(ip)
                 .or_insert_with(|| passive_device(ip, interface));
-            apply_lldp_info(device, info.clone(), state.oui.then_some(&self.oui_db));
-            identity_rules::apply_identity_rules(device, &self.rules);
-            events.push(ScanEvent::DeviceUpdated(Box::new(device.clone())));
-        }
-        events
-    }
-
-    fn apply_cdp_update(
-        &mut self,
-        interface: &str,
-        info: discovery::cdp::CdpInfo,
-    ) -> Vec<ScanEvent> {
-        let Some(state) = self.states.get_mut(interface) else {
-            return Vec::new();
-        };
-        state
-            .pending_cdp
-            .insert(cdp_passive_key(&info), info.clone());
-
-        let mut events = Vec::new();
-        for ip in cdp_target_ips(state, &info) {
-            let device = state
-                .devices
-                .entry(ip)
-                .or_insert_with(|| passive_device(ip, interface));
-            apply_cdp_info(device, info.clone(), state.oui.then_some(&self.oui_db));
+            observation.apply_to_device(device, state.oui.then_some(&self.oui_db));
             identity_rules::apply_identity_rules(device, &self.rules);
             events.push(ScanEvent::DeviceUpdated(Box::new(device.clone())));
         }
@@ -363,9 +410,10 @@ async fn continuous_l2_listener(
             protocols,
             || worker_cancel.load(Ordering::Relaxed) || stop_updates.is_closed(),
             move |advertisement| {
-                let _ = worker_updates.send(ContinuousPassiveUpdate::Advertisement {
+                let observation = PassiveObservation::from_advertisement(advertisement.clone());
+                let _ = worker_updates.send(ContinuousPassiveUpdate::Observation {
                     interface: iface_name.clone(),
-                    advertisement: Box::new(advertisement.clone()),
+                    observation: Box::new(observation),
                 });
             },
         )
@@ -605,99 +653,16 @@ fn apply_pending_passive(
     oui_db: &HashMap<String, String>,
     rules: &identity_rules::RuleDb,
 ) {
-    let lldp_matches = state
-        .pending_lldp
+    let matches = state
+        .pending_observations
         .values()
-        .filter(|info| lldp_matches_device(info, device))
+        .filter(|observation| observation.matches_device(device))
         .cloned()
         .collect::<Vec<_>>();
-    for info in lldp_matches {
-        apply_lldp_info(device, info, state.oui.then_some(oui_db));
-    }
-    let cdp_matches = state
-        .pending_cdp
-        .values()
-        .filter(|info| cdp_matches_device(info, device))
-        .cloned()
-        .collect::<Vec<_>>();
-    for info in cdp_matches {
-        apply_cdp_info(device, info, state.oui.then_some(oui_db));
+    for observation in matches {
+        observation.apply_to_device(device, state.oui.then_some(oui_db));
     }
     identity_rules::apply_identity_rules(device, rules);
-}
-
-fn lldp_target_ips(
-    state: &ContinuousPassiveInterfaceState,
-    info: &discovery::lldp::LldpInfo,
-) -> Vec<IpAddr> {
-    let mut ips = BTreeSet::new();
-    for target in &state.targets {
-        ips.extend(lldp_device_ips(&state.devices, info, *target));
-    }
-    ips.into_iter().collect()
-}
-
-fn cdp_target_ips(
-    state: &ContinuousPassiveInterfaceState,
-    info: &discovery::cdp::CdpInfo,
-) -> Vec<IpAddr> {
-    let mut ips = BTreeSet::new();
-    for target in &state.targets {
-        ips.extend(cdp_device_ips(&state.devices, info, *target));
-    }
-    ips.into_iter().collect()
-}
-
-fn lldp_matches_device(info: &discovery::lldp::LldpInfo, device: &Device) -> bool {
-    info.management_addresses.contains(&device.ip)
-        || lldp_candidate_macs(info).iter().any(|mac| {
-            device
-                .mac
-                .as_deref()
-                .is_some_and(|device_mac| same_mac(device_mac, mac))
-        })
-}
-
-fn cdp_matches_device(info: &discovery::cdp::CdpInfo, device: &Device) -> bool {
-    info.management_addresses.contains(&device.ip)
-        || info.addresses.contains(&device.ip)
-        || device
-            .mac
-            .as_deref()
-            .is_some_and(|device_mac| same_mac(device_mac, &info.source_mac))
-}
-
-fn lldp_passive_key(info: &discovery::lldp::LldpInfo) -> String {
-    format!(
-        "{}|{}|{}|{}",
-        info.source_mac,
-        info.chassis_id.as_deref().unwrap_or(""),
-        info.port_id.as_deref().unwrap_or(""),
-        info.management_addresses
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
-fn cdp_passive_key(info: &discovery::cdp::CdpInfo) -> String {
-    format!(
-        "{}|{}|{}|{}|{}",
-        info.source_mac,
-        info.device_id.as_deref().unwrap_or(""),
-        info.port_id.as_deref().unwrap_or(""),
-        info.addresses
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(","),
-        info.management_addresses
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
-    )
 }
 
 async fn scan_many_inner(
@@ -1257,12 +1222,12 @@ impl PassiveDiscovery {
     }
 }
 
-type PassiveUpdate = discovery::l2::L2Advertisement;
+type PassiveUpdate = PassiveObservation;
 
 async fn recv_passive_update(passive: &mut PassiveDiscovery) -> Option<PassiveUpdate> {
     match &mut passive.l2 {
         Some(l2) => match l2.updates.recv().await {
-            Some(advertisement) => Some(advertisement),
+            Some(advertisement) => Some(PassiveObservation::from_advertisement(advertisement)),
             None => {
                 passive.l2 = None;
                 None
@@ -1291,7 +1256,11 @@ fn drain_passive_updates(
 ) {
     if let Some(discovery) = &mut passive.l2 {
         while let Ok(advertisement) = discovery.updates.try_recv() {
-            apply_passive_update(devices, advertisement, context);
+            apply_passive_update(
+                devices,
+                PassiveObservation::from_advertisement(advertisement),
+                context,
+            );
         }
     }
 }
@@ -1301,13 +1270,10 @@ fn apply_passive_update(
     update: PassiveUpdate,
     context: &LldpApplyContext<'_>,
 ) {
-    match update {
-        discovery::l2::L2Advertisement::Lldp(info) => {
-            apply_lldp_discovery_update(devices, info, context)
-        }
-        discovery::l2::L2Advertisement::Cdp(info) => {
-            apply_cdp_discovery_update(devices, info, context)
-        }
+    for ip in update.target_ips(devices, &[context.target]) {
+        let device = upsert_device(devices, ip, context.now, context.interface);
+        update.apply_to_device(device, context.oui_db);
+        finish_device_update(context.events, device, context.rules);
     }
 }
 
@@ -1329,7 +1295,11 @@ async fn finish_l2_discovery(
             }
             advertisement = discovery.updates.recv(), if updates_open => {
                 if let Some(advertisement) = advertisement {
-                    apply_passive_update(devices, advertisement, context);
+                    apply_passive_update(
+                        devices,
+                        PassiveObservation::from_advertisement(advertisement),
+                        context,
+                    );
                 } else {
                     updates_open = false;
                 }
@@ -1344,7 +1314,11 @@ fn drain_l2_receiver(
     context: &LldpApplyContext<'_>,
 ) {
     while let Ok(advertisement) = updates.try_recv() {
-        apply_passive_update(devices, advertisement, context);
+        apply_passive_update(
+            devices,
+            PassiveObservation::from_advertisement(advertisement),
+            context,
+        );
     }
 }
 
@@ -1355,84 +1329,6 @@ struct LldpApplyContext<'a> {
     oui_db: Option<&'a std::collections::HashMap<String, String>>,
     events: &'a Option<UnboundedSender<ScanEvent>>,
     rules: &'a identity_rules::RuleDb,
-}
-
-fn apply_lldp_discovery_update(
-    devices: &mut BTreeMap<IpAddr, Device>,
-    info: discovery::lldp::LldpInfo,
-    context: &LldpApplyContext<'_>,
-) {
-    for ip in lldp_device_ips(devices, &info, context.target) {
-        let device = upsert_device(devices, ip, context.now, context.interface);
-        apply_lldp_info(device, info.clone(), context.oui_db);
-        finish_device_update(context.events, device, context.rules);
-    }
-}
-
-fn apply_cdp_discovery_update(
-    devices: &mut BTreeMap<IpAddr, Device>,
-    info: discovery::cdp::CdpInfo,
-    context: &LldpApplyContext<'_>,
-) {
-    for ip in cdp_device_ips(devices, &info, context.target) {
-        let device = upsert_device(devices, ip, context.now, context.interface);
-        apply_cdp_info(device, info.clone(), context.oui_db);
-        finish_device_update(context.events, device, context.rules);
-    }
-}
-
-fn lldp_device_ips(
-    devices: &BTreeMap<IpAddr, Device>,
-    info: &discovery::lldp::LldpInfo,
-    target: ipnet::Ipv4Net,
-) -> Vec<IpAddr> {
-    let mut ips = BTreeSet::new();
-    for ip in &info.management_addresses {
-        if target_contains_ip(target, *ip) {
-            ips.insert(*ip);
-        }
-    }
-
-    for mac in lldp_candidate_macs(info) {
-        if let Some((ip, _)) = devices.iter().find(|(_, device)| {
-            device
-                .mac
-                .as_deref()
-                .is_some_and(|device_mac| same_mac(device_mac, &mac))
-        }) {
-            ips.insert(*ip);
-        }
-    }
-
-    ips.into_iter().collect()
-}
-
-fn cdp_device_ips(
-    devices: &BTreeMap<IpAddr, Device>,
-    info: &discovery::cdp::CdpInfo,
-    target: ipnet::Ipv4Net,
-) -> Vec<IpAddr> {
-    let mut ips = BTreeSet::new();
-    for ip in info
-        .management_addresses
-        .iter()
-        .chain(info.addresses.iter())
-    {
-        if target_contains_ip(target, *ip) {
-            ips.insert(*ip);
-        }
-    }
-
-    if let Some((ip, _)) = devices.iter().find(|(_, device)| {
-        device
-            .mac
-            .as_deref()
-            .is_some_and(|device_mac| same_mac(device_mac, &info.source_mac))
-    }) {
-        ips.insert(*ip);
-    }
-
-    ips.into_iter().collect()
 }
 
 fn lldp_candidate_macs(info: &discovery::lldp::LldpInfo) -> Vec<String> {
@@ -1538,10 +1434,10 @@ mod tests {
     fn continuous_passive_lldp_update_emits_device_by_management_address() {
         let mut manager = passive_manager();
 
-        let events = manager.apply_passive_update(ContinuousPassiveUpdate::Advertisement {
+        let events = manager.apply_passive_update(ContinuousPassiveUpdate::Observation {
             interface: "en0".to_string(),
-            advertisement: Box::new(discovery::l2::L2Advertisement::Lldp(
-                discovery::lldp::LldpInfo {
+            observation: Box::new(PassiveObservation::from_advertisement(
+                discovery::l2::L2Advertisement::Lldp(discovery::lldp::LldpInfo {
                     source_mac: "aa:bb:cc:dd:ee:ff".to_string(),
                     chassis_id: Some("aa:bb:cc:dd:ee:ff".to_string()),
                     chassis_id_subtype: Some("mac-address".to_string()),
@@ -1555,7 +1451,7 @@ mod tests {
                     system_capabilities: vec!["bridge".to_string()],
                     enabled_capabilities: vec!["bridge".to_string()],
                     management_addresses: vec!["192.168.1.2".parse().unwrap()],
-                },
+                }),
             )),
         });
 
@@ -1578,10 +1474,10 @@ mod tests {
     fn continuous_passive_cdp_pending_update_enriches_later_scan_device() {
         let mut manager = passive_manager();
 
-        let events = manager.apply_passive_update(ContinuousPassiveUpdate::Advertisement {
+        let events = manager.apply_passive_update(ContinuousPassiveUpdate::Observation {
             interface: "en0".to_string(),
-            advertisement: Box::new(discovery::l2::L2Advertisement::Cdp(
-                discovery::cdp::CdpInfo {
+            observation: Box::new(PassiveObservation::from_advertisement(
+                discovery::l2::L2Advertisement::Cdp(discovery::cdp::CdpInfo {
                     source_mac: "aa:bb:cc:dd:ee:ff".to_string(),
                     version: 2,
                     ttl: 180,
@@ -1594,7 +1490,7 @@ mod tests {
                     native_vlan: None,
                     duplex: None,
                     management_addresses: Vec::new(),
-                },
+                }),
             )),
         });
         assert!(events.is_empty());
@@ -1629,8 +1525,7 @@ mod tests {
                 targets: vec!["192.168.1.0/24".parse().unwrap()],
                 oui: false,
                 devices: BTreeMap::new(),
-                pending_lldp: BTreeMap::new(),
-                pending_cdp: BTreeMap::new(),
+                pending_observations: BTreeMap::new(),
             },
         );
         ContinuousPassiveManager {
