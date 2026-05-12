@@ -25,10 +25,9 @@ use apply::{
 };
 use chrono::Utc;
 use phases::{
-    CdpDiscovery, CdpRun, LldpDiscovery, LldpRun, MulticastUpdate, NameUpdate, ProbeUpdate, emit,
-    emit_device, forward_child_events, idle_phase, run_deep_and_snmp_enrichment,
-    run_multicast_enrichment, run_name_enrichment, scan_target_summary, start_cdp_discovery,
-    start_lldp_discovery, target_contains_ip,
+    L2Discovery, L2Run, MulticastUpdate, NameUpdate, ProbeUpdate, emit, emit_device,
+    forward_child_events, idle_phase, run_deep_and_snmp_enrichment, run_multicast_enrichment,
+    run_name_enrichment, scan_target_summary, start_l2_discovery, target_contains_ip,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -112,13 +111,9 @@ const CONTINUOUS_PASSIVE_POLL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 enum ContinuousPassiveUpdate {
-    Lldp {
+    Advertisement {
         interface: String,
-        info: discovery::lldp::LldpInfo,
-    },
-    Cdp {
-        interface: String,
-        info: discovery::cdp::CdpInfo,
+        advertisement: Box<discovery::l2::L2Advertisement>,
     },
     Warning(String),
 }
@@ -194,18 +189,14 @@ impl ContinuousPassiveManager {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut handles = Vec::new();
         for interface in interfaces {
-            if interface.lldp {
-                handles.push(tokio::spawn(continuous_lldp_listener(
-                    interface.iface.clone(),
-                    tx.clone(),
-                )));
-            }
-            if interface.cdp {
-                handles.push(tokio::spawn(continuous_cdp_listener(
-                    interface.iface.clone(),
-                    tx.clone(),
-                )));
-            }
+            handles.push(tokio::spawn(continuous_l2_listener(
+                interface.iface.clone(),
+                discovery::l2::L2Protocols {
+                    lldp: interface.lldp,
+                    cdp: interface.cdp,
+                },
+                tx.clone(),
+            )));
         }
 
         Ok((manager, rx, ContinuousPassiveListenerGuard { handles }))
@@ -250,12 +241,17 @@ impl ContinuousPassiveManager {
 
     fn apply_passive_update(&mut self, update: ContinuousPassiveUpdate) -> Vec<ScanEvent> {
         match update {
-            ContinuousPassiveUpdate::Lldp { interface, info } => {
-                self.apply_lldp_update(&interface, info)
-            }
-            ContinuousPassiveUpdate::Cdp { interface, info } => {
-                self.apply_cdp_update(&interface, info)
-            }
+            ContinuousPassiveUpdate::Advertisement {
+                interface,
+                advertisement,
+            } => match *advertisement {
+                discovery::l2::L2Advertisement::Lldp(info) => {
+                    self.apply_lldp_update(&interface, info)
+                }
+                discovery::l2::L2Advertisement::Cdp(info) => {
+                    self.apply_cdp_update(&interface, info)
+                }
+            },
             ContinuousPassiveUpdate::Warning(warning) => vec![ScanEvent::Warning(warning)],
         }
     }
@@ -341,8 +337,9 @@ fn continuous_passive_interfaces(
     Ok(interfaces.into_values().collect())
 }
 
-async fn continuous_lldp_listener(
+async fn continuous_l2_listener(
     iface: net::InterfaceInfo,
+    protocols: discovery::l2::L2Protocols,
     updates: UnboundedSender<ContinuousPassiveUpdate>,
 ) {
     loop {
@@ -350,13 +347,14 @@ async fn continuous_lldp_listener(
         let worker_iface = iface.clone();
         let worker_updates = updates.clone();
         let result = tokio::task::spawn_blocking(move || {
-            discovery::lldp::listen_with_callback(
+            discovery::l2::listen_with_callback(
                 &worker_iface,
+                protocols,
                 CONTINUOUS_PASSIVE_POLL,
-                move |info| {
-                    let _ = worker_updates.send(ContinuousPassiveUpdate::Lldp {
+                move |advertisement| {
+                    let _ = worker_updates.send(ContinuousPassiveUpdate::Advertisement {
                         interface: iface_name.clone(),
-                        info: info.clone(),
+                        advertisement: Box::new(advertisement.clone()),
                     });
                 },
             )
@@ -366,39 +364,7 @@ async fn continuous_lldp_listener(
         if updates.is_closed() {
             break;
         }
-        if let Err(warning) = passive_listener_warning("LLDP", &iface.name, result) {
-            let _ = updates.send(ContinuousPassiveUpdate::Warning(warning));
-            break;
-        }
-    }
-}
-
-async fn continuous_cdp_listener(
-    iface: net::InterfaceInfo,
-    updates: UnboundedSender<ContinuousPassiveUpdate>,
-) {
-    loop {
-        let iface_name = iface.name.clone();
-        let worker_iface = iface.clone();
-        let worker_updates = updates.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            discovery::cdp::listen_with_callback(
-                &worker_iface,
-                CONTINUOUS_PASSIVE_POLL,
-                move |info| {
-                    let _ = worker_updates.send(ContinuousPassiveUpdate::Cdp {
-                        interface: iface_name.clone(),
-                        info: info.clone(),
-                    });
-                },
-            )
-        })
-        .await;
-
-        if updates.is_closed() {
-            break;
-        }
-        if let Err(warning) = passive_listener_warning("CDP", &iface.name, result) {
+        if let Err(warning) = passive_listener_warning(protocols.label(), &iface.name, result) {
             let _ = updates.send(ContinuousPassiveUpdate::Warning(warning));
             break;
         }
@@ -956,8 +922,7 @@ async fn scan_inner(
         rules: &identity_rules,
     };
     let mut passive_discovery = PassiveDiscovery {
-        lldp: start_lldp_discovery(&config, iface.clone(), &events),
-        cdp: start_cdp_discovery(&config, iface.clone(), &events),
+        l2: start_l2_discovery(&config, iface.clone(), &events),
     };
 
     if config.dhcp {
@@ -1133,16 +1098,9 @@ async fn scan_inner(
     }
 
     if let Some(Err(err)) =
-        finish_lldp_discovery(passive_discovery.lldp.take(), &mut devices, &lldp_context).await
+        finish_l2_discovery(passive_discovery.l2.take(), &mut devices, &lldp_context).await
     {
-        let warning = format!("LLDP discovery failed: {err}");
-        warnings.push(warning.clone());
-        emit(&events, ScanEvent::Warning(warning));
-    }
-    if let Some(Err(err)) =
-        finish_cdp_discovery(passive_discovery.cdp.take(), &mut devices, &lldp_context).await
-    {
-        let warning = format!("CDP discovery failed: {err}");
+        let warning = format!("L2 passive discovery failed: {err}");
         warnings.push(warning.clone());
         emit(&events, ScanEvent::Warning(warning));
     }
@@ -1281,56 +1239,27 @@ where
 }
 
 struct PassiveDiscovery {
-    lldp: Option<LldpDiscovery>,
-    cdp: Option<CdpDiscovery>,
+    l2: Option<L2Discovery>,
 }
 
 impl PassiveDiscovery {
     fn has_open_updates(&self) -> bool {
-        self.lldp.is_some() || self.cdp.is_some()
+        self.l2.is_some()
     }
 }
 
-enum PassiveUpdate {
-    Lldp(discovery::lldp::LldpInfo),
-    Cdp(discovery::cdp::CdpInfo),
-}
+type PassiveUpdate = discovery::l2::L2Advertisement;
 
 async fn recv_passive_update(passive: &mut PassiveDiscovery) -> Option<PassiveUpdate> {
-    match (&mut passive.lldp, &mut passive.cdp) {
-        (Some(lldp), Some(cdp)) => {
-            tokio::select! {
-                info = lldp.updates.recv() => match info {
-                    Some(info) => Some(PassiveUpdate::Lldp(info)),
-                    None => {
-                        passive.lldp = None;
-                        None
-                    }
-                },
-                info = cdp.updates.recv() => match info {
-                    Some(info) => Some(PassiveUpdate::Cdp(info)),
-                    None => {
-                        passive.cdp = None;
-                        None
-                    }
-                },
-            }
-        }
-        (Some(lldp), None) => match lldp.updates.recv().await {
-            Some(info) => Some(PassiveUpdate::Lldp(info)),
+    match &mut passive.l2 {
+        Some(l2) => match l2.updates.recv().await {
+            Some(advertisement) => Some(advertisement),
             None => {
-                passive.lldp = None;
+                passive.l2 = None;
                 None
             }
         },
-        (None, Some(cdp)) => match cdp.updates.recv().await {
-            Some(info) => Some(PassiveUpdate::Cdp(info)),
-            None => {
-                passive.cdp = None;
-                None
-            }
-        },
-        (None, None) => None,
+        None => None,
     }
 }
 
@@ -1351,14 +1280,9 @@ fn drain_passive_updates(
     devices: &mut BTreeMap<IpAddr, Device>,
     context: &LldpApplyContext<'_>,
 ) {
-    if let Some(discovery) = &mut passive.lldp {
-        while let Ok(info) = discovery.updates.try_recv() {
-            apply_lldp_discovery_update(devices, info, context);
-        }
-    }
-    if let Some(discovery) = &mut passive.cdp {
-        while let Ok(info) = discovery.updates.try_recv() {
-            apply_cdp_discovery_update(devices, info, context);
+    if let Some(discovery) = &mut passive.l2 {
+        while let Ok(advertisement) = discovery.updates.try_recv() {
+            apply_passive_update(devices, advertisement, context);
         }
     }
 }
@@ -1369,30 +1293,34 @@ fn apply_passive_update(
     context: &LldpApplyContext<'_>,
 ) {
     match update {
-        PassiveUpdate::Lldp(info) => apply_lldp_discovery_update(devices, info, context),
-        PassiveUpdate::Cdp(info) => apply_cdp_discovery_update(devices, info, context),
+        discovery::l2::L2Advertisement::Lldp(info) => {
+            apply_lldp_discovery_update(devices, info, context)
+        }
+        discovery::l2::L2Advertisement::Cdp(info) => {
+            apply_cdp_discovery_update(devices, info, context)
+        }
     }
 }
 
-async fn finish_lldp_discovery(
-    lldp: Option<LldpDiscovery>,
+async fn finish_l2_discovery(
+    l2: Option<L2Discovery>,
     devices: &mut BTreeMap<IpAddr, Device>,
     context: &LldpApplyContext<'_>,
-) -> Option<LldpRun> {
-    let mut discovery = lldp?;
+) -> Option<L2Run> {
+    let mut discovery = l2?;
     let mut updates_open = true;
 
     Some(loop {
         tokio::select! {
             result = &mut discovery.listener => {
-                drain_lldp_receiver(&mut discovery.updates, devices, context);
+                drain_l2_receiver(&mut discovery.updates, devices, context);
                 break result
-                    .context("LLDP worker failed")
+                    .context("L2 passive worker failed")
                     .and_then(|listener_result| listener_result);
             }
-            info = discovery.updates.recv(), if updates_open => {
-                if let Some(info) = info {
-                    apply_lldp_discovery_update(devices, info, context);
+            advertisement = discovery.updates.recv(), if updates_open => {
+                if let Some(advertisement) = advertisement {
+                    apply_passive_update(devices, advertisement, context);
                 } else {
                     updates_open = false;
                 }
@@ -1401,50 +1329,13 @@ async fn finish_lldp_discovery(
     })
 }
 
-async fn finish_cdp_discovery(
-    cdp: Option<CdpDiscovery>,
-    devices: &mut BTreeMap<IpAddr, Device>,
-    context: &LldpApplyContext<'_>,
-) -> Option<CdpRun> {
-    let mut discovery = cdp?;
-    let mut updates_open = true;
-
-    Some(loop {
-        tokio::select! {
-            result = &mut discovery.listener => {
-                drain_cdp_receiver(&mut discovery.updates, devices, context);
-                break result
-                    .context("CDP worker failed")
-                    .and_then(|listener_result| listener_result);
-            }
-            info = discovery.updates.recv(), if updates_open => {
-                if let Some(info) = info {
-                    apply_cdp_discovery_update(devices, info, context);
-                } else {
-                    updates_open = false;
-                }
-            }
-        }
-    })
-}
-
-fn drain_lldp_receiver(
-    updates: &mut UnboundedReceiver<discovery::lldp::LldpInfo>,
+fn drain_l2_receiver(
+    updates: &mut UnboundedReceiver<discovery::l2::L2Advertisement>,
     devices: &mut BTreeMap<IpAddr, Device>,
     context: &LldpApplyContext<'_>,
 ) {
-    while let Ok(info) = updates.try_recv() {
-        apply_lldp_discovery_update(devices, info, context);
-    }
-}
-
-fn drain_cdp_receiver(
-    updates: &mut UnboundedReceiver<discovery::cdp::CdpInfo>,
-    devices: &mut BTreeMap<IpAddr, Device>,
-    context: &LldpApplyContext<'_>,
-) {
-    while let Ok(info) = updates.try_recv() {
-        apply_cdp_discovery_update(devices, info, context);
+    while let Ok(advertisement) = updates.try_recv() {
+        apply_passive_update(devices, advertisement, context);
     }
 }
 
@@ -1638,23 +1529,25 @@ mod tests {
     fn continuous_passive_lldp_update_emits_device_by_management_address() {
         let mut manager = passive_manager();
 
-        let events = manager.apply_passive_update(ContinuousPassiveUpdate::Lldp {
+        let events = manager.apply_passive_update(ContinuousPassiveUpdate::Advertisement {
             interface: "en0".to_string(),
-            info: discovery::lldp::LldpInfo {
-                source_mac: "aa:bb:cc:dd:ee:ff".to_string(),
-                chassis_id: Some("aa:bb:cc:dd:ee:ff".to_string()),
-                chassis_id_subtype: Some("mac-address".to_string()),
-                chassis_mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
-                port_id: Some("Gi1/0/1".to_string()),
-                port_id_subtype: Some("interface-name".to_string()),
-                ttl: Some(120),
-                port_description: None,
-                system_name: Some("edge-switch".to_string()),
-                system_description: None,
-                system_capabilities: vec!["bridge".to_string()],
-                enabled_capabilities: vec!["bridge".to_string()],
-                management_addresses: vec!["192.168.1.2".parse().unwrap()],
-            },
+            advertisement: Box::new(discovery::l2::L2Advertisement::Lldp(
+                discovery::lldp::LldpInfo {
+                    source_mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                    chassis_id: Some("aa:bb:cc:dd:ee:ff".to_string()),
+                    chassis_id_subtype: Some("mac-address".to_string()),
+                    chassis_mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+                    port_id: Some("Gi1/0/1".to_string()),
+                    port_id_subtype: Some("interface-name".to_string()),
+                    ttl: Some(120),
+                    port_description: None,
+                    system_name: Some("edge-switch".to_string()),
+                    system_description: None,
+                    system_capabilities: vec!["bridge".to_string()],
+                    enabled_capabilities: vec!["bridge".to_string()],
+                    management_addresses: vec!["192.168.1.2".parse().unwrap()],
+                },
+            )),
         });
 
         let [ScanEvent::DeviceUpdated(device)] = events.as_slice() else {
@@ -1676,22 +1569,24 @@ mod tests {
     fn continuous_passive_cdp_pending_update_enriches_later_scan_device() {
         let mut manager = passive_manager();
 
-        let events = manager.apply_passive_update(ContinuousPassiveUpdate::Cdp {
+        let events = manager.apply_passive_update(ContinuousPassiveUpdate::Advertisement {
             interface: "en0".to_string(),
-            info: discovery::cdp::CdpInfo {
-                source_mac: "aa:bb:cc:dd:ee:ff".to_string(),
-                version: 2,
-                ttl: 180,
-                device_id: Some("access-switch".to_string()),
-                addresses: Vec::new(),
-                port_id: Some("GigabitEthernet1/0/1".to_string()),
-                capabilities: vec!["switch".to_string()],
-                software_version: Some("Cisco IOS Software".to_string()),
-                platform: Some("cisco WS-C2960X".to_string()),
-                native_vlan: None,
-                duplex: None,
-                management_addresses: Vec::new(),
-            },
+            advertisement: Box::new(discovery::l2::L2Advertisement::Cdp(
+                discovery::cdp::CdpInfo {
+                    source_mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                    version: 2,
+                    ttl: 180,
+                    device_id: Some("access-switch".to_string()),
+                    addresses: Vec::new(),
+                    port_id: Some("GigabitEthernet1/0/1".to_string()),
+                    capabilities: vec!["switch".to_string()],
+                    software_version: Some("Cisco IOS Software".to_string()),
+                    platform: Some("cisco WS-C2960X".to_string()),
+                    native_vlan: None,
+                    duplex: None,
+                    management_addresses: Vec::new(),
+                },
+            )),
         });
         assert!(events.is_empty());
 

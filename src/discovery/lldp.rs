@@ -5,20 +5,11 @@
 //! when they publish a management address or when their chassis MAC matches an
 //! already discovered neighbor.
 
-use crate::net::InterfaceInfo;
-use anyhow::{Context, Result, anyhow};
-use pnet::{
-    datalink::{self, Channel, Config},
-    packet::{
-        Packet,
-        ethernet::{EtherTypes, EthernetPacket},
-    },
+use pnet::packet::{
+    Packet,
+    ethernet::{EtherTypes, EthernetPacket},
 };
-use std::{
-    collections::BTreeMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    time::{Duration, Instant},
-};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LldpInfo {
@@ -56,7 +47,7 @@ impl LldpInfo {
         }
     }
 
-    fn identity_key(&self) -> String {
+    pub(crate) fn identity_key(&self) -> String {
         let management = self
             .management_addresses
             .iter()
@@ -71,48 +62,6 @@ impl LldpInfo {
             management
         )
     }
-}
-
-pub fn listen_with_callback<F>(
-    iface: &InterfaceInfo,
-    timeout: Duration,
-    mut on_info: F,
-) -> Result<Vec<LldpInfo>>
-where
-    F: FnMut(&LldpInfo),
-{
-    let pnet_iface = datalink::interfaces()
-        .into_iter()
-        .find(|candidate| candidate.name == iface.name)
-        .ok_or_else(|| anyhow!("interface {} is not available to pnet", iface.name))?;
-
-    let config = Config {
-        read_timeout: Some(Duration::from_millis(100)),
-        read_buffer_size: 65536,
-        ..Default::default()
-    };
-
-    let (_tx, mut rx) = match datalink::channel(&pnet_iface, config)
-        .with_context(|| format!("failed to open datalink channel on {}", iface.name))?
-    {
-        Channel::Ethernet(tx, rx) => (tx, rx),
-        _ => return Err(anyhow!("unsupported datalink channel type")),
-    };
-
-    let mut infos = BTreeMap::new();
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Ok(packet) = rx.next()
-            && let Some(info) = parse_lldp_frame(packet)
-            && let std::collections::btree_map::Entry::Vacant(entry) =
-                infos.entry(info.identity_key())
-        {
-            on_info(&info);
-            entry.insert(info);
-        }
-    }
-
-    Ok(infos.into_values().collect())
 }
 
 pub fn parse_lldp_frame(packet: &[u8]) -> Option<LldpInfo> {

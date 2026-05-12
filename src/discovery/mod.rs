@@ -5,6 +5,7 @@
 //! recently contacted hosts even when raw socket access is unavailable.
 
 pub mod cdp;
+pub mod l2;
 pub mod lldp;
 
 use crate::net::InterfaceInfo;

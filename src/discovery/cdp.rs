@@ -4,14 +4,7 @@
 //! collector listens for Cisco's SNAP PID and extracts the common identity TLVs
 //! exposed by switches, routers, access points, and phones.
 
-use crate::net::InterfaceInfo;
-use anyhow::{Context, Result, anyhow};
-use pnet::datalink::{self, Channel, Config};
-use std::{
-    collections::BTreeMap,
-    net::{IpAddr, Ipv4Addr},
-    time::{Duration, Instant},
-};
+use std::net::{IpAddr, Ipv4Addr};
 
 const CDP_MULTICAST: [u8; 6] = [0x01, 0x00, 0x0c, 0xcc, 0xcc, 0xcc];
 const LLC_SNAP_HEADER: [u8; 8] = [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x0c, 0x20, 0x00];
@@ -53,7 +46,7 @@ impl CdpInfo {
         }
     }
 
-    fn identity_key(&self) -> String {
+    pub(crate) fn identity_key(&self) -> String {
         let addresses = self
             .addresses
             .iter()
@@ -69,48 +62,6 @@ impl CdpInfo {
             addresses
         )
     }
-}
-
-pub fn listen_with_callback<F>(
-    iface: &InterfaceInfo,
-    timeout: Duration,
-    mut on_info: F,
-) -> Result<Vec<CdpInfo>>
-where
-    F: FnMut(&CdpInfo),
-{
-    let pnet_iface = datalink::interfaces()
-        .into_iter()
-        .find(|candidate| candidate.name == iface.name)
-        .ok_or_else(|| anyhow!("interface {} is not available to pnet", iface.name))?;
-
-    let config = Config {
-        read_timeout: Some(Duration::from_millis(100)),
-        read_buffer_size: 65536,
-        ..Default::default()
-    };
-
-    let (_tx, mut rx) = match datalink::channel(&pnet_iface, config)
-        .with_context(|| format!("failed to open datalink channel on {}", iface.name))?
-    {
-        Channel::Ethernet(tx, rx) => (tx, rx),
-        _ => return Err(anyhow!("unsupported datalink channel type")),
-    };
-
-    let mut infos = BTreeMap::new();
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Ok(packet) = rx.next()
-            && let Some(info) = parse_cdp_frame(packet)
-            && let std::collections::btree_map::Entry::Vacant(entry) =
-                infos.entry(info.identity_key())
-        {
-            on_info(&info);
-            entry.insert(info);
-        }
-    }
-
-    Ok(infos.into_values().collect())
 }
 
 pub fn parse_cdp_frame(packet: &[u8]) -> Option<CdpInfo> {

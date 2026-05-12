@@ -6,7 +6,7 @@
 
 use super::{ScanConfig, ScanEvent};
 use crate::{
-    discovery::{cdp, lldp},
+    discovery::l2,
     enrich,
     model::Device,
     net::InterfaceInfo,
@@ -27,17 +27,11 @@ pub(super) type RdnsRun = HashMap<IpAddr, String>;
 pub(super) type NetbiosRun = HashMap<IpAddr, Vec<String>>;
 pub(super) type DeepRun = HashMap<IpAddr, Vec<deep::PortProbe>>;
 pub(super) type SnmpRun = HashMap<IpAddr, snmp::SnmpInfo>;
-pub(super) type LldpRun = Result<Vec<lldp::LldpInfo>>;
-pub(super) type CdpRun = Result<Vec<cdp::CdpInfo>>;
+pub(super) type L2Run = Result<l2::L2Advertisements>;
 
-pub(super) struct LldpDiscovery {
-    pub updates: UnboundedReceiver<lldp::LldpInfo>,
-    pub listener: tokio::task::JoinHandle<LldpRun>,
-}
-
-pub(super) struct CdpDiscovery {
-    pub updates: UnboundedReceiver<cdp::CdpInfo>,
-    pub listener: tokio::task::JoinHandle<CdpRun>,
+pub(super) struct L2Discovery {
+    pub updates: UnboundedReceiver<l2::L2Advertisement>,
+    pub listener: tokio::task::JoinHandle<L2Run>,
 }
 
 pub(super) enum MulticastUpdate {
@@ -118,54 +112,43 @@ pub(super) async fn forward_child_events(
     }
 }
 
-pub(super) fn start_lldp_discovery(
+pub(super) fn start_l2_discovery(
     config: &ScanConfig,
     iface: InterfaceInfo,
     events: &Option<UnboundedSender<ScanEvent>>,
-) -> Option<LldpDiscovery> {
-    if !config.lldp {
+) -> Option<L2Discovery> {
+    let protocols = l2::L2Protocols {
+        lldp: config.lldp,
+        cdp: config.cdp,
+    };
+    if !protocols.any() {
         return None;
     }
 
-    let timeout = lldp_listen_timeout(config);
+    let mut timeout = Duration::ZERO;
+    if config.lldp {
+        timeout = timeout.max(lldp_listen_timeout(config));
+    }
+    if config.cdp {
+        timeout = timeout.max(cdp_listen_timeout(config));
+    }
     emit(
         events,
-        ScanEvent::Phase(format!("LLDP discovery ({}ms)", timeout.as_millis())),
+        ScanEvent::Phase(format!(
+            "{} discovery ({}ms)",
+            protocols.label(),
+            timeout.as_millis()
+        )),
     );
 
     let (tx, updates) = tokio::sync::mpsc::unbounded_channel();
     let listener = tokio::task::spawn_blocking(move || {
-        lldp::listen_with_callback(&iface, timeout, move |info| {
-            let _ = tx.send(info.clone());
+        l2::listen_with_callback(&iface, protocols, timeout, move |advertisement| {
+            let _ = tx.send(advertisement.clone());
         })
     });
 
-    Some(LldpDiscovery { updates, listener })
-}
-
-pub(super) fn start_cdp_discovery(
-    config: &ScanConfig,
-    iface: InterfaceInfo,
-    events: &Option<UnboundedSender<ScanEvent>>,
-) -> Option<CdpDiscovery> {
-    if !config.cdp {
-        return None;
-    }
-
-    let timeout = cdp_listen_timeout(config);
-    emit(
-        events,
-        ScanEvent::Phase(format!("CDP discovery ({}ms)", timeout.as_millis())),
-    );
-
-    let (tx, updates) = tokio::sync::mpsc::unbounded_channel();
-    let listener = tokio::task::spawn_blocking(move || {
-        cdp::listen_with_callback(&iface, timeout, move |info| {
-            let _ = tx.send(info.clone());
-        })
-    });
-
-    Some(CdpDiscovery { updates, listener })
+    Some(L2Discovery { updates, listener })
 }
 
 pub(super) async fn run_multicast_enrichment(
