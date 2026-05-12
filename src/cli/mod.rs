@@ -65,6 +65,7 @@ enum FingerprintSourceArg {
     Upnp,
     Snmp,
     Lldp,
+    Cdp,
     Dhcp,
 }
 
@@ -77,6 +78,7 @@ struct FingerprintSelection {
     upnp: bool,
     snmp: bool,
     lldp: bool,
+    cdp: bool,
     dhcp: bool,
 }
 
@@ -91,6 +93,7 @@ impl FingerprintSelection {
                 upnp: true,
                 snmp: true,
                 lldp: profile.includes_lldp_fingerprints(),
+                cdp: profile.includes_cdp_fingerprints(),
                 dhcp: true,
             };
         }
@@ -103,6 +106,7 @@ impl FingerprintSelection {
             upnp: sources.contains(&FingerprintSourceArg::Upnp),
             snmp: sources.contains(&FingerprintSourceArg::Snmp),
             lldp: sources.contains(&FingerprintSourceArg::Lldp),
+            cdp: sources.contains(&FingerprintSourceArg::Cdp),
             dhcp: sources.contains(&FingerprintSourceArg::Dhcp),
         }
     }
@@ -331,6 +335,7 @@ fn scan_configs_from_args(args: &ScanArgs, timeout: Duration) -> Result<Vec<Scan
                     snmp: fingerprints.snmp,
                     snmp_community: args.snmp_community.clone(),
                     lldp: fingerprints.lldp,
+                    cdp: fingerprints.cdp,
                     dhcp: fingerprints.dhcp,
                     dhcp_paths: args.dhcp_leases.clone(),
                     cache_enabled: true,
@@ -514,17 +519,19 @@ mod tests {
         assert!(configs[0].upnp);
         assert!(configs[0].snmp);
         assert!(!configs[0].lldp);
+        assert!(!configs[0].cdp);
         assert!(configs[0].dhcp);
     }
 
     #[test]
-    fn deep_scan_enables_lldp_by_default() {
+    fn deep_scan_enables_l2_neighbor_protocols_by_default() {
         let mut args = scan_args();
         args.profile = ScanProfile::Deep;
 
         let configs = scan_configs_from_args(&args, Duration::from_millis(1)).unwrap();
 
         assert!(configs[0].lldp);
+        assert!(configs[0].cdp);
     }
 
     #[test]
@@ -615,7 +622,7 @@ mod tests {
             "fing",
             "scan",
             "--fingerprint.source",
-            "dhcp,mdns,lldp",
+            "dhcp,mdns,lldp,cdp",
             "--fingerprint.source",
             "snmp",
             "en0",
@@ -632,6 +639,7 @@ mod tests {
                 FingerprintSourceArg::Dhcp,
                 FingerprintSourceArg::Mdns,
                 FingerprintSourceArg::Lldp,
+                FingerprintSourceArg::Cdp,
                 FingerprintSourceArg::Snmp,
             ]
         );
@@ -644,6 +652,7 @@ mod tests {
         assert!(!configs[0].upnp);
         assert!(configs[0].snmp);
         assert!(configs[0].lldp);
+        assert!(configs[0].cdp);
         assert!(configs[0].dhcp);
     }
 

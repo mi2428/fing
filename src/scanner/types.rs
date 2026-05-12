@@ -32,6 +32,10 @@ impl ScanProfile {
     pub fn includes_lldp_fingerprints(self) -> bool {
         matches!(self, Self::Deep)
     }
+
+    pub fn includes_cdp_fingerprints(self) -> bool {
+        matches!(self, Self::Deep)
+    }
 }
 
 impl std::fmt::Display for ScanProfile {
@@ -62,6 +66,7 @@ pub struct ScanConfig {
     pub snmp: bool,
     pub snmp_community: String,
     pub lldp: bool,
+    pub cdp: bool,
     pub dhcp: bool,
     pub dhcp_paths: Vec<PathBuf>,
     // Identity rules turn raw fingerprints into make/model/OS/type guesses.

@@ -6,7 +6,7 @@
 
 use super::{ScanConfig, ScanEvent};
 use crate::{
-    discovery::lldp,
+    discovery::{cdp, lldp},
     enrich,
     model::Device,
     net::InterfaceInfo,
@@ -31,10 +31,16 @@ pub(super) type NetbiosRun = HashMap<IpAddr, Vec<String>>;
 pub(super) type DeepRun = HashMap<IpAddr, Vec<deep::PortProbe>>;
 pub(super) type SnmpRun = HashMap<IpAddr, snmp::SnmpInfo>;
 pub(super) type LldpRun = Result<Vec<lldp::LldpInfo>>;
+pub(super) type CdpRun = Result<Vec<cdp::CdpInfo>>;
 
 pub(super) struct LldpDiscovery {
     pub updates: UnboundedReceiver<lldp::LldpInfo>,
     pub listener: tokio::task::JoinHandle<LldpRun>,
+}
+
+pub(super) struct CdpDiscovery {
+    pub updates: UnboundedReceiver<cdp::CdpInfo>,
+    pub listener: tokio::task::JoinHandle<CdpRun>,
 }
 
 pub(super) enum MulticastUpdate {
@@ -53,10 +59,19 @@ pub(super) enum ProbeUpdate {
 }
 
 const DEEP_LLDP_LISTEN_TIMEOUT: Duration = Duration::from_secs(30);
+const CDP_LISTEN_TIMEOUT: Duration = Duration::from_secs(65);
 
 fn lldp_listen_timeout(config: &ScanConfig) -> Duration {
     if config.profile.includes_lldp_fingerprints() {
         config.timeout.max(DEEP_LLDP_LISTEN_TIMEOUT)
+    } else {
+        config.timeout
+    }
+}
+
+fn cdp_listen_timeout(config: &ScanConfig) -> Duration {
+    if config.cdp {
+        config.timeout.max(CDP_LISTEN_TIMEOUT)
     } else {
         config.timeout
     }
@@ -159,6 +174,31 @@ pub(super) fn start_lldp_discovery(
     });
 
     Some(LldpDiscovery { updates, listener })
+}
+
+pub(super) fn start_cdp_discovery(
+    config: &ScanConfig,
+    iface: InterfaceInfo,
+    events: &Option<UnboundedSender<ScanEvent>>,
+) -> Option<CdpDiscovery> {
+    if !config.cdp {
+        return None;
+    }
+
+    let timeout = cdp_listen_timeout(config);
+    emit(
+        events,
+        ScanEvent::Phase(format!("CDP discovery ({}ms)", timeout.as_millis())),
+    );
+
+    let (tx, updates) = tokio::sync::mpsc::unbounded_channel();
+    let listener = tokio::task::spawn_blocking(move || {
+        cdp::listen_with_callback(&iface, timeout, move |info| {
+            let _ = tx.send(info.clone());
+        })
+    });
+
+    Some(CdpDiscovery { updates, listener })
 }
 
 pub(super) async fn run_multicast_enrichment(
@@ -548,6 +588,7 @@ mod tests {
             snmp: false,
             snmp_community: "public".to_string(),
             lldp: false,
+            cdp: false,
             dhcp: false,
             dhcp_paths: Vec::new(),
             cache_enabled: false,

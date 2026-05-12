@@ -7,7 +7,7 @@
 
 use crate::{
     dhcp,
-    discovery::lldp,
+    discovery::{cdp, lldp},
     enrich,
     model::Device,
     probes::{deep, smb, snmp, upnp},
@@ -273,6 +273,79 @@ pub(super) fn apply_lldp_info(
         device.set_device_type_guess("switch", "lldp", 0.86);
     } else if !info.enabled_capabilities.is_empty() {
         device.set_device_type_guess("network-device", "lldp", 0.72);
+    }
+}
+
+pub(super) fn apply_cdp_info(
+    device: &mut Device,
+    info: cdp::CdpInfo,
+    oui_db: Option<&HashMap<String, String>>,
+) {
+    device.add_service("cdp", "cdp", None, 0.72);
+    if device.mac.is_none() {
+        device.mac = Some(info.source_mac.clone());
+    }
+    if device.vendor.is_none()
+        && let (Some(mac), Some(oui_db)) = (&device.mac, oui_db)
+    {
+        device.vendor = enrich::lookup_vendor(mac, oui_db);
+    }
+
+    device.add_evidence("cdp", "source_mac", info.source_mac, 0.76);
+    device.add_evidence("cdp", "version", info.version.to_string(), 0.45);
+    device.add_evidence("cdp", "ttl", info.ttl.to_string(), 0.45);
+    if let Some(device_id) = info.device_id {
+        device.add_name(device_id.clone(), "cdp", 0.88);
+        device.add_evidence("cdp", "device_id", device_id, 0.88);
+    }
+    if let Some(port_id) = info.port_id {
+        device.add_evidence("cdp", "port_id", port_id, 0.7);
+    }
+    if let Some(software_version) = info.software_version {
+        device.add_evidence("cdp", "software_version", software_version.clone(), 0.9);
+        device.set_os_guess(software_version, "cdp", 0.82);
+    }
+    if let Some(platform) = info.platform {
+        device.add_evidence("cdp", "platform", platform.clone(), 0.86);
+        device.set_model_guess(platform, "cdp", 0.82);
+        device.set_make_guess("Cisco", "cdp", 0.78);
+    }
+    if let Some(native_vlan) = info.native_vlan {
+        device.add_evidence("cdp", "native_vlan", native_vlan.to_string(), 0.55);
+    }
+    if let Some(duplex) = info.duplex {
+        device.add_evidence("cdp", "duplex", duplex, 0.45);
+    }
+    for capability in &info.capabilities {
+        device.add_evidence("cdp", "capability", capability.as_str(), 0.82);
+    }
+    for address in info.addresses {
+        device.add_evidence("cdp", "address", address.to_string(), 0.78);
+    }
+    for address in info.management_addresses {
+        device.add_evidence("cdp", "management_address", address.to_string(), 0.84);
+    }
+
+    if info
+        .capabilities
+        .iter()
+        .any(|capability| capability == "phone")
+    {
+        device.set_device_type_guess("phone", "cdp", 0.88);
+    } else if info
+        .capabilities
+        .iter()
+        .any(|capability| capability == "router")
+    {
+        device.set_device_type_guess("router", "cdp", 0.86);
+    } else if info
+        .capabilities
+        .iter()
+        .any(|capability| capability == "switch")
+    {
+        device.set_device_type_guess("switch", "cdp", 0.86);
+    } else if !info.capabilities.is_empty() {
+        device.set_device_type_guess("network-device", "cdp", 0.72);
     }
 }
 
@@ -589,6 +662,56 @@ mod tests {
             "lldp",
             "management_address",
             "192.168.1.2"
+        ));
+    }
+
+    #[test]
+    fn cdp_adds_cisco_network_device_identity() {
+        let mut device = device();
+
+        apply_cdp_info(
+            &mut device,
+            cdp::CdpInfo {
+                source_mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                version: 2,
+                ttl: 180,
+                device_id: Some("access-switch".to_string()),
+                addresses: vec!["192.168.1.2".parse().unwrap()],
+                port_id: Some("GigabitEthernet1/0/1".to_string()),
+                capabilities: vec!["switch".to_string()],
+                software_version: Some("Cisco IOS Software".to_string()),
+                platform: Some("cisco WS-C2960X".to_string()),
+                native_vlan: Some(100),
+                duplex: Some("full".to_string()),
+                management_addresses: vec!["192.168.1.3".parse().unwrap()],
+            },
+            None,
+        );
+
+        assert_eq!(device.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(device.hostname.as_deref(), Some("access-switch"));
+        assert_eq!(
+            device.make.as_ref().map(|guess| guess.value.as_str()),
+            Some("Cisco")
+        );
+        assert_eq!(
+            device
+                .device_type
+                .as_ref()
+                .map(|guess| guess.value.as_str()),
+            Some("switch")
+        );
+        assert!(has_evidence(
+            &device,
+            "cdp",
+            "software_version",
+            "Cisco IOS Software"
+        ));
+        assert!(has_evidence(
+            &device,
+            "cdp",
+            "management_address",
+            "192.168.1.3"
         ));
     }
 

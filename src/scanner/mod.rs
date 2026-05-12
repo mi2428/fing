@@ -20,15 +20,15 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use apply::{
-    apply_deep_probes, apply_dhcp_lease, apply_lldp_info, apply_mdns_info, apply_oui,
-    apply_smb_info, apply_snmp_info, apply_upnp_info, merge_devices_by_interface_ip,
+    apply_cdp_info, apply_deep_probes, apply_dhcp_lease, apply_lldp_info, apply_mdns_info,
+    apply_oui, apply_smb_info, apply_snmp_info, apply_upnp_info, merge_devices_by_interface_ip,
 };
 use chrono::Utc;
 use phases::{
-    LldpDiscovery, LldpRun, MulticastUpdate, NameUpdate, ProbeUpdate, emit, emit_device,
-    forward_child_events, idle_phase, run_deep_and_snmp_enrichment, run_multicast_enrichment,
-    run_name_enrichment, scan_target_summary, start_lldp_discovery, target_contains_ip,
-    wait_interval_or_pause, wait_until_resumed,
+    CdpDiscovery, CdpRun, LldpDiscovery, LldpRun, MulticastUpdate, NameUpdate, ProbeUpdate, emit,
+    emit_device, forward_child_events, idle_phase, run_deep_and_snmp_enrichment,
+    run_multicast_enrichment, run_name_enrichment, scan_target_summary, start_cdp_discovery,
+    start_lldp_discovery, target_contains_ip, wait_interval_or_pause, wait_until_resumed,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -314,7 +314,10 @@ async fn scan_inner(
         events: &events,
         rules: &identity_rules,
     };
-    let mut lldp_discovery = start_lldp_discovery(&config, iface.clone(), &events);
+    let mut passive_discovery = PassiveDiscovery {
+        lldp: start_lldp_discovery(&config, iface.clone(), &events),
+        cdp: start_cdp_discovery(&config, iface.clone(), &events),
+    };
 
     if config.dhcp {
         emit(
@@ -330,7 +333,7 @@ async fn scan_inner(
             let dhcp_worker = tokio::task::spawn_blocking(move || dhcp::read_leases(&paths));
             let (leases, dhcp_warnings) = await_with_lldp(
                 dhcp_worker,
-                &mut lldp_discovery,
+                &mut passive_discovery,
                 &mut devices,
                 &lldp_context,
             )
@@ -362,7 +365,7 @@ async fn scan_inner(
     let (mdns_result, upnp_result) = await_with_lldp_and_phase_updates(
         multicast_future,
         &mut multicast_rx,
-        &mut lldp_discovery,
+        &mut passive_discovery,
         &mut devices,
         &lldp_context,
         |devices, update| match update {
@@ -400,7 +403,7 @@ async fn scan_inner(
     let _ = await_with_lldp_and_phase_updates(
         name_future,
         &mut name_rx,
-        &mut lldp_discovery,
+        &mut passive_discovery,
         &mut devices,
         &lldp_context,
         |devices, update| match update {
@@ -429,7 +432,7 @@ async fn scan_inner(
     let _ = await_with_lldp_and_phase_updates(
         probe_future,
         &mut probe_rx,
-        &mut lldp_discovery,
+        &mut passive_discovery,
         &mut devices,
         &lldp_context,
         |devices, update| match update {
@@ -475,7 +478,7 @@ async fn scan_inner(
             let _ = await_with_lldp_and_phase_updates(
                 smb_future,
                 &mut smb_rx,
-                &mut lldp_discovery,
+                &mut passive_discovery,
                 &mut devices,
                 &lldp_context,
                 |devices, (ip, info)| {
@@ -489,9 +492,16 @@ async fn scan_inner(
     }
 
     if let Some(Err(err)) =
-        finish_lldp_discovery(lldp_discovery.take(), &mut devices, &lldp_context).await
+        finish_lldp_discovery(passive_discovery.lldp.take(), &mut devices, &lldp_context).await
     {
         let warning = format!("LLDP discovery failed: {err}");
+        warnings.push(warning.clone());
+        emit(&events, ScanEvent::Warning(warning));
+    }
+    if let Some(Err(err)) =
+        finish_cdp_discovery(passive_discovery.cdp.take(), &mut devices, &lldp_context).await
+    {
+        let warning = format!("CDP discovery failed: {err}");
         warnings.push(warning.clone());
         emit(&events, ScanEvent::Warning(warning));
     }
@@ -561,27 +571,27 @@ fn upsert_device<'a>(
 
 async fn await_with_lldp<F, T>(
     future: F,
-    lldp: &mut Option<LldpDiscovery>,
+    passive: &mut PassiveDiscovery,
     devices: &mut BTreeMap<IpAddr, Device>,
     context: &LldpApplyContext<'_>,
 ) -> T
 where
     F: Future<Output = T>,
 {
-    let mut lldp_open = lldp.is_some();
+    let mut passive_open = passive.has_open_updates();
     tokio::pin!(future);
 
     loop {
         tokio::select! {
             result = &mut future => {
-                drain_lldp_updates(lldp, devices, context);
+                drain_passive_updates(passive, devices, context);
                 return result;
             }
-            info = recv_lldp_update(lldp), if lldp_open => {
-                if let Some(info) = info {
-                    apply_lldp_discovery_update(devices, info, context);
+            update = recv_passive_update(passive), if passive_open => {
+                if let Some(update) = update {
+                    apply_passive_update(devices, update, context);
                 } else {
-                    lldp_open = false;
+                    passive_open = false;
                 }
             }
         }
@@ -591,7 +601,7 @@ where
 async fn await_with_lldp_and_phase_updates<F, T, U, ApplyUpdate>(
     future: F,
     phase_rx: &mut UnboundedReceiver<U>,
-    lldp: &mut Option<LldpDiscovery>,
+    passive: &mut PassiveDiscovery,
     devices: &mut BTreeMap<IpAddr, Device>,
     context: &LldpApplyContext<'_>,
     mut apply_update: ApplyUpdate,
@@ -601,14 +611,14 @@ where
     ApplyUpdate: FnMut(&mut BTreeMap<IpAddr, Device>, U),
 {
     let mut phase_open = true;
-    let mut lldp_open = lldp.is_some();
+    let mut passive_open = passive.has_open_updates();
     tokio::pin!(future);
 
     loop {
         tokio::select! {
             result = &mut future => {
                 drain_phase_updates(phase_rx, devices, &mut apply_update);
-                drain_lldp_updates(lldp, devices, context);
+                drain_passive_updates(passive, devices, context);
                 return result;
             }
             update = phase_rx.recv(), if phase_open => {
@@ -618,21 +628,68 @@ where
                     phase_open = false;
                 }
             }
-            info = recv_lldp_update(lldp), if lldp_open => {
-                if let Some(info) = info {
-                    apply_lldp_discovery_update(devices, info, context);
+            update = recv_passive_update(passive), if passive_open => {
+                if let Some(update) = update {
+                    apply_passive_update(devices, update, context);
                 } else {
-                    lldp_open = false;
+                    passive_open = false;
                 }
             }
         }
     }
 }
 
-async fn recv_lldp_update(lldp: &mut Option<LldpDiscovery>) -> Option<discovery::lldp::LldpInfo> {
-    match lldp {
-        Some(discovery) => discovery.updates.recv().await,
-        None => None,
+struct PassiveDiscovery {
+    lldp: Option<LldpDiscovery>,
+    cdp: Option<CdpDiscovery>,
+}
+
+impl PassiveDiscovery {
+    fn has_open_updates(&self) -> bool {
+        self.lldp.is_some() || self.cdp.is_some()
+    }
+}
+
+enum PassiveUpdate {
+    Lldp(discovery::lldp::LldpInfo),
+    Cdp(discovery::cdp::CdpInfo),
+}
+
+async fn recv_passive_update(passive: &mut PassiveDiscovery) -> Option<PassiveUpdate> {
+    match (&mut passive.lldp, &mut passive.cdp) {
+        (Some(lldp), Some(cdp)) => {
+            tokio::select! {
+                info = lldp.updates.recv() => match info {
+                    Some(info) => Some(PassiveUpdate::Lldp(info)),
+                    None => {
+                        passive.lldp = None;
+                        None
+                    }
+                },
+                info = cdp.updates.recv() => match info {
+                    Some(info) => Some(PassiveUpdate::Cdp(info)),
+                    None => {
+                        passive.cdp = None;
+                        None
+                    }
+                },
+            }
+        }
+        (Some(lldp), None) => match lldp.updates.recv().await {
+            Some(info) => Some(PassiveUpdate::Lldp(info)),
+            None => {
+                passive.lldp = None;
+                None
+            }
+        },
+        (None, Some(cdp)) => match cdp.updates.recv().await {
+            Some(info) => Some(PassiveUpdate::Cdp(info)),
+            None => {
+                passive.cdp = None;
+                None
+            }
+        },
+        (None, None) => None,
     }
 }
 
@@ -648,16 +705,31 @@ fn drain_phase_updates<U, ApplyUpdate>(
     }
 }
 
-fn drain_lldp_updates(
-    lldp: &mut Option<LldpDiscovery>,
+fn drain_passive_updates(
+    passive: &mut PassiveDiscovery,
     devices: &mut BTreeMap<IpAddr, Device>,
     context: &LldpApplyContext<'_>,
 ) {
-    let Some(discovery) = lldp else {
-        return;
-    };
-    while let Ok(info) = discovery.updates.try_recv() {
-        apply_lldp_discovery_update(devices, info, context);
+    if let Some(discovery) = &mut passive.lldp {
+        while let Ok(info) = discovery.updates.try_recv() {
+            apply_lldp_discovery_update(devices, info, context);
+        }
+    }
+    if let Some(discovery) = &mut passive.cdp {
+        while let Ok(info) = discovery.updates.try_recv() {
+            apply_cdp_discovery_update(devices, info, context);
+        }
+    }
+}
+
+fn apply_passive_update(
+    devices: &mut BTreeMap<IpAddr, Device>,
+    update: PassiveUpdate,
+    context: &LldpApplyContext<'_>,
+) {
+    match update {
+        PassiveUpdate::Lldp(info) => apply_lldp_discovery_update(devices, info, context),
+        PassiveUpdate::Cdp(info) => apply_cdp_discovery_update(devices, info, context),
     }
 }
 
@@ -688,6 +760,33 @@ async fn finish_lldp_discovery(
     })
 }
 
+async fn finish_cdp_discovery(
+    cdp: Option<CdpDiscovery>,
+    devices: &mut BTreeMap<IpAddr, Device>,
+    context: &LldpApplyContext<'_>,
+) -> Option<CdpRun> {
+    let mut discovery = cdp?;
+    let mut updates_open = true;
+
+    Some(loop {
+        tokio::select! {
+            result = &mut discovery.listener => {
+                drain_cdp_receiver(&mut discovery.updates, devices, context);
+                break result
+                    .context("CDP worker failed")
+                    .and_then(|listener_result| listener_result);
+            }
+            info = discovery.updates.recv(), if updates_open => {
+                if let Some(info) = info {
+                    apply_cdp_discovery_update(devices, info, context);
+                } else {
+                    updates_open = false;
+                }
+            }
+        }
+    })
+}
+
 fn drain_lldp_receiver(
     updates: &mut UnboundedReceiver<discovery::lldp::LldpInfo>,
     devices: &mut BTreeMap<IpAddr, Device>,
@@ -695,6 +794,16 @@ fn drain_lldp_receiver(
 ) {
     while let Ok(info) = updates.try_recv() {
         apply_lldp_discovery_update(devices, info, context);
+    }
+}
+
+fn drain_cdp_receiver(
+    updates: &mut UnboundedReceiver<discovery::cdp::CdpInfo>,
+    devices: &mut BTreeMap<IpAddr, Device>,
+    context: &LldpApplyContext<'_>,
+) {
+    while let Ok(info) = updates.try_recv() {
+        apply_cdp_discovery_update(devices, info, context);
     }
 }
 
@@ -715,6 +824,18 @@ fn apply_lldp_discovery_update(
     for ip in lldp_device_ips(devices, &info, context.target) {
         let device = upsert_device(devices, ip, context.now, context.interface);
         apply_lldp_info(device, info.clone(), context.oui_db);
+        finish_device_update(context.events, device, context.rules);
+    }
+}
+
+fn apply_cdp_discovery_update(
+    devices: &mut BTreeMap<IpAddr, Device>,
+    info: discovery::cdp::CdpInfo,
+    context: &LldpApplyContext<'_>,
+) {
+    for ip in cdp_device_ips(devices, &info, context.target) {
+        let device = upsert_device(devices, ip, context.now, context.interface);
+        apply_cdp_info(device, info.clone(), context.oui_db);
         finish_device_update(context.events, device, context.rules);
     }
 }
@@ -740,6 +861,34 @@ fn lldp_device_ips(
         }) {
             ips.insert(*ip);
         }
+    }
+
+    ips.into_iter().collect()
+}
+
+fn cdp_device_ips(
+    devices: &BTreeMap<IpAddr, Device>,
+    info: &discovery::cdp::CdpInfo,
+    target: ipnet::Ipv4Net,
+) -> Vec<IpAddr> {
+    let mut ips = BTreeSet::new();
+    for ip in info
+        .management_addresses
+        .iter()
+        .chain(info.addresses.iter())
+    {
+        if target_contains_ip(target, *ip) {
+            ips.insert(*ip);
+        }
+    }
+
+    if let Some((ip, _)) = devices.iter().find(|(_, device)| {
+        device
+            .mac
+            .as_deref()
+            .is_some_and(|device_mac| same_mac(device_mac, &info.source_mac))
+    }) {
+        ips.insert(*ip);
     }
 
     ips.into_iter().collect()
