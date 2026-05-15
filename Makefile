@@ -339,7 +339,7 @@ case "$$HOMEBREW_TAP" in
       '' \
       '```console' \
       "\$$ brew tap $$tap_slug" \
-      "\$$ brew install $$APP" \
+      "\$$ brew install --formula $$tap_slug/$$APP" \
       '```' \
       > "$$HOMEBREW_TAP_DIR/README.md"
 
