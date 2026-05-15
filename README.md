@@ -6,6 +6,17 @@ A generic Fing made of Rust TUI - scans local IPv4 networks and uses ARP, OUI, D
 
 ## Installation
 
+### macOS (Homebrew)
+
+Install the prebuilt macOS binary from the Homebrew tap.
+
+```console
+$ brew tap mi2428/fing
+$ brew install fing
+```
+
+### Build from source
+
 Install Rust and Cargo first, then build and install the binary with `make install`.
 By default, the binary is installed to `~/.local/bin/fing`.
 Set `INSTALL_BINDIR` if you want to install it somewhere else.
@@ -79,49 +90,59 @@ $ fing oui update --output.path ./oui.json
 
 ## Development
 
-`make release TAG=vX.Y.Z` builds four local release binaries, pushes the Git tag, creates or updates the GitHub Release with generated release notes, and uploads the release artifacts.
+`make release TAG=vX.Y.Z` builds four local release binaries, pushes the Git tag, creates or updates the GitHub Release with generated release notes, uploads the release artifacts, and updates the Homebrew formula in `../homebrew-fing`.
 The default release matrix is macOS/Linux for amd64/arm64.
+Set `HOMEBREW_TAP=0` to skip the Homebrew tap update, or `HOMEBREW_TAP_DIR=/path/to/tap` to use another checkout.
 Before releasing, this repository must have a clean working tree.
 
 ```console
 $ make
 
 Development
-  build             Build the host binary into bin/
-  install           Build and install the host binary into INSTALL_BINDIR
-  fmt               Format Rust sources. Use CHECK_ONLY=1 to check without writing
-  lint              Run clippy with warnings treated as errors
-  doc               Build rustdoc with warnings treated as errors
-  test              Run unit tests
-  check             Run formatting, lint, rustdoc, and tests
-  clean             Remove local build artifacts
+  build                      Build the host binary into bin/
+  install                    Build and install the host binary into INSTALL_BINDIR
+  fmt                        Format Rust sources. Use CHECK_ONLY=1 to check without writing
+  lint                       Run clippy with warnings treated as errors
+  doc                        Build rustdoc with warnings treated as errors
+  test                       Run unit tests
+  check                      Run formatting, lint, rustdoc, and tests
+  clean                      Remove local build artifacts
 
 Demo
-  vhs               Record the README live TUI demo GIF with VHS
+  vhs                        Record the README live TUI demo GIF with VHS
 
 Distribution
-  release           Build 4 local dist binaries, push the tag, and publish a GitHub release. Requires TAG=vX.Y.Z
-  dist              Build release binaries into dist/. Use OS=darwin,linux and ARCH=amd64,arm64
-  dist-smoke        Smoke-test Linux dist binaries in a Debian container
-  checksums         Write SHA-256 checksums for dist artifacts
+  release                    Build dist, publish a GitHub release, and update Homebrew. Requires TAG=vX.Y.Z
+  dist                       Build release binaries into dist/. Use OS=darwin,linux and ARCH=amd64,arm64
+  dist-smoke                 Smoke-test Linux dist binaries in a Debian container
+  checksums                  Write SHA-256 checksums for dist artifacts
 
 Help
-  help              Show this help message
+  help                       Show this help message
 
 Variables:
-  TAG               Release tag for make release, for example v0.1.0
-  GIT_REMOTE        Release git remote, defaults to origin
-  OS                Release OS list for make dist, defaults to darwin,linux
-  ARCH              Release arch list for make dist, defaults to amd64,arm64
-  INSTALL_BINDIR    Install directory, defaults to /Users/teo/.local/bin
-  VHS               VHS command for make vhs, defaults to vhs
+  TAG                        Release tag for make release, for example v0.1.0
+  GIT_REMOTE                 Release git remote, defaults to origin
+  HOMEBREW_TAP               Set to 0 to skip Homebrew tap updates, defaults to 1
+  HOMEBREW_TAP_DIR           Homebrew tap checkout, defaults to ../homebrew-fing
+  HOMEBREW_TAP_REMOTE        Homebrew tap git remote, defaults to origin
+  HOMEBREW_TAP_SLUG          brew tap slug, defaults to GitHub owner/fing
+  HOMEBREW_TAP_README_TITLE  Homebrew tap README title, defaults to homebrew-fing
+  HOMEBREW_DESC              Homebrew formula description
+  HOMEBREW_FORMULA_CLASS     Homebrew Ruby class, defaults to Fing
+  OS                         Release OS list for make dist, defaults to darwin,linux
+  ARCH                       Release arch list for make dist, defaults to amd64,arm64
+  INSTALL_BINDIR             Install directory, defaults to /Users/teo/.local/bin
+  VHS                        VHS command for make vhs, defaults to vhs
+  VHS_DEMO_COMMAND           Demo command for make vhs
+  VHS_DEMO_DELAY_SCALE       Demo scan delay scale for make vhs, defaults to 4
 
 Examples:
-  make fmt CHECK_ONLY=1                         # Check formatting without writing
-  make check                                    # Run local quality gates
-  make vhs                                      # Record screencast.gif from deterministic demo data
-  make dist OS=darwin,linux ARCH=amd64,arm64    # Build release binaries and checksums
-  make release TAG=v0.1.0                       # Publish a GitHub release with local artifacts
+  make fmt CHECK_ONLY=1                       # Check formatting without writing
+  make check                                  # Run local quality gates
+  make vhs                                    # Record screencast.gif from deterministic demo data
+  make dist OS=darwin,linux ARCH=amd64,arm64  # Build release binaries and checksums
+  make release TAG=v0.1.0                     # Publish a GitHub release and update Homebrew
 ```
 
 ## License

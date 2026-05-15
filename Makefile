@@ -2,6 +2,16 @@ SHELL         := /bin/bash
 .SHELLFLAGS   := -eu -o pipefail -c
 .DEFAULT_GOAL := help
 
+# Project
+APP             := fing
+PACKAGE_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+
+# Output directories
+BINDIR  := bin
+DISTDIR := dist
+VHSDIR  := .vhs
+
+# Toolchain
 RUSTUP           ?= rustup
 RUSTUP_TOOLCHAIN ?= 1.95.0
 CARGO            ?= $(shell if command -v $(RUSTUP) >/dev/null 2>&1 && $(RUSTUP) which cargo --toolchain $(RUSTUP_TOOLCHAIN) >/dev/null 2>&1; then $(RUSTUP) which cargo --toolchain $(RUSTUP_TOOLCHAIN); else command -v cargo; fi)
@@ -9,29 +19,40 @@ RUSTC            ?= $(shell if command -v $(RUSTUP) >/dev/null 2>&1 && $(RUSTUP)
 RUSTDOC          ?= $(shell if command -v $(RUSTUP) >/dev/null 2>&1 && $(RUSTUP) which rustdoc --toolchain $(RUSTUP_TOOLCHAIN) >/dev/null 2>&1; then $(RUSTUP) which rustdoc --toolchain $(RUSTUP_TOOLCHAIN); else command -v rustdoc; fi)
 RUST_BINDIR      := $(patsubst %/,%,$(dir $(CARGO)))
 CARGO_ENV        := PATH="$(RUST_BINDIR):$(PATH)" RUSTC="$(RUSTC)" RUSTDOC="$(RUSTDOC)"
-RELEASE_MAKE     ?= $(MAKE)
 
-INSTALL    ?= install
-DOCKER     ?= docker
-GIT_REMOTE ?= origin
-VHS        ?= vhs
-VHS_DEMO_DELAY_SCALE ?= 4
+# Commands
+INSTALL ?= install
+DOCKER  ?= docker
+VHS     ?= vhs
 
-APP     := fing
-BINDIR  := bin
-DISTDIR := dist
-VHSDIR  := .vhs
-VHS_TAPE   := $(VHSDIR)/fing.tape
-VHS_OUTPUT := screencast.gif
-PACKAGE_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-DIST_TAG        ?= $(if $(TAG),$(TAG),v$(PACKAGE_VERSION))
-DIST_APP        := $(APP)-$(DIST_TAG)
-
+# Install
 INSTALL_PREFIX ?= $(HOME)/.local
 INSTALL_BINDIR ?= $(INSTALL_PREFIX)/bin
-OS             ?= darwin,linux
-ARCH           ?= amd64,arm64
 
+# Demo
+VHS_TAPE             ?= $(VHSDIR)/$(APP).tape
+VHS_OUTPUT           ?= screencast.gif
+VHS_DEMO_COMMAND     ?= $(APP) scan en0 en7 --scan.range 192.0.2.0/24,198.51.100.0/24 --output.live always
+VHS_DEMO_DELAY_SCALE ?= 4
+
+# Release
+GIT_REMOTE   ?= origin
+RELEASE_MAKE ?= $(MAKE)
+OS           ?= darwin,linux
+ARCH         ?= amd64,arm64
+DIST_TAG     ?= $(if $(TAG),$(TAG),v$(PACKAGE_VERSION))
+DIST_APP     := $(APP)-$(DIST_TAG)
+
+# Homebrew tap
+HOMEBREW_TAP              ?= 1
+HOMEBREW_TAP_DIR          ?= ../homebrew-$(APP)
+HOMEBREW_TAP_REMOTE       ?= origin
+HOMEBREW_TAP_SLUG         ?=
+HOMEBREW_TAP_README_TITLE ?= homebrew-$(APP)
+HOMEBREW_DESC             ?= Local IPv4 network scanner with device fingerprints
+HOMEBREW_FORMULA_CLASS    ?= $(shell printf '%s' '$(APP)' | awk -F- '{ for (i = 1; i <= NF; i++) printf toupper(substr($$i, 1, 1)) substr($$i, 2) }')
+
+# Release matrix
 DARWIN_ARCHS := amd64 arm64
 LINUX_ARCHS  := amd64 arm64
 RUST_TARGETS := x86_64-apple-darwin aarch64-apple-darwin
@@ -41,22 +62,24 @@ DARWIN_amd64_SUFFIX := darwin-amd64
 DARWIN_arm64_TARGET := aarch64-apple-darwin
 DARWIN_arm64_SUFFIX := darwin-arm64
 
-LINUX_amd64_PLATFORM        := linux/amd64
-LINUX_amd64_SUFFIX          := linux-amd64
-LINUX_arm64_PLATFORM        := linux/arm64
-LINUX_arm64_SUFFIX          := linux-arm64
+LINUX_amd64_PLATFORM := linux/amd64
+LINUX_amd64_SUFFIX   := linux-amd64
+LINUX_arm64_PLATFORM := linux/arm64
+LINUX_arm64_SUFFIX   := linux-arm64
+
+# Linux release builds
 LINUX_BUILD_IMAGE           ?= rust:1.95-bookworm
 LINUX_SMOKE_IMAGE           ?= debian:bookworm-slim
 LINUX_CACHE_KEY             := $(shell printf '%s' '$(LINUX_BUILD_IMAGE)' | sed 's/[^A-Za-z0-9_.-]/-/g')
 LINUX_OPENSSL_STATIC        ?= 1
 LINUX_PKG_CONFIG_ALL_STATIC ?= 1
+DOCKER_UID                  ?= $(shell id -u)
+DOCKER_GID                  ?= $(shell id -g)
 
-DOCKER_UID ?= $(shell id -u)
-DOCKER_GID ?= $(shell id -g)
-HOST_OS    := $(shell uname -s)
-
-HELP_NAME_WIDTH    := 18
-HELP_EXAMPLE_WIDTH := 46
+# Host and help
+HOST_OS            := $(shell uname -s)
+HELP_NAME_WIDTH    := 27
+HELP_EXAMPLE_WIDTH := 44
 
 ##@ Development
 
@@ -137,7 +160,7 @@ vhs: ## Record the README live TUI demo GIF with VHS
 		'Set TypingSpeed 45ms' \
 		'Set CursorBlink false' \
 		'' \
-		'Type "$(APP) scan en0 en7 --scan.range 192.0.2.0/24,198.51.100.0/24 --output.live always"' \
+		'Type "$(VHS_DEMO_COMMAND)"' \
 		'Sleep 500ms' \
 		'Enter' \
 		'Wait+Screen@30s /status=complete/' \
@@ -154,125 +177,236 @@ vhs: ## Record the README live TUI demo GIF with VHS
 	@rm -rf "$(VHSDIR)"
 	@printf 'Wrote %s\n' "$(VHS_OUTPUT)"
 
+define RELEASE_SCRIPT
+# shellcheck shell=bash
+set -Eeuo pipefail
+
+fail() {
+  echo "release: $$*" >&2
+  exit 1
+}
+
+run() {
+  printf '+'
+  printf ' %q' "$$@"
+  printf '\n'
+  "$$@"
+}
+
+need() {
+  command -v "$$1" >/dev/null 2>&1 || fail "$$1 is required for release"
+}
+
+value_at_ref() {
+  git show "$$1:Cargo.toml" | sed -n "s/^$$2 = \"\\(.*\\)\"/\\1/p" | head -n 1
+}
+
+sha256_file() {
+  shasum -a 256 "$$1" | awk '{print $$1}'
+}
+
+clean_git_dir() {
+  local dir="$$1" label="$$2" status
+
+  [[ -d "$$dir/.git" ]] || fail "$$label repo not found at $$dir"
+
+  status="$$(git -C "$$dir" status --porcelain)"
+  if [[ -n "$$status" ]]; then
+    git -C "$$dir" status --short >&2
+    fail "$$label must be clean before release"
+  fi
+}
+
+github_repo() {
+  local repo="$${GH_REPO:-$${GITHUB_REPOSITORY:-}}" url
+
+  if [[ -z "$$repo" ]]; then
+    url="$$(git config --get "remote.$$GIT_REMOTE.url" || true)"
+    case "$$url" in
+      git@github.com:*) repo="$${url#git@github.com:}" ;;
+      https://github.com/*) repo="$${url#https://github.com/}" ;;
+      ssh://git@github.com/*) repo="$${url#ssh://git@github.com/}" ;;
+      *) fail "could not infer GitHub repository from remote $$GIT_REMOTE; set GH_REPO=owner/repo" ;;
+    esac
+  fi
+
+  repo="$${repo#https://github.com/}"
+  repo="$${repo%.git}"
+  [[ "$$repo" == */* ]] || fail "GitHub repository must look like owner/repo, got $$repo"
+  printf '%s\n' "$$repo"
+}
+
+cleanup() {
+  local status=$$?
+
+  if [[ "$$created_tag" == 1 && "$$pushed_tag" != 1 ]]; then
+    git tag -d "$$TAG" >/dev/null 2>&1 || true
+  fi
+
+  exit "$$status"
+}
+
+semver='^v[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?([+][0-9A-Za-z][0-9A-Za-z.-]*)?$$'
+created_tag=0
+pushed_tag=0
+
+[[ -n "$$TAG" ]] || fail "TAG is required, for example: make release TAG=v0.1.0"
+[[ "$$TAG" =~ $$semver ]] || fail "TAG must look like vMAJOR.MINOR.PATCH"
+
+cd "$$(git rev-parse --show-toplevel)"
+clean_git_dir . "working tree"
+need git
+need gh
+need shasum
+
+repo="$$(github_repo)"
+version="$${TAG#v}"
+tap_slug="$${HOMEBREW_TAP_SLUG:-$${repo%%/*}/$$APP}"
+tap_readme_title="$${HOMEBREW_TAP_README_TITLE:-homebrew-$$APP}"
+remote_line="$$(git ls-remote --tags "$$GIT_REMOTE" "refs/tags/$$TAG" | sed -n '1p')"
+remote_oid="$${remote_line%%[[:space:]]*}"
+trap cleanup EXIT
+
+if git rev-parse -q --verify "refs/tags/$$TAG" >/dev/null; then
+  local_oid="$$(git rev-parse "refs/tags/$$TAG")"
+  [[ -z "$$remote_oid" || "$$remote_oid" == "$$local_oid" ]] || \
+    fail "local tag $$TAG does not match $$GIT_REMOTE/tags/$$TAG"
+  printf 'Using existing tag %s at %s\n' "$$TAG" "$$(git rev-list -n 1 "$$TAG")"
+elif [[ -n "$$remote_oid" ]]; then
+  run git fetch "$$GIT_REMOTE" "refs/tags/$$TAG:refs/tags/$$TAG"
+  printf 'Using fetched tag %s at %s\n' "$$TAG" "$$(git rev-list -n 1 "$$TAG")"
+else
+  run git tag "$$TAG"
+  created_tag=1
+  printf 'Created tag %s at %s\n' "$$TAG" "$$(git rev-parse HEAD)"
+fi
+
+release_commit="$$(git rev-list -n 1 "$$TAG")"
+head_commit="$$(git rev-parse HEAD)"
+[[ "$$release_commit" == "$$head_commit" ]] || \
+  fail "$$TAG points to $$release_commit, but HEAD is $$head_commit; checkout the release commit first"
+
+[[ "$$(value_at_ref "refs/tags/$$TAG" name)" == "$$APP" ]] || fail "Cargo.toml package name does not match $$APP"
+[[ "$$(value_at_ref "refs/tags/$$TAG" version)" == "$$version" ]] || fail "Cargo.toml version does not match $$TAG"
+
+run "$$RELEASE_MAKE" dist TAG="$$TAG" OS="$$OS" ARCH="$$ARCH"
+run git push "$$GIT_REMOTE" "refs/tags/$$TAG"
+pushed_tag=1
+
+shopt -s nullglob
+assets=("$$DISTDIR"/*)
+shopt -u nullglob
+(($${#assets[@]} > 0)) || fail "no release assets found in $$DISTDIR"
+
+release_flags=()
+[[ "$$TAG" == *-* ]] && release_flags=(--prerelease)
+
+if gh release view "$$TAG" --repo "$$repo" >/dev/null 2>&1; then
+  run gh release upload "$$TAG" "$${assets[@]}" --clobber --repo "$$repo"
+else
+  run gh release create "$$TAG" \
+    --repo "$$repo" \
+    --target "$$release_commit" \
+    --title "$$TAG" \
+    --generate-notes \
+    "$${release_flags[@]}" \
+    "$${assets[@]}"
+fi
+
+case "$$HOMEBREW_TAP" in
+  0|false|FALSE|no|NO)
+    printf 'Skipping Homebrew tap update because HOMEBREW_TAP=0\n'
+    ;;
+  *)
+    dist_app="$$APP-$$TAG"
+    darwin_amd64_bin="$$DISTDIR/$$dist_app-darwin-amd64"
+    darwin_arm64_bin="$$DISTDIR/$$dist_app-darwin-arm64"
+    formula_dir="$$HOMEBREW_TAP_DIR/Formula"
+    formula_file="$$formula_dir/$$APP.rb"
+
+    [[ -f "$$darwin_amd64_bin" ]] || fail "missing Homebrew artifact $$darwin_amd64_bin"
+    [[ -f "$$darwin_arm64_bin" ]] || fail "missing Homebrew artifact $$darwin_arm64_bin"
+    clean_git_dir "$$HOMEBREW_TAP_DIR" "Homebrew tap working tree"
+
+    mkdir -p "$$formula_dir"
+    darwin_amd64_sha="$$(sha256_file "$$darwin_amd64_bin")"
+    darwin_arm64_sha="$$(sha256_file "$$darwin_arm64_bin")"
+
+    printf '%s\n' \
+      "# $$tap_readme_title" \
+      '' \
+      "Homebrew tap for \`$$APP\`." \
+      '' \
+      '```console' \
+      "\$$ brew tap $$tap_slug" \
+      "\$$ brew install $$APP" \
+      '```' \
+      > "$$HOMEBREW_TAP_DIR/README.md"
+
+    printf '%s\n' \
+      '# typed: false' \
+      '# frozen_string_literal: true' \
+      '' \
+      "class $$HOMEBREW_FORMULA_CLASS < Formula" \
+      "  desc \"$$HOMEBREW_DESC\"" \
+      "  homepage \"https://github.com/$$repo\"" \
+      "  version \"$$version\"" \
+      '  license "MIT"' \
+      '  depends_on :macos' \
+      '' \
+      '  on_macos do' \
+      '    on_arm do' \
+      "      url \"https://github.com/$$repo/releases/download/$$TAG/$$APP-$$TAG-darwin-arm64\"," \
+      '          using: :nounzip' \
+      "      sha256 \"$$darwin_arm64_sha\"" \
+      '    end' \
+      '' \
+      '    on_intel do' \
+      "      url \"https://github.com/$$repo/releases/download/$$TAG/$$APP-$$TAG-darwin-amd64\"," \
+      '          using: :nounzip' \
+      "      sha256 \"$$darwin_amd64_sha\"" \
+      '    end' \
+      '  end' \
+      '' \
+      '  def install' \
+      "    bin.install Dir[\"$$APP-v#{version}-darwin-*\"].first => \"$$APP\"" \
+      "    chmod 0755, bin/\"$$APP\"" \
+      '  end' \
+      '' \
+      '  test do' \
+      "    assert_match \"$$APP #{version}\", shell_output(\"#{bin}/$$APP --version\")" \
+      "    assert_match \"Usage:\", shell_output(\"#{bin}/$$APP --help\")" \
+      '  end' \
+      'end' \
+      > "$$formula_file"
+
+    if command -v brew >/dev/null 2>&1; then
+      run env HOMEBREW_DEVELOPER=1 brew style \
+        --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict \
+        --fix "$$formula_file" || true
+    else
+      printf 'Skipping Homebrew style; brew not found\n'
+    fi
+
+    run git -C "$$HOMEBREW_TAP_DIR" add README.md "Formula/$$APP.rb"
+    if git -C "$$HOMEBREW_TAP_DIR" diff --cached --quiet; then
+      printf 'Homebrew formula is already up to date for %s\n' "$$TAG"
+    else
+      run git -C "$$HOMEBREW_TAP_DIR" commit -m "$$APP $$version"
+      run git -C "$$HOMEBREW_TAP_DIR" push "$$HOMEBREW_TAP_REMOTE" HEAD
+    fi
+    ;;
+esac
+
+printf 'Published %s from local release artifacts and updated Homebrew.\n' "$$TAG"
+endef
+export RELEASE_SCRIPT
+
 ##@ Distribution
 
 .PHONY: release
-release: ## Build 4 local dist binaries, push the tag, and publish a GitHub release. Requires TAG=vX.Y.Z
-	@set -Eeuo pipefail; \
-	SEMVER_TAG_RE='^v[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?([+][0-9A-Za-z][0-9A-Za-z.-]*)?$$'; \
-	APP="$(APP)"; \
-	tag="$(TAG)"; \
-	remote="$(GIT_REMOTE)"; \
-	release_os="darwin,linux"; \
-	release_arch="amd64,arm64"; \
-	dist_dir="$(DISTDIR)"; \
-	fail() { echo "release: $$*" >&2; exit 1; }; \
-	run() { printf '+'; printf ' %q' "$$@"; printf '\n'; "$$@"; }; \
-	require_tool() { command -v "$$1" >/dev/null 2>&1 || fail "$$1 is required for local release publishing"; }; \
-	manifest_value_at_ref() { git show "$$1:Cargo.toml" | sed -n "s/^$$2 = \"\\(.*\\)\"/\\1/p" | head -n 1; }; \
-	is_prerelease_tag() { [[ "$$1" == *-* ]]; }; \
-	repository_slug() { \
-		local repo="$${GH_REPO:-$${GITHUB_REPOSITORY:-}}" url; \
-		if [[ -z "$$repo" ]]; then \
-			url="$$(git config --get "remote.$$remote.url" || true)"; \
-			case "$$url" in \
-				git@github.com:*) repo="$${url#git@github.com:}" ;; \
-				https://github.com/*) repo="$${url#https://github.com/}" ;; \
-				ssh://git@github.com/*) repo="$${url#ssh://git@github.com/}" ;; \
-				*) fail "could not infer GitHub repository from remote $$remote; set GH_REPO=owner/repo" ;; \
-			esac; \
-		fi; \
-		repo="$${repo#https://github.com/}"; \
-		repo="$${repo%.git}"; \
-		[[ "$$repo" == */* ]] || fail "GitHub repository must look like owner/repo, got $$repo"; \
-		printf '%s\n' "$$repo"; \
-	}; \
-	require_clean_worktree() { \
-		local status; \
-		status="$$(git status --porcelain)"; \
-		if [[ -n "$$status" ]]; then \
-			git status --short >&2; \
-			fail "working tree must be clean before release"; \
-		fi; \
-	}; \
-	release_assets() { \
-		local assets=(); \
-		shopt -s nullglob; \
-		assets=("$$dist_dir"/*); \
-		shopt -u nullglob; \
-		(($${#assets[@]} > 0)) || fail "no release assets found in $$dist_dir"; \
-		printf '%s\0' "$${assets[@]}"; \
-	}; \
-	publish_github_release() { \
-		local release_tag="$$1" release_commit="$$2" repository="$$3" assets=(); \
-		while IFS= read -r -d '' asset; do assets+=("$$asset"); done < <(release_assets); \
-		if gh release view "$$release_tag" --repo "$$repository" >/dev/null 2>&1; then \
-			run gh release upload "$$release_tag" "$${assets[@]}" --clobber --repo "$$repository"; \
-			return; \
-		fi; \
-		if is_prerelease_tag "$$release_tag"; then \
-			run gh release create "$$release_tag" \
-				--repo "$$repository" \
-				--target "$$release_commit" \
-				--title "$$release_tag" \
-				--generate-notes \
-				--prerelease \
-				"$${assets[@]}"; \
-		else \
-			run gh release create "$$release_tag" \
-				--repo "$$repository" \
-				--target "$$release_commit" \
-				--title "$$release_tag" \
-				--generate-notes \
-				"$${assets[@]}"; \
-		fi; \
-	}; \
-	[[ -n "$$tag" ]] || fail "TAG is required, for example: make release TAG=v0.1.0"; \
-	[[ "$$tag" =~ $$SEMVER_TAG_RE ]] || fail "TAG must look like vMAJOR.MINOR.PATCH"; \
-	cd "$$(git rev-parse --show-toplevel)"; \
-	require_clean_worktree; \
-	require_tool git; \
-	require_tool gh; \
-	require_tool shasum; \
-	repository="$$(repository_slug)"; \
-	remote_line="$$(git ls-remote --tags "$$remote" "refs/tags/$$tag" | sed -n '1p')"; \
-	remote_oid="$${remote_line%%[[:space:]]*}"; \
-	if git rev-parse -q --verify "refs/tags/$$tag" >/dev/null; then \
-		local_oid="$$(git rev-parse "refs/tags/$$tag")"; \
-		if [[ -n "$$remote_oid" && "$$remote_oid" != "$$local_oid" ]]; then \
-			fail "local tag $$tag does not match $$remote/tags/$$tag"; \
-		fi; \
-		printf 'Using existing tag %s at %s\n' "$$tag" "$$(git rev-list -n 1 "$$tag")"; \
-	elif [[ -n "$$remote_oid" ]]; then \
-		run git fetch "$$remote" "refs/tags/$$tag:refs/tags/$$tag"; \
-		printf 'Using fetched tag %s at %s\n' "$$tag" "$$(git rev-list -n 1 "$$tag")"; \
-	else \
-		run git tag "$$tag"; \
-		created_tag=1; \
-		printf 'Created tag %s at %s\n' "$$tag" "$$(git rev-parse HEAD)"; \
-	fi; \
-	cleanup() { \
-		status=$$?; \
-		if [[ "$${created_tag:-0}" == "1" && "$${pushed_created_tag:-0}" != "1" ]]; then \
-			git tag -d "$$tag" >/dev/null 2>&1 || true; \
-		fi; \
-		exit "$$status"; \
-	}; \
-	trap cleanup EXIT; \
-	release_ref="refs/tags/$$tag"; \
-	release_commit="$$(git rev-list -n 1 "$$tag")"; \
-	head_commit="$$(git rev-parse HEAD)"; \
-	[[ "$$release_commit" == "$$head_commit" ]] || fail "$$tag points to $$release_commit, but HEAD is $$head_commit; checkout the release commit first"; \
-	tag_version="$${tag#v}"; \
-	package_name="$$(manifest_value_at_ref "$$release_ref" name)"; \
-	package_version="$$(manifest_value_at_ref "$$release_ref" version)"; \
-	[[ "$$package_name" == "$$APP" ]] || fail "Cargo.toml package name is $$package_name, expected $$APP"; \
-	[[ "$$package_version" == "$$tag_version" ]] || fail "Cargo.toml version $$package_version does not match $$tag"; \
-	run "$(RELEASE_MAKE)" dist TAG="$$tag" OS="$$release_os" ARCH="$$release_arch"; \
-	run git push "$$remote" "refs/tags/$$tag"; \
-	pushed_created_tag=1; \
-	publish_github_release "$$tag" "$$release_commit" "$$repository"; \
-	printf 'Published %s from local release artifacts.\n' "$$tag"
+release: ## Build dist, publish a GitHub release, and update Homebrew. Requires TAG=vX.Y.Z
+	@APP="$(APP)" TAG="$(TAG)" GIT_REMOTE="$(GIT_REMOTE)" DISTDIR="$(DISTDIR)" OS="$(OS)" ARCH="$(ARCH)" HOMEBREW_TAP="$(HOMEBREW_TAP)" HOMEBREW_TAP_DIR="$(HOMEBREW_TAP_DIR)" HOMEBREW_TAP_REMOTE="$(HOMEBREW_TAP_REMOTE)" HOMEBREW_TAP_SLUG="$(HOMEBREW_TAP_SLUG)" HOMEBREW_TAP_README_TITLE="$(HOMEBREW_TAP_README_TITLE)" HOMEBREW_DESC="$(HOMEBREW_DESC)" HOMEBREW_FORMULA_CLASS="$(HOMEBREW_FORMULA_CLASS)" RELEASE_MAKE="$(RELEASE_MAKE)" PATH="$(RUST_BINDIR):$(PATH)" bash -c "$$RELEASE_SCRIPT"
 
 .PHONY: dist
 dist: ## Build release binaries into dist/. Use OS=darwin,linux and ARCH=amd64,arm64
@@ -434,14 +568,22 @@ help: ## Show this help message
 	@printf "\n\033[1mVariables:\033[0m\n"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "TAG" "Release tag for make release, for example v0.1.0"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "GIT_REMOTE" "Release git remote, defaults to $(GIT_REMOTE)"
+	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "HOMEBREW_TAP" "Set to 0 to skip Homebrew tap updates, defaults to $(HOMEBREW_TAP)"
+	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "HOMEBREW_TAP_DIR" "Homebrew tap checkout, defaults to $(HOMEBREW_TAP_DIR)"
+	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "HOMEBREW_TAP_REMOTE" "Homebrew tap git remote, defaults to $(HOMEBREW_TAP_REMOTE)"
+	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "HOMEBREW_TAP_SLUG" "brew tap slug, defaults to GitHub owner/$(APP)"
+	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "HOMEBREW_TAP_README_TITLE" "Homebrew tap README title, defaults to $(HOMEBREW_TAP_README_TITLE)"
+	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "HOMEBREW_DESC" "Homebrew formula description"
+	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "HOMEBREW_FORMULA_CLASS" "Homebrew Ruby class, defaults to $(HOMEBREW_FORMULA_CLASS)"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "OS" "Release OS list for make dist, defaults to $(OS)"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "ARCH" "Release arch list for make dist, defaults to $(ARCH)"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "INSTALL_BINDIR" "Install directory, defaults to $(INSTALL_BINDIR)"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "VHS" "VHS command for make vhs, defaults to $(VHS)"
+	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "VHS_DEMO_COMMAND" "Demo command for make vhs"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "VHS_DEMO_DELAY_SCALE" "Demo scan delay scale for make vhs, defaults to $(VHS_DEMO_DELAY_SCALE)"
 	@printf "\n\033[1mExamples:\033[0m\n"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_EXAMPLE_WIDTH)" "make fmt CHECK_ONLY=1" "# Check formatting without writing"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_EXAMPLE_WIDTH)" "make check" "# Run local quality gates"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_EXAMPLE_WIDTH)" "make vhs" "# Record screencast.gif from deterministic demo data"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_EXAMPLE_WIDTH)" "make dist OS=darwin,linux ARCH=amd64,arm64" "# Build release binaries and checksums"
-	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_EXAMPLE_WIDTH)" "make release TAG=v0.1.0" "# Publish a GitHub release with local artifacts"
+	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_EXAMPLE_WIDTH)" "make release TAG=v0.1.0" "# Publish a GitHub release and update Homebrew"
