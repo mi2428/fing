@@ -132,7 +132,7 @@ Variables:
   HOMEBREW_FORMULA_CLASS     Homebrew Ruby class, defaults to Fing
   OS                         Release OS list for make dist, defaults to darwin,linux
   ARCH                       Release arch list for make dist, defaults to amd64,arm64
-  INSTALL_BINDIR             Install directory, defaults to /Users/teo/.local/bin
+  INSTALL_BINDIR             Install directory, defaults to ~/.local/bin
   VHS                        VHS command for make vhs, defaults to vhs
   VHS_DEMO_COMMAND           Demo command for make vhs
   VHS_DEMO_DELAY_SCALE       Demo scan delay scale for make vhs, defaults to 4

@@ -208,7 +208,7 @@ sha256_file() {
 clean_git_dir() {
   local dir="$$1" label="$$2" status
 
-  [[ -d "$$dir/.git" ]] || fail "$$label repo not found at $$dir"
+  git -C "$$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "$$label repo not found at $$dir"
 
   status="$$(git -C "$$dir" status --porcelain)"
   if [[ -n "$$status" ]]; then
