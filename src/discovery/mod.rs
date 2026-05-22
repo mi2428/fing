@@ -28,6 +28,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+const ARP_READ_TIMEOUT: Duration = Duration::from_millis(5);
+const ARP_SEND_BATCH_SIZE: usize = 128;
+const ARP_BATCH_RECEIVE_WINDOW: Duration = Duration::from_millis(5);
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArpHit {
     pub ip: Ipv4Addr,
@@ -58,7 +62,7 @@ where
         .ok_or_else(|| anyhow!("interface {} has no hardware address", iface.name))?;
 
     let config = Config {
-        read_timeout: Some(Duration::from_millis(100)),
+        read_timeout: Some(ARP_READ_TIMEOUT),
         write_buffer_size: 4096,
         read_buffer_size: 4096,
         ..Default::default()
@@ -71,34 +75,77 @@ where
         _ => return Err(anyhow!("unsupported datalink channel type")),
     };
 
+    let mut hits = BTreeMap::new();
+    let batch_receive_window = timeout.min(ARP_BATCH_RECEIVE_WINDOW);
+    let mut sent_in_batch = 0;
+
     for target_ip in target.hosts() {
         if target_ip == iface.ip {
             continue;
         }
-        // Broadcast one ARP request per host. Responses are collected below and
-        // deduped by sender IP because devices can retransmit replies.
+        // Broadcast in bounded batches and drain replies between batches. Large
+        // CIDRs can answer while we are still sending; interleaving receive work
+        // keeps the datalink buffer from filling with early replies.
         let packet = build_arp_request(source_mac, iface.ip, target_ip)?;
         match tx.send_to(&packet, None) {
             Some(Ok(())) => {}
             Some(Err(err)) => return Err(err).context("failed to send ARP request"),
             None => return Err(anyhow!("datalink sender refused ARP packet")),
         }
-    }
-
-    let mut hits = BTreeMap::new();
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Ok(packet) = rx.next()
-            && let Some(hit) = parse_arp_reply(packet)
-            && target.contains(&hit.ip)
-            && let std::collections::btree_map::Entry::Vacant(entry) = hits.entry(hit.ip)
-        {
-            on_hit(&hit);
-            entry.insert(hit);
+        sent_in_batch += 1;
+        if sent_in_batch >= ARP_SEND_BATCH_SIZE {
+            drain_arp_replies_for(
+                &mut *rx,
+                target,
+                batch_receive_window,
+                &mut hits,
+                &mut on_hit,
+            );
+            sent_in_batch = 0;
         }
     }
 
+    drain_arp_replies_for(&mut *rx, target, timeout, &mut hits, &mut on_hit);
+
     Ok(hits.into_values().collect())
+}
+
+fn drain_arp_replies_for<F>(
+    rx: &mut dyn datalink::DataLinkReceiver,
+    target: Ipv4Net,
+    duration: Duration,
+    hits: &mut BTreeMap<Ipv4Addr, ArpHit>,
+    on_hit: &mut F,
+) where
+    F: FnMut(&ArpHit),
+{
+    if duration.is_zero() {
+        return;
+    }
+
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        if let Ok(packet) = rx.next() {
+            record_arp_reply(packet, target, hits, on_hit);
+        }
+    }
+}
+
+fn record_arp_reply<F>(
+    packet: &[u8],
+    target: Ipv4Net,
+    hits: &mut BTreeMap<Ipv4Addr, ArpHit>,
+    on_hit: &mut F,
+) where
+    F: FnMut(&ArpHit),
+{
+    if let Some(hit) = parse_arp_reply(packet)
+        && target.contains(&hit.ip)
+        && let std::collections::btree_map::Entry::Vacant(entry) = hits.entry(hit.ip)
+    {
+        on_hit(&hit);
+        entry.insert(hit);
+    }
 }
 
 pub fn arp_table(target: Ipv4Net, interface: &str) -> Vec<ArpHit> {
@@ -302,5 +349,45 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].ip, "192.168.1.1".parse::<Ipv4Addr>().unwrap());
+    }
+
+    #[test]
+    fn arp_reply_recording_dedupes_callback_by_sender_ip() {
+        let target = "192.168.1.0/24".parse::<Ipv4Net>().unwrap();
+        let packet = arp_reply_packet(
+            "192.168.1.20".parse().unwrap(),
+            MacAddr::new(0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff),
+        );
+        let mut hits = BTreeMap::new();
+        let mut callbacks = 0;
+
+        {
+            let mut callback = |_: &ArpHit| callbacks += 1;
+            record_arp_reply(&packet, target, &mut hits, &mut callback);
+            record_arp_reply(&packet, target, &mut hits, &mut callback);
+        }
+
+        assert_eq!(callbacks, 1);
+        assert_eq!(hits.len(), 1);
+    }
+
+    fn arp_reply_packet(sender_ip: Ipv4Addr, sender_mac: MacAddr) -> [u8; 42] {
+        let mut buffer = [0_u8; 42];
+        let mut ethernet_packet = MutableEthernetPacket::new(&mut buffer).unwrap();
+        ethernet_packet.set_destination(MacAddr::broadcast());
+        ethernet_packet.set_source(sender_mac);
+        ethernet_packet.set_ethertype(EtherTypes::Arp);
+
+        let mut arp_packet = MutableArpPacket::new(ethernet_packet.payload_mut()).unwrap();
+        arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
+        arp_packet.set_protocol_type(EtherTypes::Ipv4);
+        arp_packet.set_hw_addr_len(6);
+        arp_packet.set_proto_addr_len(4);
+        arp_packet.set_operation(ArpOperations::Reply);
+        arp_packet.set_sender_hw_addr(sender_mac);
+        arp_packet.set_sender_proto_addr(sender_ip);
+        arp_packet.set_target_hw_addr(MacAddr::zero());
+        arp_packet.set_target_proto_addr("192.168.1.2".parse().unwrap());
+        buffer
     }
 }
