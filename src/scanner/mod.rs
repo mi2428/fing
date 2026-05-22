@@ -441,7 +441,7 @@ async fn continuous_l2_listener(
     let worker_updates = updates.clone();
     let worker_cancel = Arc::clone(&cancel);
     let result = tokio::task::spawn_blocking(move || {
-        discovery::l2::listen_until(
+        discovery::l2::listen_until_repeating(
             &worker_iface,
             protocols,
             || worker_cancel.load(Ordering::Relaxed) || stop_updates.is_closed(),
