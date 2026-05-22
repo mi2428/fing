@@ -455,6 +455,14 @@ impl LiveTable {
                 self.move_selection(-10);
                 LiveInputAction::Continue
             }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let removed = self.cleanup_dead_devices();
+                self.push_log(
+                    LiveLogLevel::Info,
+                    format!("cleanup removed dead={removed}"),
+                );
+                LiveInputAction::Continue
+            }
             KeyCode::Home => {
                 self.select_index(0);
                 LiveInputAction::Continue
@@ -530,6 +538,24 @@ impl LiveTable {
         self.search_query.clear();
         self.search_editing = false;
         self.reset_visible_selection();
+    }
+
+    fn cleanup_dead_devices(&mut self) -> usize {
+        let Some(round) = self.current_round else {
+            return 0;
+        };
+        let dead_keys = self
+            .devices
+            .keys()
+            .filter(|key| self.device_rounds.get(*key).copied() != Some(round))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in &dead_keys {
+            self.devices.remove(key);
+            self.device_rounds.remove(key);
+        }
+        self.clamp_selection();
+        dead_keys.len()
     }
 
     fn reset_visible_selection(&mut self) {
@@ -1173,6 +1199,42 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_r_cleanup_removes_dead_devices() {
+        let first_round = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let second_round = Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 0).unwrap();
+        let mut app = LiveTable::new(OutputOptions::default(), LiveInterfacePanel::default());
+
+        app.apply(ScanEvent::RoundStarted { round: 1 });
+        for ip in ["192.168.1.10", "192.168.1.20"] {
+            let mut device = Device::new(ip.parse().unwrap(), first_round);
+            device.interface = Some("en0".to_string());
+            app.apply(ScanEvent::DeviceUpdated(Box::new(device)));
+        }
+
+        app.apply(ScanEvent::RoundStarted { round: 2 });
+        let mut refreshed = Device::new("192.168.1.20".parse().unwrap(), second_round);
+        refreshed.interface = Some("en0".to_string());
+        app.apply(ScanEvent::DeviceUpdated(Box::new(refreshed)));
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            LiveInputAction::Continue
+        );
+
+        assert_eq!(app.devices.len(), 1);
+        assert!(
+            app.devices
+                .keys()
+                .all(|key| key.ip.to_string() == "192.168.1.20")
+        );
+        assert!(
+            app.logs
+                .back()
+                .is_some_and(|entry| entry.message == "cleanup removed dead=1")
+        );
+    }
+
+    #[test]
     fn continuous_live_replaces_same_ip_when_mac_changes() {
         let first_seen = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let later_seen = Utc.with_ymd_and_hms(2026, 1, 1, 0, 5, 0).unwrap();
@@ -1507,6 +1569,7 @@ mod tests {
         assert!(first_row.contains("j=Down k=Up"));
         assert!(first_row.contains("Ctrl-D=PageDown"));
         assert!(first_row.contains("Ctrl-U=PageUp"));
+        assert!(first_row.contains("Ctrl-R=Cleanup"));
         assert!(!first_row.contains("Ctrl-D/U"));
         assert!(!first_row.contains("Up/Down,j/k"));
         assert!(!first_row.contains('|'));
@@ -1561,6 +1624,7 @@ mod tests {
         assert_eq!(line.spans[2].style.fg, Some(NeonTheme::TEXT));
         assert!(line_to_string(&line).contains("Ctrl-D=PageDown"));
         assert!(line_to_string(&line).contains("Ctrl-U=PageUp"));
+        assert!(line_to_string(&line).contains("Ctrl-R=Cleanup"));
         assert!(line_to_string(&line).contains("Now=12:34:56"));
     }
 
