@@ -34,6 +34,7 @@ VHS_TAPE             ?= $(VHSDIR)/$(APP).tape
 VHS_OUTPUT           ?= screencast.gif
 VHS_DEMO_COMMAND     ?= $(APP) scan en0 en7 --scan.range 192.0.2.0/24,198.51.100.0/24 --output.live always
 VHS_DEMO_DELAY_SCALE ?= 4
+VHS_FRAMERATE        ?= 24
 
 # Release
 GIT_REMOTE   ?= origin
@@ -142,7 +143,7 @@ vhs: ## Record the README live TUI demo GIF with VHS
 	@mkdir -p "$(VHSDIR)/bin" "$$(dirname "$(VHS_OUTPUT)")"
 	@printf '%s\n' \
 		'#!/bin/sh' \
-		'FING_DEMO_DELAY_SCALE="$(VHS_DEMO_DELAY_SCALE)" exec "$(CURDIR)/target/debug/examples/tui_demo" "$$@"' \
+		'FING_DEMO_DELAY_SCALE="$(VHS_DEMO_DELAY_SCALE)" FING_DEMO_FRAMERATE="$(VHS_FRAMERATE)" exec "$(CURDIR)/target/debug/examples/tui_demo" "$$@"' \
 		> "$(VHSDIR)/bin/$(APP)"
 	@chmod +x "$(VHSDIR)/bin/$(APP)"
 	@printf '%s\n' \
@@ -155,7 +156,7 @@ vhs: ## Record the README live TUI demo GIF with VHS
 		'Set Width 1664' \
 		'Set Height 936' \
 		'Set Padding 14' \
-		'Set Framerate 24' \
+		'Set Framerate $(VHS_FRAMERATE)' \
 		'Set PlaybackSpeed 1.0' \
 		'Set TypingSpeed 45ms' \
 		'Set CursorBlink false' \
@@ -581,6 +582,7 @@ help: ## Show this help message
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "VHS" "VHS command for make vhs, defaults to $(VHS)"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "VHS_DEMO_COMMAND" "Demo command for make vhs"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "VHS_DEMO_DELAY_SCALE" "Demo scan delay scale for make vhs, defaults to $(VHS_DEMO_DELAY_SCALE)"
+	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_NAME_WIDTH)" "VHS_FRAMERATE" "VHS recording framerate, defaults to $(VHS_FRAMERATE)"
 	@printf "\n\033[1mExamples:\033[0m\n"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_EXAMPLE_WIDTH)" "make fmt CHECK_ONLY=1" "# Check formatting without writing"
 	@printf "  \033[36m%-*s\033[0m%s\n" "$(HELP_EXAMPLE_WIDTH)" "make check" "# Run local quality gates"

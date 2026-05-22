@@ -47,10 +47,13 @@ const TARGET_RANGES: &str = "192.0.2.0/24,198.51.100.0/24";
 const SCAN_INTERFACES: &str = "en0,en7";
 const QUIET_HOST_WARNING: &str = "SNMP timed out on 14 quiet hosts";
 
-// Bursty timing is more convincing than a metronome. These delays create short
-// runs of immediate updates, then small gaps where the live log can be read.
+// Bursty timing is more convincing than a metronome. These base delays create
+// short runs of near-immediate updates, then small gaps where the live log can
+// be read. The recorder path clamps each update gap to at least one GIF frame
+// so the highlighted row can visibly follow the row that just changed.
 const DISCOVERY_DELAYS_MS: &[u64] = &[0, 14, 0, 38, 7, 0, 55, 18, 0, 24, 6, 0, 42, 11, 0, 65];
 const ENRICHMENT_DELAYS_MS: &[u64] = &[0, 28, 8, 0, 46, 13, 0, 60];
+const DEFAULT_DEMO_FRAMERATE: u64 = 24;
 
 // Interleave Wi-Fi and Ethernet hosts so the recording looks like concurrent
 // scans on en0 and en7 instead of one interface completing before the other.
@@ -822,11 +825,15 @@ where
             .get(offset % delays_ms.len())
             .copied()
             .unwrap_or(0);
-        if delay > 0 {
-            pause(delay).await;
-        }
+        pause_update_gap(delay).await;
     }
     Ok(())
+}
+
+async fn pause_update_gap(base_milliseconds: u64) {
+    let scaled_milliseconds = base_milliseconds.saturating_mul(demo_delay_scale());
+    let milliseconds = scaled_milliseconds.max(demo_frame_milliseconds());
+    tokio::time::sleep(Duration::from_millis(milliseconds)).await;
 }
 
 async fn pause(milliseconds: u64) {
@@ -844,6 +851,15 @@ fn demo_delay_scale() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|scale| *scale > 0)
         .unwrap_or(1)
+}
+
+fn demo_frame_milliseconds() -> u64 {
+    let frames_per_second = std::env::var("FING_DEMO_FRAMERATE")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|framerate| *framerate > 0)
+        .unwrap_or(DEFAULT_DEMO_FRAMERATE);
+    1000_u64.div_ceil(frames_per_second).max(1)
 }
 
 fn now() -> DateTime<Utc> {
