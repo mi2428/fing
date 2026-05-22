@@ -13,7 +13,7 @@ mod theme;
 
 use super::OutputOptions;
 use crate::{model::Device, scanner::ScanEvent};
-use chrono::Local;
+use chrono::{DateTime, Local};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use devices::{
     DeviceKey, device_log_summary, device_matches_search, device_row, live_identity_signature,
@@ -39,6 +39,7 @@ use session::TuiSession;
 use std::{
     collections::{BTreeMap, VecDeque},
     io,
+    sync::Arc,
     time::Duration,
 };
 use theme::NeonTheme;
@@ -70,13 +71,38 @@ enum LiveInputAction {
 const MAX_LIVE_LOG_LINES: usize = 200;
 
 pub async fn run_live_table(
-    mut events: UnboundedReceiver<ScanEvent>,
+    events: UnboundedReceiver<ScanEvent>,
     pause_tx: watch::Sender<bool>,
     options: OutputOptions,
     interface_panel: LiveInterfacePanel,
 ) -> io::Result<LiveOutcome> {
+    run_live_table_with_time_source(events, pause_tx, options, interface_panel, Local::now).await
+}
+
+pub async fn run_live_table_with_time_source<F>(
+    events: UnboundedReceiver<ScanEvent>,
+    pause_tx: watch::Sender<bool>,
+    options: OutputOptions,
+    interface_panel: LiveInterfacePanel,
+    now: F,
+) -> io::Result<LiveOutcome>
+where
+    F: Fn() -> DateTime<Local> + Send + Sync + 'static,
+{
+    run_live_table_with_app(
+        events,
+        pause_tx,
+        LiveTable::new_with_time_source(options, interface_panel, Arc::new(now)),
+    )
+    .await
+}
+
+async fn run_live_table_with_app(
+    mut events: UnboundedReceiver<ScanEvent>,
+    pause_tx: watch::Sender<bool>,
+    mut app: LiveTable,
+) -> io::Result<LiveOutcome> {
     let mut tui = TuiSession::enter()?;
-    let mut app = LiveTable::new(options, interface_panel);
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -146,10 +172,20 @@ struct LiveTable {
     search_editing: bool,
     options: OutputOptions,
     interface_panel: LiveInterfacePanel,
+    now: Arc<dyn Fn() -> DateTime<Local> + Send + Sync>,
 }
 
 impl LiveTable {
+    #[cfg(test)]
     fn new(options: OutputOptions, interface_panel: LiveInterfacePanel) -> Self {
+        Self::new_with_time_source(options, interface_panel, Arc::new(Local::now))
+    }
+
+    fn new_with_time_source(
+        options: OutputOptions,
+        interface_panel: LiveInterfacePanel,
+        now: Arc<dyn Fn() -> DateTime<Local> + Send + Sync>,
+    ) -> Self {
         Self {
             target: None,
             interface: None,
@@ -166,6 +202,7 @@ impl LiveTable {
             search_editing: false,
             options,
             interface_panel,
+            now,
         }
     }
 
@@ -315,7 +352,7 @@ impl LiveTable {
             self.logs.pop_front();
         }
         self.logs.push_back(LiveLogEntry {
-            timestamp: Local::now(),
+            timestamp: self.now(),
             level,
             message: message.into(),
         });
@@ -500,7 +537,7 @@ impl LiveTable {
             .constraints([Constraint::Min(0), Constraint::Length(interface_width)])
             .split(chunks[1]);
 
-        frame.render_widget(help_bar(chunks[0].width, Local::now()), chunks[0]);
+        frame.render_widget(help_bar(chunks[0].width, self.now()), chunks[0]);
         frame.render_widget(self.live_scan(top[0].width), top[0]);
         render_interfaces(frame, top[1], &self.interface_panel, self.options);
         self.render_table(frame, chunks[2]);
@@ -559,6 +596,10 @@ impl LiveTable {
             .style(NeonTheme::panel())
             .block(NeonTheme::block("Live Scan"))
             .wrap(Wrap { trim: true })
+    }
+
+    fn now(&self) -> DateTime<Local> {
+        (self.now)()
     }
 
     fn interface_panel_width(&self, available_width: u16) -> u16 {
@@ -1344,6 +1385,28 @@ mod tests {
         assert!(first_row.contains("Now="));
         assert!(first_row.ends_with(' '));
         assert!(!first_row.contains("Live Scan"));
+    }
+
+    #[test]
+    fn live_tui_uses_injected_time_source_for_chrome() {
+        let now = Local.with_ymd_and_hms(2026, 1, 1, 12, 34, 56).unwrap();
+        let mut app = LiveTable::new_with_time_source(
+            OutputOptions::default(),
+            LiveInterfacePanel::default(),
+            Arc::new(move || now),
+        );
+        app.push_log(LiveLogLevel::Info, "scan started target=demo");
+
+        let frame = render_app_to_text(&mut app, 140, 30);
+
+        assert!(
+            frame
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .contains("Now=12:34:56")
+        );
+        assert!(frame.contains("12:34:56 scan started"));
     }
 
     #[test]

@@ -11,5 +11,7 @@ mod privacy;
 mod sources;
 
 pub use export::{to_csv, to_json, to_table};
+#[allow(unused_imports)]
+pub use live::run_live_table_with_time_source;
 pub use live::{LiveInterfacePanel, LiveOutcome, run_live_table};
 pub use privacy::{MacAddressDisplay, OutputOptions};

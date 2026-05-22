@@ -7,8 +7,8 @@
 
 #![allow(dead_code, unused_imports)]
 
-use chrono::{DateTime, Utc};
-use std::time::Duration;
+use chrono::{DateTime, Local, Utc};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 
 // Pull the production renderer into this example without adding demo branches to
@@ -82,6 +82,31 @@ struct DemoScene {
 struct EnrichmentScene {
     timeline: DemoScene,
     apply: fn(&mut [Device]),
+}
+
+#[derive(Clone)]
+struct DemoClock {
+    started_at_utc: DateTime<Utc>,
+    started_at_instant: Instant,
+}
+
+impl DemoClock {
+    fn new() -> Self {
+        Self {
+            started_at_utc: Utc::now(),
+            started_at_instant: Instant::now(),
+        }
+    }
+
+    fn now_utc(&self) -> DateTime<Utc> {
+        let elapsed =
+            chrono::Duration::from_std(self.started_at_instant.elapsed()).unwrap_or_default();
+        self.started_at_utc + elapsed
+    }
+
+    fn now_local(&self) -> DateTime<Local> {
+        self.now_utc().with_timezone(&Local)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -191,8 +216,8 @@ impl DemoHost {
         }
     }
 
-    fn to_device(self) -> Device {
-        let mut device = Device::new(self.ip.parse().expect("valid demo device IP"), now());
+    fn to_device(self, now: DateTime<Utc>) -> Device {
+        let mut device = Device::new(self.ip.parse().expect("valid demo device IP"), now);
         device.interface = Some(self.iface.to_string());
 
         match self.identity {
@@ -401,26 +426,34 @@ async fn main() -> std::io::Result<()> {
     let (tx, rx) = mpsc::unbounded_channel();
     let (pause_tx, _pause_rx) = watch::channel(false);
     let panel = demo_interfaces();
+    // Share one monotonic demo clock so the table's Seen values and top-row
+    // Now= indicator advance together during terminal recording.
+    let clock = DemoClock::new();
+    let event_clock = clock.clone();
 
     tokio::spawn(async move {
-        if let Err(err) = send_demo_events(tx).await {
+        if let Err(err) = send_demo_events(tx, event_clock).await {
             eprintln!("demo event stream stopped: {err}");
         }
     });
 
-    output::run_live_table(
+    output::run_live_table_with_time_source(
         rx,
         pause_tx,
         OutputOptions {
             mac: MacAddressDisplay::Full,
         },
         panel,
+        move || clock.now_local(),
     )
     .await
     .map(|_| ())
 }
 
-async fn send_demo_events(tx: mpsc::UnboundedSender<ScanEvent>) -> Result<(), &'static str> {
+async fn send_demo_events(
+    tx: mpsc::UnboundedSender<ScanEvent>,
+    clock: DemoClock,
+) -> Result<(), &'static str> {
     // Scene 0: draw the TUI chrome, mark en0/en7 as active scan targets, and
     // give VHS a short beat after Enter before rows begin to stream in.
     send(
@@ -433,17 +466,17 @@ async fn send_demo_events(tx: mpsc::UnboundedSender<ScanEvent>) -> Result<(), &'
     )?;
     pause(140).await;
 
-    let mut devices = demo_devices();
+    let mut devices = demo_devices(clock.now_utc());
 
     // Scene 1: fill the device table quickly from ARP/ICMP/TCP observations.
     // The first view is intentionally sparse: many rows have only IP/MAC/vendor.
-    play_scene(&tx, &devices, DISCOVERY_SCENE).await?;
+    play_scene(&tx, &mut devices, DISCOVERY_SCENE, &clock).await?;
 
     for scene in ENRICHMENT_SCENES {
         // Scenes 2..7: replay only the hosts touched by the current probe family
         // so the GIF shows identity columns filling in over time.
         (scene.apply)(&mut devices);
-        play_scene(&tx, &devices, scene.timeline).await?;
+        play_scene(&tx, &mut devices, scene.timeline, &clock).await?;
     }
 
     // Final scene: keep one realistic warning in the log, then leave the table
@@ -463,12 +496,20 @@ async fn send_demo_events(tx: mpsc::UnboundedSender<ScanEvent>) -> Result<(), &'
 
 async fn play_scene(
     tx: &mpsc::UnboundedSender<ScanEvent>,
-    devices: &[Device],
+    devices: &mut [Device],
     scene: DemoScene,
+    clock: &DemoClock,
 ) -> Result<(), &'static str> {
     send(tx, ScanEvent::Phase(scene.phase.to_string()))?;
     pause(scene.lead_in_ms).await;
-    send_device_updates(tx, devices, scene.hosts.iter().copied(), scene.delays_ms).await
+    send_device_updates(
+        tx,
+        devices,
+        scene.hosts.iter().copied(),
+        scene.delays_ms,
+        clock,
+    )
+    .await
 }
 
 fn demo_interfaces() -> LiveInterfacePanel {
@@ -485,11 +526,11 @@ fn demo_interfaces() -> LiveInterfacePanel {
     }
 }
 
-fn demo_devices() -> Vec<Device> {
+fn demo_devices(now: DateTime<Utc>) -> Vec<Device> {
     DEMO_HOSTS
         .iter()
         .copied()
-        .map(DemoHost::to_device)
+        .map(|host| host.to_device(now))
         .collect()
 }
 
@@ -811,15 +852,19 @@ fn send(tx: &mpsc::UnboundedSender<ScanEvent>, event: ScanEvent) -> Result<(), &
 
 async fn send_device_updates<I>(
     tx: &mpsc::UnboundedSender<ScanEvent>,
-    devices: &[Device],
+    devices: &mut [Device],
     indices: I,
     delays_ms: &[u64],
+    clock: &DemoClock,
 ) -> Result<(), &'static str>
 where
     I: IntoIterator<Item = usize>,
 {
     for (offset, index) in indices.into_iter().enumerate() {
-        let device = devices.get(index).ok_or("demo device index out of range")?;
+        let device = devices
+            .get_mut(index)
+            .ok_or("demo device index out of range")?;
+        device.last_seen = clock.now_utc();
         send(tx, ScanEvent::DeviceUpdated(Box::new(device.clone())))?;
         let delay = delays_ms
             .get(offset % delays_ms.len())
@@ -860,8 +905,4 @@ fn demo_frame_milliseconds() -> u64 {
         .filter(|framerate| *framerate > 0)
         .unwrap_or(DEFAULT_DEMO_FRAMERATE);
     1000_u64.div_ceil(frames_per_second).max(1)
-}
-
-fn now() -> DateTime<Utc> {
-    Utc::now()
 }
