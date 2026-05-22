@@ -73,12 +73,19 @@ fn collect_device_sources(device: &Device) -> Vec<String> {
     if device.mac.is_some() {
         sources.push("arp".to_string());
     }
-    if device.vendor.is_some() {
+    if device.vendor.is_some() && !vendor_was_filled_from_cache(device) {
         sources.push("oui".to_string());
     }
     sources.sort();
     sources.dedup();
     sources
+}
+
+fn vendor_was_filled_from_cache(device: &Device) -> bool {
+    device
+        .evidence
+        .iter()
+        .any(|evidence| evidence.source == "cache" && evidence.key == "vendor")
 }
 
 fn source_code(source: &str) -> char {
@@ -125,6 +132,17 @@ mod tests {
 
         assert_eq!(source_summary(&device), "arp,oui");
         assert_eq!(compact_source_summary(&device), "AO");
+    }
+
+    #[test]
+    fn source_summary_marks_cached_vendor_as_cache() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut device = Device::new("192.168.1.10".parse().unwrap(), now);
+        device.vendor = Some("Example Inc".to_string());
+        device.add_evidence("cache", "vendor", "Example Inc", 0.55);
+
+        assert_eq!(source_summary(&device), "cache");
+        assert_eq!(compact_source_summary(&device), "K");
     }
 
     #[test]

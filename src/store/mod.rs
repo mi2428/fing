@@ -12,6 +12,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const CACHE_SOURCE: &str = "cache";
+
 pub fn default_scan_cache_path() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
@@ -54,25 +56,51 @@ pub fn merge_previous_scan(current: &mut [Device], previous: &[Device]) {
         {
             device.first_seen = previous.first_seen;
             if device.vendor.is_none() {
-                device.vendor = previous.vendor.clone();
+                copy_cached_vendor(device, previous);
             }
             if device.hostname.is_none() {
-                device.hostname = previous.hostname.clone();
-                device.names = previous.names.clone();
+                copy_cached_names(device, previous);
             }
-            if device.make.is_none() {
-                device.make = previous.make.clone();
+            if device.make.is_none()
+                && let Some(guess) = &previous.make
+            {
+                device.set_make_guess(&guess.value, CACHE_SOURCE, guess.confidence);
             }
-            if device.model.is_none() {
-                device.model = previous.model.clone();
+            if device.model.is_none()
+                && let Some(guess) = &previous.model
+            {
+                device.set_model_guess(&guess.value, CACHE_SOURCE, guess.confidence);
             }
-            if device.os.is_none() {
-                device.os = previous.os.clone();
+            if device.os.is_none()
+                && let Some(guess) = &previous.os
+            {
+                device.set_os_guess(&guess.value, CACHE_SOURCE, guess.confidence);
             }
-            if device.device_type.is_none() {
-                device.device_type = previous.device_type.clone();
+            if device.device_type.is_none()
+                && let Some(guess) = &previous.device_type
+            {
+                device.set_device_type_guess(&guess.value, CACHE_SOURCE, guess.confidence);
             }
         }
+    }
+}
+
+fn copy_cached_vendor(device: &mut Device, previous: &Device) {
+    let Some(vendor) = &previous.vendor else {
+        return;
+    };
+    device.vendor = Some(vendor.clone());
+    device.add_evidence(CACHE_SOURCE, "vendor", vendor, 0.55);
+}
+
+fn copy_cached_names(device: &mut Device, previous: &Device) {
+    for name in &previous.names {
+        device.add_name(name.name.clone(), CACHE_SOURCE, name.confidence);
+    }
+    if device.hostname.is_none()
+        && let Some(hostname) = &previous.hostname
+    {
+        device.add_name(hostname.clone(), CACHE_SOURCE, 0.6);
     }
 }
 
@@ -94,7 +122,10 @@ fn normalize_mac(value: &str) -> String {
 fn identity_keys(device: &Device) -> Vec<String> {
     let mut keys = Vec::new();
     if let Some(mac) = &device.mac {
-        keys.push(format!("mac:{}", mac.to_ascii_lowercase()));
+        let mac = normalize_mac(mac);
+        if !mac.is_empty() {
+            keys.push(format!("mac:{mac}"));
+        }
     }
     // Interface is part of the fallback key because overlapping RFC1918 ranges
     // are common across VLANs, VPNs, and guest networks.
@@ -128,6 +159,41 @@ mod tests {
 
         assert_eq!(current.first_seen, old_time);
         assert_eq!(current.hostname.as_deref(), Some("old-name"));
+    }
+
+    #[test]
+    fn cached_identity_is_marked_as_cache_source() {
+        let old_time = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let new_time = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+
+        let mut previous = Device::new("192.168.1.10".parse().unwrap(), old_time);
+        previous.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+        previous.vendor = Some("Example Inc".to_string());
+        previous.add_name("old-name", "mdns", 0.9);
+        previous.set_model_guess("Example Camera", "upnp", 0.85);
+        previous.set_os_guess("Embedded Linux", "snmp", 0.8);
+
+        let mut current = Device::new("192.168.1.20".parse().unwrap(), new_time);
+        current.mac = Some("AA-BB-CC-DD-EE-FF".to_string());
+
+        merge_previous_scan(std::slice::from_mut(&mut current), &[previous]);
+
+        assert_eq!(current.first_seen, old_time);
+        assert_eq!(current.hostname.as_deref(), Some("old-name"));
+        assert!(current.names.iter().all(|name| name.source == CACHE_SOURCE));
+        assert_eq!(
+            current.model.as_ref().map(|guess| guess.source.as_str()),
+            Some(CACHE_SOURCE)
+        );
+        assert_eq!(
+            current.os.as_ref().map(|guess| guess.source.as_str()),
+            Some(CACHE_SOURCE)
+        );
+        assert!(current.evidence.iter().any(|evidence| {
+            evidence.source == CACHE_SOURCE
+                && evidence.key == "vendor"
+                && evidence.value == "Example Inc"
+        }));
     }
 
     #[test]
