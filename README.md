@@ -136,6 +136,7 @@ Variables:
   VHS                        VHS command for make vhs, defaults to vhs
   VHS_DEMO_COMMAND           Demo command for make vhs
   VHS_DEMO_DELAY_SCALE       Demo scan delay scale for make vhs, defaults to 4
+  VHS_FRAMERATE              VHS recording framerate, defaults to 24
 
 Examples:
   make fmt CHECK_ONLY=1                       # Check formatting without writing

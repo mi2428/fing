@@ -331,7 +331,7 @@ impl LiveTable {
         }
 
         match key.code {
-            KeyCode::Char('w') => {
+            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if !self.paused {
                     self.paused = true;
                     self.phase = "paused".to_string();
@@ -1117,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn live_tui_pause_freezes_auto_follow_until_escape_resumes() {
+    fn live_tui_ctrl_z_pause_freezes_auto_follow_until_escape_resumes() {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let mut app = LiveTable::new(OutputOptions::default(), LiveInterfacePanel::default());
 
@@ -1128,7 +1128,10 @@ mod tests {
         }
 
         assert_eq!(app.table_state.selected(), Some(1));
-        assert_eq!(app.handle_key(key('w')), LiveInputAction::Pause);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+            LiveInputAction::Pause
+        );
         assert!(app.paused);
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
@@ -1328,7 +1331,9 @@ mod tests {
 
         assert!(first_row.contains("Keys:"));
         assert!(first_row.starts_with(" Keys:"));
-        assert!(first_row.contains("w=Pause Esc=Resume"));
+        assert!(first_row.contains("Ctrl-Z=Pause"));
+        assert!(!first_row.contains("w=Pause"));
+        assert!(!first_row.contains("Esc=Resume"));
         assert!(first_row.contains("j=Down k=Up"));
         assert!(first_row.contains("Ctrl-D=PageDown"));
         assert!(first_row.contains("Ctrl-U=PageUp"));
@@ -1344,11 +1349,11 @@ mod tests {
     #[test]
     fn help_line_truncates_to_available_width() {
         let now = Local.with_ymd_and_hms(2026, 1, 1, 12, 34, 56).unwrap();
-        let line = help_line(32, now);
+        let line = help_line(48, now);
         let text = line_to_string(&line);
 
-        assert_eq!(text.chars().count(), 32);
-        assert!(text.starts_with(" Keys: w=Pause"));
+        assert_eq!(text.chars().count(), 48);
+        assert!(text.starts_with(" Keys: /=Filter j=Down k=Up"));
         assert!(text.contains("Now=12:34:56"));
         assert!(text.trim_end().ends_with("Now=12:34:56"));
         assert!(text.ends_with(' '));
