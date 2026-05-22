@@ -6,7 +6,7 @@
 use crate::{
     enrich, net, output,
     scanner::{self, ScanConfig, ScanProfile},
-    store,
+    store, version,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -15,7 +15,9 @@ use std::{io::IsTerminal, path::PathBuf, time::Duration};
 #[derive(Debug, Parser)]
 #[command(name = "fing")]
 #[command(version)]
+#[command(long_version = version::LONG_VERSION)]
 #[command(about = "Generic Fing - scan local IPv4 networks and enrich device identities")]
+#[command(propagate_version = true)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -459,6 +461,38 @@ mod tests {
                 "{option} should be in Fingerprint Options:\n{help}"
             );
         }
+    }
+
+    #[test]
+    fn version_flags_split_short_and_long_output() {
+        let short = Cli::try_parse_from(["fing", "-V"]).unwrap_err();
+        let long = Cli::try_parse_from(["fing", "--version"]).unwrap_err();
+
+        assert_eq!(short.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(long.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            short.to_string(),
+            format!("fing {}\n", env!("CARGO_PKG_VERSION"))
+        );
+
+        let long = long.to_string();
+        assert!(long.starts_with(&format!("fing {} (git ", env!("CARGO_PKG_VERSION"))));
+        assert!(long.contains("; commit "));
+        assert!(long.contains("; commit date "));
+        assert!(long.contains("; built "));
+        assert!(long.contains(") on "));
+        assert_ne!(long, short.to_string());
+    }
+
+    #[test]
+    fn version_flags_propagate_to_subcommands() {
+        let short = Cli::try_parse_from(["fing", "scan", "-V"]).unwrap_err();
+
+        assert_eq!(short.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            short.to_string(),
+            format!("fing-scan {}\n", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]
