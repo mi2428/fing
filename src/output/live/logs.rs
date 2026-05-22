@@ -143,7 +143,7 @@ fn help_spans(text: String) -> Vec<Span<'static>> {
 }
 
 fn help_text() -> String {
-    "Keys: w=Pause Esc=Resume j=Down k=Up Ctrl-D=PageDown Ctrl-U=PageUp /=Filter Ctrl-C=Quit"
+    "Keys: /=Filter j=Down k=Up Ctrl-D=PageDown Ctrl-U=PageUp Ctrl-Z=Pause Ctrl-C=Quit"
         .to_string()
 }
 
