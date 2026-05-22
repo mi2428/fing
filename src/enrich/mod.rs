@@ -387,6 +387,7 @@ fn records_to_mdns_info(records: &[MdnsRecord]) -> HashMap<IpAddr, MdnsInfo> {
     // first, then materialize one MdnsInfo per IP.
     let mut host_ips: HashMap<String, Vec<IpAddr>> = HashMap::new();
     let mut host_names: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut host_txt_names: HashMap<String, HashSet<String>> = HashMap::new();
     let mut host_services: HashMap<String, Vec<MdnsService>> = HashMap::new();
     let mut txt_by_name: HashMap<String, Vec<String>> = HashMap::new();
     let mut ptr_targets = HashSet::new();
@@ -404,6 +405,10 @@ fn records_to_mdns_info(records: &[MdnsRecord]) -> HashMap<IpAddr, MdnsInfo> {
                     .entry(target.clone())
                     .or_default()
                     .insert(service_instance_name(name));
+                host_txt_names
+                    .entry(target.clone())
+                    .or_default()
+                    .insert(name.clone());
                 host_services
                     .entry(target.clone())
                     .or_default()
@@ -442,7 +447,7 @@ fn records_to_mdns_info(records: &[MdnsRecord]) -> HashMap<IpAddr, MdnsInfo> {
 
             for (name, attrs) in &txt_by_name {
                 if name == &host
-                    || host_names
+                    || host_txt_names
                         .get(&host)
                         .is_some_and(|names| names.contains(name))
                 {
@@ -790,6 +795,39 @@ mod tests {
                 host: "host.local".to_string(),
                 ip: "192.168.1.20".parse().unwrap()
             }]
+        );
+    }
+
+    #[test]
+    fn mdns_txt_for_service_instance_enriches_srv_target_host() {
+        let records = vec![
+            MdnsRecord::Address {
+                host: "printer.local".to_string(),
+                ip: "192.168.1.20".parse().unwrap(),
+            },
+            MdnsRecord::Srv {
+                name: "Office._ipp._tcp.local".to_string(),
+                target: "printer.local".to_string(),
+                port: 631,
+            },
+            MdnsRecord::Txt {
+                name: "Office._ipp._tcp.local".to_string(),
+                attrs: vec!["model=OfficeJet Pro".to_string()],
+            },
+        ];
+
+        let info = records_to_mdns_info(&records);
+        let device = info
+            .get(&"192.168.1.20".parse().unwrap())
+            .expect("mDNS info should be keyed by the SRV target host IP");
+
+        assert_eq!(device.model.as_deref(), Some("OfficeJet Pro"));
+        assert!(device.names.iter().any(|name| name == "Office"));
+        assert!(
+            device
+                .services
+                .iter()
+                .any(|service| { service.name == "ipp" && service.port == Some(631) })
         );
     }
 
