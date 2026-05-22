@@ -4,18 +4,20 @@
 //! description XML adds friendly names, manufacturer, model, and device type.
 //! The scanner later decides how strongly to trust those facts.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use quick_xml::{Reader, events::Event};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
     collections::{HashMap, HashSet},
+    io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket},
     time::{Duration, Instant},
 };
 
 const SSDP_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const SSDP_PORT: u16 = 1900;
+const MAX_UPNP_DESCRIPTION_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpnpInfo {
@@ -66,7 +68,7 @@ where
     let deadline = Instant::now() + timeout;
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::limited(3))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to build UPnP HTTP client")?;
 
@@ -89,6 +91,7 @@ where
                 // the same device often point at the same XML description.
                 if fetch_descriptions
                     && let Some(location) = info.location.clone()
+                    && description_location_allowed(&location, source_ip)
                     && fetched_locations.insert(location.clone())
                     && let Ok(description) = fetch_description(&client, &location)
                 {
@@ -174,10 +177,50 @@ fn fetch_description(
         .get(location)
         .send()
         .with_context(|| format!("failed to fetch UPnP description from {location}"))?;
-    let text = response
-        .text()
-        .with_context(|| format!("failed to read UPnP description from {location}"))?;
+    if !response.status().is_success() {
+        bail!(
+            "UPnP description fetch from {location} failed with status {}",
+            response.status()
+        );
+    }
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_UPNP_DESCRIPTION_BYTES as u64)
+    {
+        bail!("UPnP description from {location} exceeded {MAX_UPNP_DESCRIPTION_BYTES} bytes");
+    }
+
+    let text = read_limited_description_body(response, location)?;
     parse_upnp_description(&text)
+}
+
+fn description_location_allowed(location: &str, source_ip: IpAddr) -> bool {
+    let Ok(url) = reqwest::Url::parse(location) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+
+    url.host_str()
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .is_some_and(|host_ip| host_ip == source_ip)
+}
+
+fn read_limited_description_body(reader: impl Read, location: &str) -> Result<String> {
+    let mut bytes = Vec::new();
+    let mut limited = reader.take(MAX_UPNP_DESCRIPTION_BYTES as u64 + 1);
+    limited
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read UPnP description from {location}"))?;
+    if bytes.len() > MAX_UPNP_DESCRIPTION_BYTES {
+        bail!("UPnP description from {location} exceeded {MAX_UPNP_DESCRIPTION_BYTES} bytes");
+    }
+
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 pub fn parse_upnp_description(xml: &str) -> Result<UpnpDescription> {
@@ -260,6 +303,7 @@ pub fn friendly_device_type(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn parses_ssdp_headers_case_insensitively() {
@@ -274,6 +318,47 @@ mod tests {
             parsed.headers.get("server").map(String::as_str),
             Some("Linux UPnP/1.0")
         );
+    }
+
+    #[test]
+    fn description_location_must_match_source_ip() {
+        let source = "192.168.1.1".parse().unwrap();
+
+        assert!(description_location_allowed(
+            "http://192.168.1.1/root.xml",
+            source
+        ));
+        assert!(description_location_allowed(
+            "https://192.168.1.1/root.xml",
+            source
+        ));
+        assert!(!description_location_allowed(
+            "http://192.168.1.2/root.xml",
+            source
+        ));
+        assert!(!description_location_allowed(
+            "http://example.com/root.xml",
+            source
+        ));
+        assert!(!description_location_allowed(
+            "file:///tmp/root.xml",
+            source
+        ));
+        assert!(!description_location_allowed(
+            "http://user@192.168.1.1/root.xml",
+            source
+        ));
+    }
+
+    #[test]
+    fn upnp_description_body_has_a_size_limit() {
+        let oversized = vec![b'a'; MAX_UPNP_DESCRIPTION_BYTES + 1];
+        let err =
+            read_limited_description_body(Cursor::new(oversized), "http://192.168.1.1/root.xml")
+                .unwrap_err()
+                .to_string();
+
+        assert!(err.contains("exceeded"));
     }
 
     #[test]
