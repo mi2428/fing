@@ -901,7 +901,7 @@ async fn scan_inner(
             let warning = format!("ARP sweep failed ({err}); falling back to the OS ARP table");
             warnings.push(warning.clone());
             emit(&events, ScanEvent::Warning(warning));
-            for hit in discovery::arp_table(target) {
+            for hit in discovery::arp_table(target, &iface.name) {
                 let device =
                     upsert_device(&mut devices, IpAddr::V4(hit.ip), scanned_at, &iface.name);
                 if config.oui {

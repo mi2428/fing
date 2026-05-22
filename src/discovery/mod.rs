@@ -32,6 +32,8 @@ use std::{
 pub struct ArpHit {
     pub ip: Ipv4Addr,
     pub mac: String,
+    #[serde(default)]
+    pub interface: Option<String>,
 }
 
 pub fn arp_sweep_with_callback<F>(
@@ -99,7 +101,7 @@ where
     Ok(hits.into_values().collect())
 }
 
-pub fn arp_table(target: Ipv4Net) -> Vec<ArpHit> {
+pub fn arp_table(target: Ipv4Net, interface: &str) -> Vec<ArpHit> {
     let mut hits = BTreeMap::new();
     for command in arp_table_commands() {
         // Try platform-native commands in order. Failure of one command is not a
@@ -113,7 +115,7 @@ pub fn arp_table(target: Ipv4Net) -> Vec<ArpHit> {
         }
         let text = String::from_utf8_lossy(&output.stdout);
         for hit in parse_arp_table(&text) {
-            if target.contains(&hit.ip) {
+            if arp_hit_matches_target_interface(&hit, target, interface) {
                 hits.insert(hit.ip, hit);
             }
         }
@@ -168,6 +170,7 @@ pub fn parse_arp_reply(packet: &[u8]) -> Option<ArpHit> {
     Some(ArpHit {
         ip: arp.get_sender_proto_addr(),
         mac: arp.get_sender_hw_addr().to_string(),
+        interface: None,
     })
 }
 
@@ -187,7 +190,15 @@ fn parse_arp_table_line(line: &str) -> Option<ArpHit> {
     if mac.eq_ignore_ascii_case("(incomplete)") || mac.eq_ignore_ascii_case("incomplete") {
         return None;
     }
-    Some(ArpHit { ip, mac })
+    Some(ArpHit {
+        ip,
+        mac,
+        interface: parse_arp_table_interface(line),
+    })
+}
+
+fn arp_hit_matches_target_interface(hit: &ArpHit, target: Ipv4Net, interface: &str) -> bool {
+    target.contains(&hit.ip) && hit.interface.as_deref() == Some(interface)
 }
 
 fn parse_parenthesized_ip(line: &str) -> Option<Ipv4Addr> {
@@ -223,6 +234,26 @@ fn parse_linux_neigh_mac(line: &str) -> Option<String> {
     None
 }
 
+fn parse_arp_table_interface(line: &str) -> Option<String> {
+    if let Some(interface) = value_after_token(line, "dev") {
+        return Some(interface.to_string());
+    }
+    if let Some((_, rest)) = line.split_once(" on ") {
+        return rest.split_whitespace().next().map(str::to_string);
+    }
+    None
+}
+
+fn value_after_token<'a>(line: &'a str, token: &str) -> Option<&'a str> {
+    let mut parts = line.split_whitespace();
+    while let Some(part) = parts.next() {
+        if part == token {
+            return parts.next();
+        }
+    }
+    None
+}
+
 fn is_mac_like(value: &str) -> bool {
     let hex_count = value.chars().filter(|ch| ch.is_ascii_hexdigit()).count();
     hex_count == 12
@@ -243,6 +274,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].ip, "192.168.1.1".parse::<Ipv4Addr>().unwrap());
         assert_eq!(hits[0].mac, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(hits[0].interface.as_deref(), Some("en0"));
     }
 
     #[test]
@@ -253,5 +285,22 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].ip, "192.168.1.20".parse::<Ipv4Addr>().unwrap());
         assert_eq!(hits[0].mac, "11:22:33:44:55:66");
+        assert_eq!(hits[0].interface.as_deref(), Some("wlan0"));
+    }
+
+    #[test]
+    fn arp_table_fallback_requires_matching_interface() {
+        let target = "192.168.1.0/24".parse::<Ipv4Net>().unwrap();
+        let hits = parse_arp_table(
+            "? (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]\n\
+             ? (192.168.1.2) at 11:22:33:44:55:66 on en1 ifscope [ethernet]\n",
+        );
+        let filtered = hits
+            .into_iter()
+            .filter(|hit| arp_hit_matches_target_interface(hit, target, "en0"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].ip, "192.168.1.1".parse::<Ipv4Addr>().unwrap());
     }
 }
