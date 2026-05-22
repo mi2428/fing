@@ -50,10 +50,129 @@ pub fn masked_scan_result(result: &ScanResult, options: OutputOptions) -> ScanRe
 }
 
 fn mask_device(device: &mut Device, options: OutputOptions) {
-    if let Some(mac) = device.mac.as_deref()
-        && options.mask_mac()
-    {
+    if !options.mask_mac() {
+        return;
+    }
+
+    if let Some(mac) = device.mac.as_deref() {
         device.mac = Some(mask_lower_24_bits(mac));
+    }
+
+    for evidence in &mut device.evidence {
+        evidence.value = mask_mac_evidence_value(&evidence.key, &evidence.value);
+    }
+}
+
+fn mask_mac_evidence_value(key: &str, value: &str) -> String {
+    if !evidence_key_may_contain_mac(key) {
+        return value.to_string();
+    }
+
+    if key.eq_ignore_ascii_case("client_id")
+        && let Some(masked) = mask_dhcp_mac_client_id(value)
+    {
+        return masked;
+    }
+
+    let masked = mask_separated_macs(value);
+    if masked != value {
+        return masked;
+    }
+
+    mask_compact_mac(value).unwrap_or_else(|| value.to_string())
+}
+
+fn evidence_key_may_contain_mac(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "mac"
+        || key.ends_with("_mac")
+        || matches!(key.as_str(), "chassis_id" | "port_id" | "client_id")
+}
+
+fn mask_dhcp_mac_client_id(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    for separator in [':', '-'] {
+        let parts = trimmed.split(separator).collect::<Vec<_>>();
+        if parts.len() == 7
+            && parts[0].eq_ignore_ascii_case("01")
+            && parts
+                .iter()
+                .all(|part| part.len() == 2 && part.chars().all(|ch| ch.is_ascii_hexdigit()))
+        {
+            return Some(format!("01:{}", mask_lower_24_bits(&parts[1..].join(":"))));
+        }
+    }
+
+    if trimmed.len() == 14
+        && trimmed.starts_with("01")
+        && trimmed.chars().all(|ch| ch.is_ascii_hexdigit())
+    {
+        return Some(format!("01:{}", mask_lower_24_bits(&trimmed[2..])));
+    }
+
+    None
+}
+
+fn mask_separated_macs(value: &str) -> String {
+    let mut masked = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        if let Some((end, mac)) = separated_mac_at(value, index) {
+            masked.push_str(&mask_lower_24_bits(mac));
+            index = end;
+        } else {
+            let ch = value[index..]
+                .chars()
+                .next()
+                .expect("index should be at a valid character boundary");
+            masked.push(ch);
+            index += ch.len_utf8();
+        }
+    }
+    masked
+}
+
+fn separated_mac_at(value: &str, start: usize) -> Option<(usize, &str)> {
+    let bytes = value.as_bytes();
+    if start + 17 > bytes.len() {
+        return None;
+    }
+    if start > 0 && is_mac_token_byte(bytes[start - 1]) {
+        return None;
+    }
+
+    let separator = bytes[start + 2];
+    if !matches!(separator, b':' | b'-') {
+        return None;
+    }
+
+    for octet in 0..6 {
+        let octet_start = start + octet * 3;
+        if !bytes[octet_start].is_ascii_hexdigit() || !bytes[octet_start + 1].is_ascii_hexdigit() {
+            return None;
+        }
+        if octet < 5 && bytes[octet_start + 2] != separator {
+            return None;
+        }
+    }
+
+    let end = start + 17;
+    if end < bytes.len() && is_mac_token_byte(bytes[end]) {
+        return None;
+    }
+    Some((end, &value[start..end]))
+}
+
+fn is_mac_token_byte(byte: u8) -> bool {
+    byte.is_ascii_hexdigit() || matches!(byte, b':' | b'-')
+}
+
+fn mask_compact_mac(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.len() == 12 && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Some(mask_lower_24_bits(trimmed))
+    } else {
+        None
     }
 }
 
@@ -134,5 +253,47 @@ mod tests {
 
         assert_eq!(masked.devices[0].mac.as_deref(), Some("aa:bb:cc:**:**:**"));
         assert_eq!(result.devices[0].mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+    }
+
+    #[test]
+    fn masks_mac_values_embedded_in_evidence() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut device = Device::new("192.168.1.10".parse().unwrap(), now);
+        device.add_evidence("dhcp", "mac", "aa:bb:cc:dd:ee:ff", 0.55);
+        device.add_evidence("lldp", "source_mac", "00:11:22:33:44:55", 0.76);
+        device.add_evidence("lldp", "chassis_id", "66778899aabb", 0.82);
+        device.add_evidence("dhcp", "client_id", "01:aa:bb:cc:dd:ee:ff", 0.55);
+        device.add_evidence("tls", "tls_cert_sha256", "aabbccddeeff", 0.72);
+        let result = ScanResult {
+            target: "192.168.1.0/24".to_string(),
+            interface: "en0".to_string(),
+            scanned_at: now,
+            devices: vec![device],
+            warnings: Vec::new(),
+        };
+
+        let masked = masked_scan_result(
+            &result,
+            OutputOptions {
+                mac: MacAddressDisplay::MaskLower24,
+            },
+        );
+        let values = masked.devices[0]
+            .evidence
+            .iter()
+            .map(|evidence| evidence.value.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(values.contains(&"aa:bb:cc:**:**:**"));
+        assert!(values.contains(&"00:11:22:**:**:**"));
+        assert!(values.contains(&"66:77:88:**:**:**"));
+        assert!(values.contains(&"01:aa:bb:cc:**:**:**"));
+        assert!(values.contains(&"aabbccddeeff"));
+        assert!(
+            result.devices[0]
+                .evidence
+                .iter()
+                .any(|evidence| evidence.value == "aa:bb:cc:dd:ee:ff")
+        );
     }
 }

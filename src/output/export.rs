@@ -208,6 +208,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let mut device = Device::new("192.168.1.10".parse().unwrap(), now);
         device.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+        device.add_evidence("dhcp", "mac", "aa:bb:cc:dd:ee:ff", 0.55);
         let result = ScanResult {
             target: "192.168.1.0/24".to_string(),
             interface: "en0".to_string(),
@@ -225,6 +226,11 @@ mod tests {
         .unwrap();
 
         assert!(json.contains("aa:bb:cc:**:**:**"));
+        assert!(!json.contains("aa:bb:cc:dd:ee:ff"));
         assert_eq!(result.devices[0].mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(
+            result.devices[0].evidence[0].value.as_str(),
+            "aa:bb:cc:dd:ee:ff"
+        );
     }
 }
