@@ -972,12 +972,15 @@ async fn scan_inner(
                 // Lease files are often host-global rather than per-interface.
                 // Scope them back to this interface's target network before
                 // using hostnames or vendor-class strings as identity evidence.
+                // They are passive and can be stale, so they only enrich
+                // devices that this scan already observed by IP or MAC.
                 if !target_contains_ip(target, lease.ip) {
                     continue;
                 }
-                let device = upsert_device(&mut devices, lease.ip, scanned_at, &iface.name);
-                apply_dhcp_lease(device, lease, config.oui.then_some(&oui_db));
-                finish_observed_device_update(&events, device, &identity_rules);
+                if let Some(device) = observed_device_for_dhcp_lease(&mut devices, &lease) {
+                    apply_dhcp_lease(device, lease, config.oui.then_some(&oui_db));
+                    finish_observed_device_update(&events, device, &identity_rules);
+                }
             }
         }
     }
@@ -1185,6 +1188,27 @@ fn upsert_device<'a>(
         device.interface = Some(interface.to_string());
     }
     device
+}
+
+fn observed_device_for_dhcp_lease<'a>(
+    devices: &'a mut BTreeMap<IpAddr, Device>,
+    lease: &dhcp::DhcpLease,
+) -> Option<&'a mut Device> {
+    if devices.contains_key(&lease.ip) {
+        return devices.get_mut(&lease.ip);
+    }
+
+    let lease_mac = lease.mac.as_deref()?;
+    let matching_ip = devices
+        .iter()
+        .find(|(_, device)| {
+            device
+                .mac
+                .as_deref()
+                .is_some_and(|device_mac| same_mac(device_mac, lease_mac))
+        })
+        .map(|(ip, _)| *ip)?;
+    devices.get_mut(&matching_ip)
 }
 
 async fn await_with_lldp<F, T>(
@@ -1490,6 +1514,44 @@ mod tests {
         let merged = merge_devices_by_interface_ip(vec![left, right]);
 
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn dhcp_lease_does_not_create_unobserved_device() {
+        let mut devices = BTreeMap::new();
+        let lease = dhcp::DhcpLease {
+            ip: "192.168.1.44".parse().unwrap(),
+            mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+            hostname: Some("stale-host".to_string()),
+            client_id: None,
+            vendor_class: None,
+            source: None,
+        };
+
+        assert!(observed_device_for_dhcp_lease(&mut devices, &lease).is_none());
+        assert!(devices.is_empty());
+    }
+
+    #[test]
+    fn dhcp_lease_can_enrich_observed_device_by_mac() {
+        let now = Utc::now();
+        let mut devices = BTreeMap::new();
+        let mut observed = Device::new("192.168.1.44".parse().unwrap(), now);
+        observed.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+        devices.insert(observed.ip, observed);
+        let lease = dhcp::DhcpLease {
+            ip: "192.168.1.88".parse().unwrap(),
+            mac: Some("AA-BB-CC-DD-EE-FF".to_string()),
+            hostname: Some("observed-host".to_string()),
+            client_id: None,
+            vendor_class: None,
+            source: None,
+        };
+
+        let device = observed_device_for_dhcp_lease(&mut devices, &lease)
+            .expect("lease should match the observed MAC");
+
+        assert_eq!(device.ip.to_string(), "192.168.1.44");
     }
 
     #[test]
