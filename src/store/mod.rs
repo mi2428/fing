@@ -50,6 +50,7 @@ pub fn merge_previous_scan(current: &mut [Device], previous: &[Device]) {
         if let Some(previous) = identity_keys(device)
             .into_iter()
             .find_map(|key| by_key.get(&key).copied())
+            .filter(|previous| !known_mac_conflict(device, previous))
         {
             device.first_seen = previous.first_seen;
             if device.vendor.is_none() {
@@ -73,6 +74,21 @@ pub fn merge_previous_scan(current: &mut [Device], previous: &[Device]) {
             }
         }
     }
+}
+
+fn known_mac_conflict(current: &Device, previous: &Device) -> bool {
+    matches!(
+        (current.mac.as_deref(), previous.mac.as_deref()),
+        (Some(current), Some(previous)) if normalize_mac(current) != normalize_mac(previous)
+    )
+}
+
+fn normalize_mac(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn identity_keys(device: &Device) -> Vec<String> {
@@ -112,5 +128,25 @@ mod tests {
 
         assert_eq!(current.first_seen, old_time);
         assert_eq!(current.hostname.as_deref(), Some("old-name"));
+    }
+
+    #[test]
+    fn does_not_merge_cached_identity_by_ip_when_macs_conflict() {
+        let old_time = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let new_time = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+
+        let mut previous = Device::new("192.168.1.10".parse().unwrap(), old_time);
+        previous.interface = Some("en0".to_string());
+        previous.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+        previous.add_name("old-name", "mdns", 0.9);
+
+        let mut current = Device::new("192.168.1.10".parse().unwrap(), new_time);
+        current.interface = Some("en0".to_string());
+        current.mac = Some("00:11:22:33:44:55".to_string());
+
+        merge_previous_scan(std::slice::from_mut(&mut current), &[previous]);
+
+        assert_eq!(current.first_seen, new_time);
+        assert!(current.hostname.is_none());
     }
 }

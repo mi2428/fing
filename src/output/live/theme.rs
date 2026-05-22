@@ -19,6 +19,7 @@ impl NeonTheme {
     pub(super) const PRIMARY_SOFT: Color = Color::Rgb(255, 170, 68);
     pub(super) const TEXT: Color = Color::Rgb(238, 136, 34);
     pub(super) const ACCENT_GREEN: Color = Color::Rgb(88, 242, 165);
+    pub(super) const STALE_RED: Color = Color::Rgb(150, 45, 38);
     pub(super) const DIM: Color = Color::Rgb(107, 53, 16);
 
     pub(super) fn panel() -> Style {
@@ -56,7 +57,6 @@ impl NeonTheme {
 
     pub(super) fn selected_row() -> Style {
         Style::default()
-            .fg(Self::PRIMARY_SOFT)
             .bg(Self::SELECTED_BG)
             .add_modifier(Modifier::BOLD)
     }

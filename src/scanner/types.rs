@@ -84,6 +84,9 @@ pub enum ScanEvent {
         interface: String,
         profile: ScanProfile,
     },
+    RoundStarted {
+        round: u64,
+    },
     Phase(String),
     DeviceUpdated(Box<Device>),
     Warning(String),

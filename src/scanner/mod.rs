@@ -71,6 +71,7 @@ pub async fn scan_continuously_with_events(
             &mut passive_manager,
         )
         .await;
+        emit(&Some(events.clone()), ScanEvent::RoundStarted { round });
         emit(
             &Some(events.clone()),
             ScanEvent::Phase(format!("scan round {round}")),
@@ -378,14 +379,16 @@ impl ContinuousPassiveManager {
         state
             .pending_observations
             .insert(observation.key.clone(), observation.clone());
+        let received_at = observation.received_at;
 
         let mut events = Vec::new();
         for ip in observation.target_ips(&state.devices, &state.targets) {
             let device = state
                 .devices
                 .entry(ip)
-                .or_insert_with(|| passive_device(ip, interface));
+                .or_insert_with(|| passive_device(ip, interface, received_at));
             let before = device.clone();
+            device.last_seen = received_at;
             observation.apply_to_device(device, state.oui.then_some(&self.oui_db));
             identity_rules::apply_identity_rules(device, &self.rules);
             if *device != before {
@@ -614,15 +617,19 @@ async fn wait_until_resumed_with_passive(
     }
 }
 
-fn passive_device(ip: IpAddr, interface: &str) -> Device {
-    let mut device = Device::new(ip, Utc::now());
+fn passive_device(ip: IpAddr, interface: &str, now: DateTime<Utc>) -> Device {
+    let mut device = Device::new(ip, now);
     device.interface = Some(interface.to_string());
     device
 }
 
 fn merge_known_device(state: &mut ContinuousPassiveInterfaceState, incoming: Device) {
     if let Some(existing) = state.devices.get_mut(&incoming.ip) {
-        merge_device_snapshot(existing, incoming);
+        if device_mac_changed(existing, &incoming) {
+            *existing = incoming;
+        } else {
+            merge_device_snapshot(existing, incoming);
+        }
     } else {
         state.devices.insert(incoming.ip, incoming);
     }
@@ -797,7 +804,7 @@ async fn scan_many_inner(
         match store::load_scan_cache(&cache_path) {
             Ok(previous) => {
                 store::merge_previous_scan(&mut devices, &previous);
-                finish_devices_update(&events, devices.iter_mut(), &identity_rules);
+                finish_device_snapshots(&events, devices.iter_mut(), &identity_rules);
                 if let Err(err) = store::save_scan_cache(&cache_path, &devices) {
                     let warning = format!("failed to save scan cache: {err}");
                     push_unique_warning(&mut warnings, warning.clone());
@@ -872,8 +879,7 @@ async fn scan_inner(
             if arp_oui_enabled {
                 device.vendor = crate::enrich::lookup_vendor(&hit.mac, &arp_oui_db);
             }
-            identity_rules::apply_identity_rules(&mut device, &arp_rules);
-            emit_device(&arp_events, &device);
+            finish_observed_device_update(&arp_events, &mut device, &arp_rules);
         })
     })
     .await
@@ -888,7 +894,7 @@ async fn scan_inner(
                     device.vendor = crate::enrich::lookup_vendor(&hit.mac, &oui_db);
                 }
                 device.mac = Some(hit.mac);
-                finish_device_update(&events, device, &identity_rules);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
         }
         Err(err) => {
@@ -902,7 +908,7 @@ async fn scan_inner(
                     device.vendor = crate::enrich::lookup_vendor(&hit.mac, &oui_db);
                 }
                 device.mac = Some(hit.mac);
-                finish_device_update(&events, device, &identity_rules);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
         }
     }
@@ -918,13 +924,13 @@ async fn scan_inner(
             "local",
             0.95,
         );
-        finish_device_update(&events, self_device, &identity_rules);
+        finish_observed_device_update(&events, self_device, &identity_rules);
     }
 
     if config.oui {
         apply_oui(&mut devices, &oui_db);
     }
-    finish_devices_update(&events, devices.values_mut(), &identity_rules);
+    finish_device_snapshots(&events, devices.values_mut(), &identity_rules);
 
     let lldp_context = LldpApplyContext {
         now: scanned_at,
@@ -971,7 +977,7 @@ async fn scan_inner(
                 }
                 let device = upsert_device(&mut devices, lease.ip, scanned_at, &iface.name);
                 apply_dhcp_lease(device, lease, config.oui.then_some(&oui_db));
-                finish_device_update(&events, device, &identity_rules);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
         }
     }
@@ -991,12 +997,12 @@ async fn scan_inner(
             MulticastUpdate::Mdns(ip, mdns) => {
                 let device = upsert_device(devices, ip, scanned_at, &iface.name);
                 apply_mdns_info(device, mdns);
-                finish_device_update(&events, device, &identity_rules);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
             MulticastUpdate::Upnp(ip, info) => {
                 let device = upsert_device(devices, ip, scanned_at, &iface.name);
                 apply_upnp_info(device, info);
-                finish_device_update(&events, device, &identity_rules);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
         },
     )
@@ -1029,7 +1035,7 @@ async fn scan_inner(
             NameUpdate::Rdns(ip, name) => {
                 let device = upsert_device(devices, ip, scanned_at, &iface.name);
                 device.add_name(name, "rdns", 0.65);
-                finish_device_update(&events, device, &identity_rules);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
             NameUpdate::Netbios(ip, names) => {
                 let device = upsert_device(devices, ip, scanned_at, &iface.name);
@@ -1037,7 +1043,7 @@ async fn scan_inner(
                     device.add_name(name, "netbios", 0.8);
                 }
                 device.set_os_guess("Windows/SMB capable", "netbios", 0.45);
-                finish_device_update(&events, device, &identity_rules);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
         },
     )
@@ -1058,12 +1064,12 @@ async fn scan_inner(
             ProbeUpdate::Deep(ip, probe) => {
                 let device = upsert_device(devices, ip, scanned_at, &iface.name);
                 apply_deep_probes(device, vec![probe]);
-                finish_device_update(&events, device, &identity_rules);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
             ProbeUpdate::Snmp(ip, info) => {
                 let device = upsert_device(devices, ip, scanned_at, &iface.name);
                 apply_snmp_info(device, info);
-                finish_device_update(&events, device, &identity_rules);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
         },
     )
@@ -1103,7 +1109,7 @@ async fn scan_inner(
                 |devices, (ip, info)| {
                     let device = upsert_device(devices, ip, scanned_at, &iface.name);
                     apply_smb_info(device, info);
-                    finish_device_update(&events, device, &identity_rules);
+                    finish_observed_device_update(&events, device, &identity_rules);
                 },
             )
             .await;
@@ -1126,7 +1132,7 @@ async fn scan_inner(
         match store::load_scan_cache(&config.cache_path) {
             Ok(previous) => {
                 store::merge_previous_scan(&mut devices, &previous);
-                finish_devices_update(&events, devices.iter_mut(), &identity_rules);
+                finish_device_snapshots(&events, devices.iter_mut(), &identity_rules);
                 if let Err(err) = store::save_scan_cache(&config.cache_path, &devices) {
                     let warning = format!("failed to save scan cache: {err}");
                     warnings.push(warning.clone());
@@ -1312,7 +1318,7 @@ fn apply_passive_update(
     for ip in update.target_ips(devices, &[context.target]) {
         let device = upsert_device(devices, ip, context.now, context.interface);
         update.apply_to_device(device, context.oui_db);
-        finish_device_update(context.events, device, context.rules);
+        finish_observed_device_update(context.events, device, context.rules);
     }
 }
 
@@ -1383,6 +1389,13 @@ fn same_mac(left: &str, right: &str) -> bool {
     normalize_mac(left) == normalize_mac(right)
 }
 
+fn device_mac_changed(existing: &Device, incoming: &Device) -> bool {
+    matches!(
+        (existing.mac.as_deref(), incoming.mac.as_deref()),
+        (Some(existing), Some(incoming)) if !same_mac(existing, incoming)
+    )
+}
+
 fn normalize_mac(value: &str) -> String {
     value
         .chars()
@@ -1391,7 +1404,16 @@ fn normalize_mac(value: &str) -> String {
         .collect()
 }
 
-fn finish_device_update(
+fn finish_observed_device_update(
+    events: &Option<UnboundedSender<ScanEvent>>,
+    device: &mut Device,
+    rules: &identity_rules::RuleDb,
+) {
+    device.last_seen = Utc::now();
+    finish_device_snapshot(events, device, rules);
+}
+
+fn finish_device_snapshot(
     events: &Option<UnboundedSender<ScanEvent>>,
     device: &mut Device,
     rules: &identity_rules::RuleDb,
@@ -1403,7 +1425,7 @@ fn finish_device_update(
     emit_device(events, device);
 }
 
-fn finish_devices_update<'a, I>(
+fn finish_device_snapshots<'a, I>(
     events: &Option<UnboundedSender<ScanEvent>>,
     devices: I,
     rules: &identity_rules::RuleDb,
@@ -1411,7 +1433,7 @@ fn finish_devices_update<'a, I>(
     I: IntoIterator<Item = &'a mut Device>,
 {
     for device in devices {
-        finish_device_update(events, device, rules);
+        finish_device_snapshot(events, device, rules);
     }
 }
 
@@ -1438,6 +1460,7 @@ fn ip_sort_key(ip: IpAddr) -> (u8, u128) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn profile_timeouts_are_ordered_by_depth() {
@@ -1557,7 +1580,34 @@ mod tests {
     }
 
     #[test]
-    fn continuous_passive_duplicate_observation_does_not_emit_unchanged_update() {
+    fn continuous_passive_replaces_same_ip_when_scan_mac_changes() {
+        let mut manager = passive_manager();
+        let ip = "192.168.1.44".parse().unwrap();
+        let first_seen = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let later_seen = Utc.with_ymd_and_hms(2026, 1, 1, 0, 5, 0).unwrap();
+
+        let mut first = Device::new(ip, first_seen);
+        first.interface = Some("en0".to_string());
+        first.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+        first.add_name("old-host.local", "mdns", 0.9);
+        let _ = manager.observe_scan_event(ScanEvent::DeviceUpdated(Box::new(first)));
+
+        let mut replacement = Device::new(ip, later_seen);
+        replacement.interface = Some("en0".to_string());
+        replacement.mac = Some("00:11:22:33:44:55".to_string());
+        let event = manager.observe_scan_event(ScanEvent::DeviceUpdated(Box::new(replacement)));
+        let ScanEvent::DeviceUpdated(device) = event else {
+            panic!("expected device update");
+        };
+
+        assert_eq!(device.mac.as_deref(), Some("00:11:22:33:44:55"));
+        assert!(device.hostname.is_none());
+        assert_eq!(device.first_seen, later_seen);
+        assert_eq!(device.last_seen, later_seen);
+    }
+
+    #[test]
+    fn continuous_passive_duplicate_observation_refreshes_last_seen() {
         let mut manager = passive_manager();
         let advertisement = discovery::l2::L2Advertisement::Lldp(discovery::lldp::LldpInfo {
             source_mac: "aa:bb:cc:dd:ee:ff".to_string(),
@@ -1574,12 +1624,18 @@ mod tests {
             enabled_capabilities: vec!["bridge".to_string()],
             management_addresses: vec!["192.168.1.2".parse().unwrap()],
         });
+        let first_seen = Utc::now();
+        let later_seen = first_seen + chrono::Duration::seconds(5);
 
-        let first = manager.apply_passive_update(passive_update(advertisement.clone()));
-        let second = manager.apply_passive_update(passive_update(advertisement));
+        let first =
+            manager.apply_passive_update(passive_update_at(advertisement.clone(), first_seen));
+        let second = manager.apply_passive_update(passive_update_at(advertisement, later_seen));
 
         assert_eq!(first.len(), 1);
-        assert!(second.is_empty());
+        let [ScanEvent::DeviceUpdated(device)] = second.as_slice() else {
+            panic!("expected refreshed device update");
+        };
+        assert_eq!(device.last_seen, later_seen);
     }
 
     #[test]
@@ -1629,10 +1685,16 @@ mod tests {
         );
     }
 
-    fn passive_update(advertisement: discovery::l2::L2Advertisement) -> ContinuousPassiveUpdate {
+    fn passive_update_at(
+        advertisement: discovery::l2::L2Advertisement,
+        received_at: DateTime<Utc>,
+    ) -> ContinuousPassiveUpdate {
         ContinuousPassiveUpdate::Observation {
             interface: "en0".to_string(),
-            observation: Box::new(PassiveObservation::from_advertisement(advertisement)),
+            observation: Box::new(PassiveObservation::from_advertisement_at(
+                advertisement,
+                received_at,
+            )),
         }
     }
 

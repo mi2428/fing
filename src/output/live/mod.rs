@@ -16,8 +16,8 @@ use crate::{model::Device, scanner::ScanEvent};
 use chrono::{DateTime, Local};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use devices::{
-    DeviceKey, device_log_summary, device_matches_search, device_row, live_identity_signature,
-    merge_live_device, visible_columns_for_devices,
+    DeviceKey, device_log_summary, device_mac_changed, device_matches_search, device_row,
+    live_identity_signature, merge_live_device, visible_columns_for_devices,
 };
 pub use interfaces::LiveInterfacePanel;
 use interfaces::{interface_panel_width, render_interfaces, top_panel_height};
@@ -162,6 +162,8 @@ struct LiveTable {
     profile: Option<String>,
     phase: String,
     devices: BTreeMap<DeviceKey, Device>,
+    device_rounds: BTreeMap<DeviceKey, u64>,
+    current_round: Option<u64>,
     warnings: Vec<String>,
     logs: VecDeque<LiveLogEntry>,
     finished: bool,
@@ -192,6 +194,8 @@ impl LiveTable {
             profile: None,
             phase: "starting".to_string(),
             devices: BTreeMap::new(),
+            device_rounds: BTreeMap::new(),
+            current_round: None,
             warnings: Vec::new(),
             logs: VecDeque::new(),
             finished: false,
@@ -229,6 +233,10 @@ impl LiveTable {
                     ),
                 );
             }
+            ScanEvent::RoundStarted { round } => {
+                self.current_round = Some(round);
+                self.phase = format!("scan round {round}");
+            }
             ScanEvent::Phase(phase) => {
                 self.phase = phase;
             }
@@ -250,6 +258,11 @@ impl LiveTable {
                     .into_iter()
                     .map(|device| (DeviceKey::from_device(&device), device))
                     .collect();
+                self.device_rounds.clear();
+                if let Some(round) = self.current_round {
+                    self.device_rounds
+                        .extend(self.devices.keys().cloned().map(|key| (key, round)));
+                }
                 for warning in &warnings {
                     if !self.warnings.iter().any(|existing| existing == warning) {
                         self.push_log(LiveLogLevel::Warning, format!("warning {warning}"));
@@ -273,7 +286,18 @@ impl LiveTable {
 
     fn upsert_device_update(&mut self, device: Device) -> Option<String> {
         let key = DeviceKey::from_device(&device);
+        if let Some(round) = self.current_round {
+            self.device_rounds.insert(key.clone(), round);
+        }
         if let Some(existing) = self.devices.get_mut(&key) {
+            if device_mac_changed(existing, &device) {
+                let message = format!(
+                    "device replaced {}",
+                    device_log_summary(&device, self.options)
+                );
+                *existing = device;
+                return Some(message);
+            }
             let before = live_identity_signature(existing);
             merge_live_device(existing, device);
             let after = live_identity_signature(existing);
@@ -292,6 +316,13 @@ impl LiveTable {
             );
             self.devices.insert(key, device);
             Some(message)
+        }
+    }
+
+    fn device_is_current_round(&self, key: &DeviceKey) -> bool {
+        match self.current_round {
+            Some(round) => self.device_rounds.get(key).copied() == Some(round),
+            None => true,
         }
     }
 
@@ -616,9 +647,16 @@ impl LiveTable {
         let header = TuiRow::new(columns.iter().map(|column| TuiCell::from(column.title())))
             .style(NeonTheme::table_header());
 
-        let rows = devices
+        let rows = entries
             .iter()
-            .map(|device| device_row(device, &columns, self.options))
+            .map(|(key, device)| {
+                device_row(
+                    device,
+                    &columns,
+                    self.options,
+                    self.device_is_current_round(key),
+                )
+            })
             .collect::<Vec<_>>();
         let offset = self.update_table_offset(area);
         *self.table_state.offset_mut() = offset;
@@ -655,7 +693,10 @@ impl LiveTable {
 mod tests {
     use super::*;
     use super::{
-        devices::{DeviceColumn, DeviceTableColumn, device_row_style, visible_columns},
+        devices::{
+            DeviceColumn, DeviceTableColumn, device_row_style, stale_device_row_style,
+            visible_columns,
+        },
         interfaces::{
             INTERFACE_PANEL_VISIBLE_ROWS, InterfaceColumn, InterfaceTableColumn,
             desired_interface_panel_width, interface_column_kinds, interface_panel_height,
@@ -667,7 +708,13 @@ mod tests {
     use crate::net::InterfaceInfo;
     use crate::{model::Device, output::MacAddressDisplay, scanner::ScanEvent};
     use chrono::{Local, TimeZone, Utc};
-    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Color, text::Line};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        buffer::Buffer,
+        style::{Color, Modifier},
+        text::Line,
+    };
 
     #[test]
     fn table_offset_keeps_cursor_moving_inside_viewport() {
@@ -846,6 +893,7 @@ mod tests {
         assert_eq!(NeonTheme::PRIMARY_SOFT, Color::Rgb(255, 170, 68));
         assert_eq!(NeonTheme::TEXT, Color::Rgb(238, 136, 34));
         assert_eq!(NeonTheme::ACCENT_GREEN, Color::Rgb(88, 242, 165));
+        assert_eq!(NeonTheme::STALE_RED, Color::Rgb(150, 45, 38));
     }
 
     #[test]
@@ -870,6 +918,14 @@ mod tests {
             Some(NeonTheme::PRIMARY_SOFT)
         );
         assert_eq!(log_style(LiveLogLevel::Device).fg, Some(NeonTheme::TEXT));
+    }
+
+    #[test]
+    fn stale_device_rows_are_dimmed_red() {
+        let style = stale_device_row_style();
+
+        assert_eq!(style.fg, Some(NeonTheme::STALE_RED));
+        assert!(style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
@@ -1081,6 +1137,79 @@ mod tests {
         );
         assert_eq!(stored.last_seen, later_seen);
         assert_eq!(app.logs.len(), 1);
+    }
+
+    #[test]
+    fn continuous_round_marks_unseen_devices_stale() {
+        let first_round = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let second_round = Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 0).unwrap();
+        let mut app = LiveTable::new(OutputOptions::default(), LiveInterfacePanel::default());
+
+        app.apply(ScanEvent::RoundStarted { round: 1 });
+        for ip in ["192.168.1.10", "192.168.1.20"] {
+            let mut device = Device::new(ip.parse().unwrap(), first_round);
+            device.interface = Some("en0".to_string());
+            app.apply(ScanEvent::DeviceUpdated(Box::new(device)));
+        }
+
+        app.apply(ScanEvent::RoundStarted { round: 2 });
+        let stale_key = DeviceKey {
+            interface: "en0".to_string(),
+            ip: "192.168.1.10".parse().unwrap(),
+        };
+        let refreshed_key = DeviceKey {
+            interface: "en0".to_string(),
+            ip: "192.168.1.20".parse().unwrap(),
+        };
+        assert!(!app.device_is_current_round(&stale_key));
+        assert!(!app.device_is_current_round(&refreshed_key));
+
+        let mut refreshed = Device::new(refreshed_key.ip, second_round);
+        refreshed.interface = Some("en0".to_string());
+        app.apply(ScanEvent::DeviceUpdated(Box::new(refreshed)));
+
+        assert!(!app.device_is_current_round(&stale_key));
+        assert!(app.device_is_current_round(&refreshed_key));
+    }
+
+    #[test]
+    fn continuous_live_replaces_same_ip_when_mac_changes() {
+        let first_seen = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let later_seen = Utc.with_ymd_and_hms(2026, 1, 1, 0, 5, 0).unwrap();
+        let ip = "192.168.1.44".parse().unwrap();
+        let key = DeviceKey {
+            interface: "en0".to_string(),
+            ip,
+        };
+        let mut app = LiveTable::new(OutputOptions::default(), LiveInterfacePanel::default());
+
+        app.apply(ScanEvent::RoundStarted { round: 1 });
+        let mut first = Device::new(ip, first_seen);
+        first.interface = Some("en0".to_string());
+        first.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+        first.vendor = Some("Old Vendor".to_string());
+        first.add_name("old-host.local", "mdns", 0.9);
+        first.add_service("http", "deep", Some(80), 0.7);
+        app.apply(ScanEvent::DeviceUpdated(Box::new(first)));
+
+        app.apply(ScanEvent::RoundStarted { round: 2 });
+        let mut replacement = Device::new(ip, later_seen);
+        replacement.interface = Some("en0".to_string());
+        replacement.mac = Some("00:11:22:33:44:55".to_string());
+        replacement.vendor = Some("New Vendor".to_string());
+        app.apply(ScanEvent::DeviceUpdated(Box::new(replacement)));
+
+        let stored = app
+            .devices
+            .get(&key)
+            .expect("device row should remain keyed by IP");
+        assert_eq!(stored.mac.as_deref(), Some("00:11:22:33:44:55"));
+        assert_eq!(stored.vendor.as_deref(), Some("New Vendor"));
+        assert!(stored.hostname.is_none());
+        assert!(stored.services.is_empty());
+        assert_eq!(stored.first_seen, later_seen);
+        assert_eq!(stored.last_seen, later_seen);
+        assert!(app.device_is_current_round(&key));
     }
 
     #[test]

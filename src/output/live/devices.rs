@@ -12,7 +12,7 @@ use crate::model::{Device, Guess};
 use chrono::{DateTime, Local, Utc};
 use ratatui::{
     layout::Constraint,
-    style::Style,
+    style::{Modifier, Style},
     widgets::{Cell as TuiCell, Row as TuiRow},
 };
 use std::net::IpAddr;
@@ -349,8 +349,13 @@ pub(super) fn device_row(
     device: &Device,
     columns: &[DeviceTableColumn],
     options: super::super::OutputOptions,
+    current_round: bool,
 ) -> TuiRow<'static> {
-    let style = device_row_style(device);
+    let style = if current_round {
+        device_row_style(device)
+    } else {
+        stale_device_row_style()
+    };
 
     TuiRow::new(
         columns
@@ -361,6 +366,13 @@ pub(super) fn device_row(
             .collect::<Vec<_>>(),
     )
     .style(style)
+}
+
+pub(super) fn stale_device_row_style() -> Style {
+    Style::default()
+        .fg(NeonTheme::STALE_RED)
+        .bg(NeonTheme::BACKGROUND)
+        .add_modifier(Modifier::DIM)
 }
 
 pub(super) fn device_row_style(device: &Device) -> Style {
@@ -507,4 +519,19 @@ pub(super) fn merge_live_device(existing: &mut Device, mut incoming: Device) {
     }
     existing.first_seen = existing.first_seen.min(incoming.first_seen);
     existing.last_seen = existing.last_seen.max(incoming.last_seen);
+}
+
+pub(super) fn device_mac_changed(existing: &Device, incoming: &Device) -> bool {
+    matches!(
+        (existing.mac.as_deref(), incoming.mac.as_deref()),
+        (Some(existing), Some(incoming)) if normalize_mac(existing) != normalize_mac(incoming)
+    )
+}
+
+fn normalize_mac(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
