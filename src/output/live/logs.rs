@@ -143,8 +143,7 @@ fn help_spans(text: String) -> Vec<Span<'static>> {
 }
 
 fn help_text() -> String {
-    "Keys: /=Filter j=Down k=Up Ctrl-D=PageDown Ctrl-U=PageUp Ctrl-Z=Pause Ctrl-C=Quit"
-        .to_string()
+    "Keys: /=Filter j=Down k=Up Ctrl-D=PageDown Ctrl-U=PageUp Ctrl-Z=Pause Ctrl-C=Quit".to_string()
 }
 
 pub(super) fn source_footer_line(width: usize, filter: String) -> Line<'static> {
