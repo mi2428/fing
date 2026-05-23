@@ -6,6 +6,11 @@
 //! scanner/apply and identity-rule layers.
 
 use anyhow::{Context, Result, anyhow, bail};
+use hickory_resolver::{
+    TokioResolver,
+    lookup::Lookup,
+    proto::rr::{Name, RData},
+};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
@@ -153,23 +158,29 @@ pub async fn reverse_dns_with_callback<F>(
 where
     F: FnMut(IpAddr, String),
 {
-    // `dns_lookup` is blocking, so each lookup runs on the blocking pool while a
-    // semaphore limits outstanding work. Results are streamed to the live UI as
-    // soon as each host resolves.
+    // Hickory performs PTR queries on Tokio instead of parking blocking libc
+    // resolver calls on the blocking pool. A timed-out lookup can now be
+    // dropped without leaving a worker thread stuck in getnameinfo.
+    let resolver = match TokioResolver::builder_tokio().and_then(|builder| builder.build()) {
+        Ok(resolver) => Arc::new(resolver),
+        Err(_) => return HashMap::new(),
+    };
     let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut tasks = JoinSet::new();
 
     for ip in ips {
+        let resolver = Arc::clone(&resolver);
         let semaphore = Arc::clone(&semaphore);
         tasks.spawn(async move {
             let Ok(_permit) = semaphore.acquire_owned().await else {
                 return None;
             };
-            let task = tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip));
-            match tokio::time::timeout(timeout, task).await {
-                Ok(Ok(Ok(name))) => Some((ip, name)),
-                _ => None,
-            }
+            let lookup =
+                tokio::time::timeout(timeout, resolver.reverse_lookup(reverse_lookup_name(ip)))
+                    .await
+                    .ok()?
+                    .ok()?;
+            ptr_hostname(&lookup).map(|name| (ip, name))
         });
     }
 
@@ -181,6 +192,22 @@ where
         }
     }
     result
+}
+
+fn reverse_lookup_name(ip: IpAddr) -> Name {
+    let mut name = Name::from(ip);
+    name.set_fqdn(true);
+    name
+}
+
+fn ptr_hostname(lookup: &Lookup) -> Option<String> {
+    lookup
+        .answers()
+        .iter()
+        .find_map(|record| match &record.data {
+            RData::PTR(ptr) => Some(ptr.0.to_utf8().trim_end_matches('.').to_string()),
+            _ => None,
+        })
 }
 
 pub fn mdns_probe_with_callback<F>(
@@ -767,6 +794,16 @@ mod tests {
         let db = parse_ieee_oui_csv(csv).unwrap();
 
         assert_eq!(db.get("AABBCC").map(String::as_str), Some("Example Inc"));
+    }
+
+    #[test]
+    fn builds_fqdn_reverse_lookup_name() {
+        let ipv4 = reverse_lookup_name("192.168.1.20".parse().unwrap());
+        let ipv6 = reverse_lookup_name("2001:db8::1".parse().unwrap());
+
+        assert_eq!(ipv4.to_ascii(), "20.1.168.192.in-addr.arpa.");
+        assert!(ipv6.is_fqdn());
+        assert!(ipv6.to_ascii().ends_with(".ip6.arpa."));
     }
 
     #[test]
