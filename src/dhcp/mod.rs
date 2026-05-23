@@ -87,7 +87,7 @@ fn append_dir_entries(paths: &mut Vec<PathBuf>, dir: &Path) {
 
 fn read_path(path: &Path) -> Result<Vec<DhcpLease>> {
     if path.is_dir() {
-        // Some managers store one lease per file. Recurse one directory tree but
+        // Some managers store one lease per file. Read the direct children and
         // still parse every file through the same format-tolerant path.
         let mut leases = Vec::new();
         for entry in fs::read_dir(path).with_context(|| "read directory failed")? {

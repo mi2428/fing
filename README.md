@@ -31,7 +31,7 @@ $ make -C fing install
 > Pick the asset that matches your machine, make it executable, and place it on your `PATH`.
 >
 > ```console
-> $ curl -L -o fing https://github.com/mi2428/fing/releases/download/v0.9.0/fing-v0.9.0-darwin-arm64
+> $ curl -L -o fing https://github.com/mi2428/fing/releases/download/v0.9.3/fing-v0.9.3-darwin-arm64
 > $ chmod +x ./fing
 > ```
 
@@ -57,6 +57,7 @@ Options:
       --output.live <LIVE>              Live TUI mode: auto uses it only for interactive table output [default: auto] [possible values: auto, always, never]
       --output.mask-mac                 Mask the lower 24 bits of MAC addresses in output
   -h, --help                            Print help
+  -V, --version                         Print version
 
 Fingerprint Options:
       --fingerprint.source <SOURCE>
