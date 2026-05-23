@@ -92,7 +92,7 @@ pub(super) async fn forward_child_events(
                     ScanEvent::Phase(format!("{interface}: scanning {target}")),
                 );
             }
-            ScanEvent::RoundStarted { .. } => {}
+            ScanEvent::RoundStarted { .. } | ScanEvent::RoundFinished { .. } => {}
             ScanEvent::Phase(phase) => {
                 emit(
                     &events,

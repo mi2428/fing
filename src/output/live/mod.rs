@@ -164,6 +164,7 @@ struct LiveTable {
     devices: BTreeMap<DeviceKey, Device>,
     device_rounds: BTreeMap<DeviceKey, u64>,
     current_round: Option<u64>,
+    completed_round: Option<u64>,
     warnings: Vec<String>,
     logs: VecDeque<LiveLogEntry>,
     finished: bool,
@@ -196,6 +197,7 @@ impl LiveTable {
             devices: BTreeMap::new(),
             device_rounds: BTreeMap::new(),
             current_round: None,
+            completed_round: None,
             warnings: Vec::new(),
             logs: VecDeque::new(),
             finished: false,
@@ -236,6 +238,11 @@ impl LiveTable {
             ScanEvent::RoundStarted { round } => {
                 self.current_round = Some(round);
                 self.phase = format!("scan round {round}");
+            }
+            ScanEvent::RoundFinished { round } => {
+                self.completed_round = Some(round);
+                self.phase = format!("round {round} complete");
+                self.clamp_selection();
             }
             ScanEvent::Phase(phase) => {
                 self.phase = phase;
@@ -320,8 +327,12 @@ impl LiveTable {
     }
 
     fn device_is_current_round(&self, key: &DeviceKey) -> bool {
-        match self.current_round {
-            Some(round) => self.device_rounds.get(key).copied() == Some(round),
+        match self.completed_round {
+            Some(round) => self
+                .device_rounds
+                .get(key)
+                .copied()
+                .is_none_or(|device_round| device_round >= round),
             None => true,
         }
     }
@@ -541,13 +552,18 @@ impl LiveTable {
     }
 
     fn cleanup_dead_devices(&mut self) -> usize {
-        let Some(round) = self.current_round else {
+        let Some(round) = self.completed_round else {
             return 0;
         };
         let dead_keys = self
             .devices
             .keys()
-            .filter(|key| self.device_rounds.get(*key).copied() != Some(round))
+            .filter(|key| {
+                self.device_rounds
+                    .get(*key)
+                    .copied()
+                    .is_some_and(|device_round| device_round < round)
+            })
             .cloned()
             .collect::<Vec<_>>();
         for key in &dead_keys {
@@ -1188,12 +1204,17 @@ mod tests {
             interface: "en0".to_string(),
             ip: "192.168.1.20".parse().unwrap(),
         };
-        assert!(!app.device_is_current_round(&stale_key));
-        assert!(!app.device_is_current_round(&refreshed_key));
+        assert!(app.device_is_current_round(&stale_key));
+        assert!(app.device_is_current_round(&refreshed_key));
 
         let mut refreshed = Device::new(refreshed_key.ip, second_round);
         refreshed.interface = Some("en0".to_string());
         app.apply(ScanEvent::DeviceUpdated(Box::new(refreshed)));
+
+        assert!(app.device_is_current_round(&stale_key));
+        assert!(app.device_is_current_round(&refreshed_key));
+
+        app.apply(ScanEvent::RoundFinished { round: 2 });
 
         assert!(!app.device_is_current_round(&stale_key));
         assert!(app.device_is_current_round(&refreshed_key));
@@ -1216,6 +1237,20 @@ mod tests {
         let mut refreshed = Device::new("192.168.1.20".parse().unwrap(), second_round);
         refreshed.interface = Some("en0".to_string());
         app.apply(ScanEvent::DeviceUpdated(Box::new(refreshed)));
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            LiveInputAction::Continue
+        );
+
+        assert_eq!(app.devices.len(), 2);
+        assert!(
+            app.logs
+                .back()
+                .is_some_and(|entry| entry.message == "cleanup removed dead=0")
+        );
+
+        app.apply(ScanEvent::RoundFinished { round: 2 });
 
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),

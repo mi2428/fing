@@ -88,6 +88,8 @@ pub async fn scan_continuously_with_events(
                 &Some(events.clone()),
                 ScanEvent::Warning(format!("scan round {round} failed: {err}")),
             );
+        } else {
+            emit(&Some(events.clone()), ScanEvent::RoundFinished { round });
         }
         if let Some(phase) = idle_phase(interval, round) {
             emit(&Some(events.clone()), ScanEvent::Phase(phase));
