@@ -17,9 +17,13 @@ use ipnet::Ipv4Net;
 use std::{
     collections::{BTreeMap, HashMap},
     net::{IpAddr, Ipv4Addr},
+    sync::Arc,
     time::Duration,
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::{
+    Semaphore,
+    mpsc::{UnboundedReceiver, UnboundedSender},
+};
 
 pub(super) type MdnsRun = Result<BTreeMap<IpAddr, enrich::MdnsInfo>>;
 pub(super) type UpnpRun = Result<BTreeMap<IpAddr, upnp::UpnpInfo>>;
@@ -211,6 +215,7 @@ pub(super) async fn run_name_enrichment(
     config: &ScanConfig,
     ips: Vec<IpAddr>,
     events: &Option<UnboundedSender<ScanEvent>>,
+    limiter: Arc<Semaphore>,
     mut on_update: impl FnMut(NameUpdate),
 ) -> (Option<RdnsRun>, Option<NetbiosRun>) {
     if config.rdns {
@@ -232,13 +237,15 @@ pub(super) async fn run_name_enrichment(
     // and stream whichever answers first instead of waiting for both maps.
     let rdns_ips = ips.clone();
     let netbios_ips = ips;
+    let rdns_limiter = Arc::clone(&limiter);
+    let netbios_limiter = Arc::clone(&limiter);
     let rdns = async {
         if config.rdns {
             Some(
                 enrich::reverse_dns_with_callback(
                     rdns_ips,
                     config.timeout,
-                    config.concurrency,
+                    rdns_limiter,
                     move |ip, name| {
                         let _ = rdns_tx.send(NameUpdate::Rdns(ip, name));
                     },
@@ -255,7 +262,7 @@ pub(super) async fn run_name_enrichment(
                 enrich::netbios_probe_with_callback(
                     netbios_ips,
                     config.timeout,
-                    config.concurrency,
+                    netbios_limiter,
                     move |ip, names| {
                         let _ = netbios_tx.send(NameUpdate::Netbios(ip, names));
                     },
@@ -286,6 +293,7 @@ pub(super) async fn run_deep_and_snmp_enrichment(
     config: &ScanConfig,
     ips: Vec<IpAddr>,
     events: &Option<UnboundedSender<ScanEvent>>,
+    limiter: Arc<Semaphore>,
     mut on_update: impl FnMut(ProbeUpdate),
 ) -> (Option<DeepRun>, Option<SnmpRun>) {
     if config.profile.includes_deep_probes() {
@@ -311,13 +319,15 @@ pub(super) async fn run_deep_and_snmp_enrichment(
     // of "probe" updates while each collector owns its concurrency limits.
     let deep_ips = ips.clone();
     let snmp_ips = ips;
+    let deep_limiter = Arc::clone(&limiter);
+    let snmp_limiter = Arc::clone(&limiter);
     let deep = async {
         if config.profile.includes_deep_probes() {
             Some(
                 deep::probe_hosts_with_callback(
                     deep_ips,
                     config.timeout,
-                    config.concurrency,
+                    deep_limiter,
                     move |ip, probe| {
                         let _ = deep_tx.send(ProbeUpdate::Deep(ip, probe));
                     },
@@ -335,7 +345,7 @@ pub(super) async fn run_deep_and_snmp_enrichment(
                     snmp_ips,
                     config.snmp_community.clone(),
                     config.timeout,
-                    config.concurrency,
+                    snmp_limiter,
                     move |ip, info| {
                         let _ = snmp_tx.send(ProbeUpdate::Snmp(ip, info));
                     },

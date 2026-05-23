@@ -79,22 +79,21 @@ const MAX_FAVICON_BYTES: usize = 256 * 1024;
 pub async fn probe_hosts_with_callback<F>(
     ips: Vec<IpAddr>,
     timeout: Duration,
-    concurrency: usize,
+    limiter: Arc<Semaphore>,
     mut on_probe: F,
 ) -> HashMap<IpAddr, Vec<PortProbe>>
 where
     F: FnMut(IpAddr, PortProbe),
 {
-    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut tasks = JoinSet::new();
 
     for ip in ips {
         for (port, service) in PORTS {
-            let semaphore = Arc::clone(&semaphore);
+            let limiter = Arc::clone(&limiter);
             let service = (*service).to_string();
             let port = *port;
             tasks.spawn(async move {
-                let Ok(_permit) = semaphore.acquire_owned().await else {
+                let Ok(_permit) = limiter.acquire_owned().await else {
                     return None;
                 };
                 probe_port(ip, port, service, timeout)

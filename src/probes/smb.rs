@@ -36,19 +36,18 @@ pub struct NtlmHostInfo {
 pub async fn probe_hosts_with_callback<F>(
     ips: Vec<IpAddr>,
     timeout: Duration,
-    concurrency: usize,
+    limiter: Arc<Semaphore>,
     mut on_result: F,
 ) -> HashMap<IpAddr, SmbInfo>
 where
     F: FnMut(IpAddr, SmbInfo),
 {
-    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut tasks = JoinSet::new();
 
     for ip in ips {
-        let semaphore = Arc::clone(&semaphore);
+        let limiter = Arc::clone(&limiter);
         tasks.spawn(async move {
-            let Ok(_permit) = semaphore.acquire_owned().await else {
+            let Ok(_permit) = limiter.acquire_owned().await else {
                 return None;
             };
             probe_one(ip, timeout).await.map(|info| (ip, info))

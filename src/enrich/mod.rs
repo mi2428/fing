@@ -152,7 +152,7 @@ fn find_header(headers: &csv::StringRecord, name: &str) -> Option<usize> {
 pub async fn reverse_dns_with_callback<F>(
     ips: Vec<IpAddr>,
     timeout: Duration,
-    concurrency: usize,
+    limiter: Arc<Semaphore>,
     mut on_result: F,
 ) -> HashMap<IpAddr, String>
 where
@@ -165,14 +165,13 @@ where
         Ok(resolver) => Arc::new(resolver),
         Err(_) => return HashMap::new(),
     };
-    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut tasks = JoinSet::new();
 
     for ip in ips {
         let resolver = Arc::clone(&resolver);
-        let semaphore = Arc::clone(&semaphore);
+        let limiter = Arc::clone(&limiter);
         tasks.spawn(async move {
-            let Ok(_permit) = semaphore.acquire_owned().await else {
+            let Ok(_permit) = limiter.acquire_owned().await else {
                 return None;
             };
             let lookup =
@@ -599,7 +598,7 @@ fn read_dns_name(buf: &[u8], mut offset: usize) -> Option<(String, usize)> {
 pub async fn netbios_probe_with_callback<F>(
     ips: Vec<IpAddr>,
     timeout: Duration,
-    concurrency: usize,
+    limiter: Arc<Semaphore>,
     mut on_result: F,
 ) -> HashMap<IpAddr, Vec<String>>
 where
@@ -607,16 +606,15 @@ where
 {
     // NetBIOS name service is UDP/137 and still useful for Windows and Samba
     // hosts that do not publish richer multicast records.
-    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut tasks = JoinSet::new();
 
     for ip in ips {
         let IpAddr::V4(ipv4) = ip else {
             continue;
         };
-        let semaphore = Arc::clone(&semaphore);
+        let limiter = Arc::clone(&limiter);
         tasks.spawn(async move {
-            let Ok(_permit) = semaphore.acquire_owned().await else {
+            let Ok(_permit) = limiter.acquire_owned().await else {
                 return None;
             };
             let query = build_netbios_query(0x4000);

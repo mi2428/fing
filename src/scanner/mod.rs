@@ -722,7 +722,8 @@ async fn scan_many_inner(
         let Some(config) = configs.pop() else {
             anyhow::bail!("no scan targets configured");
         };
-        return scan_inner(config, events, emit_finished).await;
+        let probe_limiter = Arc::new(Semaphore::new(config.concurrency.max(1)));
+        return scan_inner(config, events, emit_finished, probe_limiter).await;
     }
 
     let scanned_at = Utc::now();
@@ -752,6 +753,7 @@ async fn scan_many_inner(
 
     let scan_concurrency = configs[0].concurrency.max(1);
     let semaphore = Arc::new(Semaphore::new(scan_concurrency));
+    let probe_limiter = Arc::new(Semaphore::new(configs[0].concurrency.max(1)));
     let mut handles = Vec::new();
 
     for mut config in configs {
@@ -761,6 +763,7 @@ async fn scan_many_inner(
         config.cache_enabled = false;
         let events = events.clone();
         let semaphore = Arc::clone(&semaphore);
+        let probe_limiter = Arc::clone(&probe_limiter);
         handles.push(tokio::spawn(async move {
             let _permit = semaphore
                 .acquire_owned()
@@ -768,7 +771,7 @@ async fn scan_many_inner(
                 .context("scan concurrency limiter closed")?;
             let (child_tx, child_rx) = tokio::sync::mpsc::unbounded_channel();
             let forwarder = tokio::spawn(forward_child_events(child_rx, events));
-            let result = scan_inner(config, Some(child_tx), false).await;
+            let result = scan_inner(config, Some(child_tx), false, probe_limiter).await;
             let _ = forwarder.await;
             result
         }));
@@ -846,6 +849,7 @@ async fn scan_inner(
     config: ScanConfig,
     events: Option<UnboundedSender<ScanEvent>>,
     emit_finished: bool,
+    probe_limiter: Arc<Semaphore>,
 ) -> Result<ScanResult> {
     let scanned_at = Utc::now();
     let iface = net::select_interface(config.iface.as_deref())?;
@@ -1027,9 +1031,15 @@ async fn scan_inner(
 
     let ips = devices.keys().copied().collect::<Vec<_>>();
     let (name_tx, mut name_rx) = tokio::sync::mpsc::unbounded_channel();
-    let name_future = run_name_enrichment(&config, ips.clone(), &events, move |update| {
-        let _ = name_tx.send(update);
-    });
+    let name_future = run_name_enrichment(
+        &config,
+        ips.clone(),
+        &events,
+        Arc::clone(&probe_limiter),
+        move |update| {
+            let _ = name_tx.send(update);
+        },
+    );
     let _ = await_with_lldp_and_phase_updates(
         name_future,
         &mut name_rx,
@@ -1056,9 +1066,15 @@ async fn scan_inner(
 
     let ips = devices.keys().copied().collect::<Vec<_>>();
     let (probe_tx, mut probe_rx) = tokio::sync::mpsc::unbounded_channel();
-    let probe_future = run_deep_and_snmp_enrichment(&config, ips.clone(), &events, move |update| {
-        let _ = probe_tx.send(update);
-    });
+    let probe_future = run_deep_and_snmp_enrichment(
+        &config,
+        ips.clone(),
+        &events,
+        Arc::clone(&probe_limiter),
+        move |update| {
+            let _ = probe_tx.send(update);
+        },
+    );
     let _ = await_with_lldp_and_phase_updates(
         probe_future,
         &mut probe_rx,
@@ -1100,7 +1116,7 @@ async fn scan_inner(
             let smb_future = smb::probe_hosts_with_callback(
                 smb_ips,
                 config.timeout,
-                config.concurrency,
+                Arc::clone(&probe_limiter),
                 move |ip, info| {
                     let _ = smb_tx.send((ip, info));
                 },
