@@ -33,6 +33,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     net::IpAddr,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -61,6 +62,9 @@ pub async fn scan_continuously_with_events(
 
     let (mut passive_manager, mut passive_rx, _passive_listeners) =
         ContinuousPassiveManager::start(&configs)?;
+    for warning in passive_manager.take_startup_warnings() {
+        emit(&Some(events.clone()), ScanEvent::Warning(warning));
+    }
     let round_configs = round_scan_configs(&configs);
     let mut round = 1_u64;
     loop {
@@ -149,6 +153,7 @@ struct ContinuousPassiveManager {
     states: BTreeMap<String, ContinuousPassiveInterfaceState>,
     rules: identity_rules::RuleDb,
     oui_db: HashMap<String, String>,
+    startup_warnings: Vec<String>,
 }
 
 struct ContinuousPassiveInterfaceState {
@@ -289,10 +294,12 @@ impl ContinuousPassiveManager {
             .first()
             .map(|config| config.oui_path.clone())
             .unwrap_or_else(enrich::default_oui_db_path);
+        let (oui_db, oui_warning) = load_oui_db_or_warning(&oui_path);
         let manager = Self {
             states,
             rules: identity_rules::load_rule_db()?,
-            oui_db: enrich::load_oui_db(&oui_path).unwrap_or_default(),
+            oui_db,
+            startup_warnings: oui_warning.into_iter().collect(),
         };
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -334,6 +341,10 @@ impl ContinuousPassiveManager {
             }
             other => other,
         }
+    }
+
+    fn take_startup_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.startup_warnings)
     }
 
     fn observe_device(&mut self, device: &mut Device) {
@@ -854,7 +865,7 @@ async fn scan_inner(
     let scanned_at = Utc::now();
     let iface = net::select_interface(config.iface.as_deref())?;
     let target = net::parse_target(config.target.as_deref(), &iface)?;
-    let oui_db = crate::enrich::load_oui_db(&config.oui_path).unwrap_or_default();
+    let (oui_db, oui_warning) = load_oui_db_or_warning(&config.oui_path);
     let identity_rules = identity_rules::load_rule_db()?;
 
     let mut warnings = Vec::new();
@@ -868,6 +879,10 @@ async fn scan_inner(
             profile: config.profile,
         },
     );
+    if let Some(warning) = oui_warning {
+        warnings.push(warning.clone());
+        emit(&events, ScanEvent::Warning(warning));
+    }
     emit(&events, ScanEvent::Phase("ARP discovery".to_string()));
 
     let arp_iface = iface.clone();
@@ -1192,6 +1207,16 @@ async fn scan_inner(
 fn push_unique_warning(warnings: &mut Vec<String>, warning: String) {
     if !warnings.iter().any(|existing| existing == &warning) {
         warnings.push(warning);
+    }
+}
+
+fn load_oui_db_or_warning(path: &Path) -> (HashMap<String, String>, Option<String>) {
+    match enrich::load_oui_db(path) {
+        Ok(db) => (db, None),
+        Err(err) => (
+            HashMap::new(),
+            Some(format!("failed to load OUI DB {}: {err}", path.display())),
+        ),
     }
 }
 
@@ -1525,6 +1550,44 @@ mod tests {
     }
 
     #[test]
+    fn invalid_oui_db_falls_back_with_warning() {
+        let path = std::env::temp_dir().join(format!(
+            "fing-invalid-oui-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "{not-json").unwrap();
+
+        let (db, warning) = load_oui_db_or_warning(&path);
+
+        let _ = std::fs::remove_file(&path);
+        assert!(db.is_empty());
+        let warning = warning.expect("invalid OUI DB should produce a warning");
+        assert!(warning.contains("failed to load OUI DB"));
+        assert!(warning.contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn missing_oui_db_falls_back_without_warning() {
+        let path = std::env::temp_dir().join(format!(
+            "fing-missing-oui-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let (db, warning) = load_oui_db_or_warning(&path);
+
+        assert!(db.is_empty());
+        assert!(warning.is_none());
+    }
+
+    #[test]
     fn ip_sort_key_orders_ipv4_numerically() {
         let mut ips = [
             "192.168.1.20".parse::<IpAddr>().unwrap(),
@@ -1849,6 +1912,7 @@ mod tests {
             states,
             rules: identity_rules::RuleDb::default(),
             oui_db: HashMap::new(),
+            startup_warnings: Vec::new(),
         }
     }
 }
