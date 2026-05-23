@@ -61,7 +61,7 @@ Options:
 
 Fingerprint Options:
       --fingerprint.source <SOURCE>
-          Limit fingerprint sources. Defaults to profile-appropriate sources when omitted [possible values: oui, rdns, mdns, netbios, upnp, snmp, lldp, cdp, dhcp]
+          Limit fingerprint sources. Defaults to profile-appropriate sources when omitted [possible values: oui, rdns, mdns, netbios, upnp, deep, http, tls, smb, snmp, lldp, cdp, dhcp]
       --dhcp.leases <DHCP_LEASES>
           Read DHCP leases from an explicit lease file. Can be repeated
       --snmp.community <SNMP_COMMUNITY>

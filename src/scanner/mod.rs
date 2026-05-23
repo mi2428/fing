@@ -1082,6 +1082,11 @@ async fn scan_inner(
 
     let ips = devices.keys().copied().collect::<Vec<_>>();
     let (probe_tx, mut probe_rx) = tokio::sync::mpsc::unbounded_channel();
+    let deep_options = crate::probes::deep::ProbeOptions {
+        deep: config.deep,
+        http: config.http,
+        tls: config.tls,
+    };
     let probe_future = run_deep_and_snmp_enrichment(
         &config,
         iface.ip,
@@ -1101,7 +1106,7 @@ async fn scan_inner(
         |devices, update| match update {
             ProbeUpdate::Deep(ip, probe) => {
                 let device = upsert_device(devices, ip, scanned_at, &iface.name);
-                apply_deep_probes(device, vec![probe]);
+                apply_deep_probes(device, vec![probe], deep_options);
                 finish_observed_device_update(&events, device, &identity_rules);
             }
             ProbeUpdate::Snmp(ip, info) => {
@@ -1113,20 +1118,24 @@ async fn scan_inner(
     )
     .await;
 
-    if config.profile.includes_deep_probes() {
+    if config.smb {
         // A listening 445/139 port only proves SMB reachability. SMB2 negotiate
         // adds dialect/signing/native strings before identity rules promote
         // the device toward Windows, Samba, NAS, or file-server hints.
-        let smb_ips = devices
-            .iter()
-            .filter(|(_, device)| {
-                device
-                    .services
-                    .iter()
-                    .any(|service| matches!(service.port, Some(445)))
-            })
-            .map(|(ip, _)| *ip)
-            .collect::<Vec<_>>();
+        let smb_ips = if config.deep {
+            devices
+                .iter()
+                .filter(|(_, device)| {
+                    device
+                        .services
+                        .iter()
+                        .any(|service| matches!(service.port, Some(445)))
+                })
+                .map(|(ip, _)| *ip)
+                .collect::<Vec<_>>()
+        } else {
+            devices.keys().copied().collect::<Vec<_>>()
+        };
         if !smb_ips.is_empty() {
             emit(&events, ScanEvent::Phase("SMB fingerprinting".to_string()));
             let (smb_tx, mut smb_rx) = tokio::sync::mpsc::unbounded_channel();

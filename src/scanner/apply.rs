@@ -74,49 +74,62 @@ pub(super) fn apply_upnp_info(device: &mut Device, info: upnp::UpnpInfo) {
     }
 }
 
-pub(super) fn apply_deep_probes(device: &mut Device, probes: Vec<deep::PortProbe>) {
+pub(super) fn apply_deep_probes(
+    device: &mut Device,
+    probes: Vec<deep::PortProbe>,
+    options: deep::ProbeOptions,
+) {
     for probe in probes {
-        // An open port is weak identity by itself, but it is still useful as a
-        // service signal and as input to built-in identity rules.
-        device.add_service(probe.service.clone(), "deep", Some(probe.port), 0.7);
-        if let Some((device_type, confidence)) = deep::device_type_hint_from_port(probe.port) {
-            device.set_device_type_guess(device_type, "deep", confidence);
-        }
-        if probe.port == 445 || probe.port == 139 {
-            device.set_os_guess("Windows/SMB capable", "deep", 0.45);
-        }
-        if let Some(banner) = probe.banner {
-            device.add_evidence(
-                "deep",
-                &format!("{}_banner", probe.service),
-                banner.clone(),
-                0.75,
-            );
-            if let Some(server) = deep::http_server_from_banner(&banner) {
-                device.add_evidence("deep", "http_server", server, 0.7);
+        if options.deep {
+            // An open port is weak identity by itself, but it is still useful as
+            // a service signal and as input to built-in identity rules.
+            device.add_service(probe.service.clone(), "deep", Some(probe.port), 0.7);
+            if let Some((device_type, confidence)) = deep::device_type_hint_from_port(probe.port) {
+                device.set_device_type_guess(device_type, "deep", confidence);
             }
-            if let Some((os, confidence)) = deep::os_hint_from_banner(&probe.service, &banner) {
-                device.set_os_guess(os, "deep", confidence);
+            if probe.port == 445 || probe.port == 139 {
+                device.set_os_guess("Windows/SMB capable", "deep", 0.45);
             }
-        }
-        for header in probe.http_headers {
-            // HTTP headers get their own source because they often outlive the
-            // generic TCP probe in exports and rule matching.
-            let key = deep::header_evidence_key(&header.name);
-            device.add_evidence("http", &key, header.value.clone(), 0.75);
-            if header.name == "server" {
-                device.add_evidence("http", "http_server", header.value.clone(), 0.75);
-                if let Some((os, confidence)) = deep::os_hint_from_banner("http", &header.value) {
-                    device.set_os_guess(os, "http", confidence);
+            if let Some(banner) = &probe.banner {
+                device.add_evidence(
+                    "deep",
+                    &format!("{}_banner", probe.service),
+                    banner.clone(),
+                    0.75,
+                );
+                if let Some(server) = deep::http_server_from_banner(banner) {
+                    device.add_evidence("deep", "http_server", server, 0.7);
+                }
+                if let Some((os, confidence)) = deep::os_hint_from_banner(&probe.service, banner) {
+                    device.set_os_guess(os, "deep", confidence);
                 }
             }
         }
-        if let Some(favicon) = probe.favicon {
-            device.add_evidence("http", "favicon_sha256", favicon.sha256, 0.72);
-            device.add_evidence("http", "favicon_url", favicon.url, 0.55);
-            device.add_evidence("http", "favicon_bytes", favicon.bytes.to_string(), 0.5);
+
+        if options.http {
+            // HTTP headers get their own source because they often outlive the
+            // generic TCP probe in exports and rule matching.
+            for header in probe.http_headers {
+                let key = deep::header_evidence_key(&header.name);
+                device.add_evidence("http", &key, header.value.clone(), 0.75);
+                if header.name == "server" {
+                    device.add_evidence("http", "http_server", header.value.clone(), 0.75);
+                    if let Some((os, confidence)) = deep::os_hint_from_banner("http", &header.value)
+                    {
+                        device.set_os_guess(os, "http", confidence);
+                    }
+                }
+            }
+            if let Some(favicon) = probe.favicon {
+                device.add_evidence("http", "favicon_sha256", favicon.sha256, 0.72);
+                device.add_evidence("http", "favicon_url", favicon.url, 0.55);
+                device.add_evidence("http", "favicon_bytes", favicon.bytes.to_string(), 0.5);
+            }
         }
-        if let Some(tls) = probe.tls {
+
+        if options.tls
+            && let Some(tls) = probe.tls
+        {
             device.add_evidence("tls", "tls_cert_sha256", tls.sha256, 0.72);
             if let Some(subject) = tls.subject {
                 device.add_evidence("tls", "tls_subject", subject, 0.7);
@@ -568,6 +581,11 @@ mod tests {
                     not_after: Some("2028-01-01".to_string()),
                 }),
             }],
+            deep::ProbeOptions {
+                deep: true,
+                http: true,
+                tls: true,
+            },
         );
         apply_snmp_info(
             &mut device,
@@ -618,6 +636,52 @@ mod tests {
                 .iter()
                 .any(|service| service.source == "smb" && service.port == Some(445))
         );
+    }
+
+    #[test]
+    fn deep_probe_application_respects_source_options() {
+        let mut device = device();
+
+        apply_deep_probes(
+            &mut device,
+            vec![deep::PortProbe {
+                port: 443,
+                service: "https".to_string(),
+                banner: Some("HTTP 200 | server: OpenWrt".to_string()),
+                http_headers: vec![deep::HttpHeader {
+                    name: "server".to_string(),
+                    value: "uhttpd".to_string(),
+                }],
+                favicon: None,
+                tls: Some(deep::TlsCertificate {
+                    sha256: "def456".to_string(),
+                    subject: None,
+                    issuer: None,
+                    not_before: None,
+                    not_after: None,
+                }),
+            }],
+            deep::ProbeOptions {
+                deep: false,
+                http: true,
+                tls: false,
+            },
+        );
+
+        assert!(
+            !device
+                .services
+                .iter()
+                .any(|service| service.source == "deep")
+        );
+        assert!(!device.evidence.iter().any(|item| item.source == "deep"));
+        assert!(has_evidence(
+            &device,
+            "http",
+            "http_header_server",
+            "uhttpd"
+        ));
+        assert!(!device.evidence.iter().any(|item| item.source == "tls"));
     }
 
     #[test]

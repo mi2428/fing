@@ -299,11 +299,19 @@ pub(super) async fn run_deep_and_snmp_enrichment(
     limiter: Arc<Semaphore>,
     mut on_update: impl FnMut(ProbeUpdate),
 ) -> (Option<DeepRun>, Option<SnmpRun>) {
-    if config.profile.includes_deep_probes() {
+    let probe_options = deep::ProbeOptions {
+        deep: config.deep,
+        http: config.http,
+        tls: config.tls,
+    };
+
+    if probe_options.deep {
         emit(
             events,
             ScanEvent::Phase("deep port/banner enrichment".to_string()),
         );
+    } else if probe_options.http || probe_options.tls {
+        emit(events, ScanEvent::Phase("HTTP/TLS enrichment".to_string()));
     }
     if config.snmp {
         emit(
@@ -325,13 +333,14 @@ pub(super) async fn run_deep_and_snmp_enrichment(
     let deep_limiter = Arc::clone(&limiter);
     let snmp_limiter = Arc::clone(&limiter);
     let deep = async {
-        if config.profile.includes_deep_probes() {
+        if probe_options.any() {
             Some(
                 deep::probe_hosts_with_callback(
                     deep_ips,
                     IpAddr::V4(interface_ip),
                     config.timeout,
                     deep_limiter,
+                    probe_options,
                     move |ip, probe| {
                         let _ = deep_tx.send(ProbeUpdate::Deep(ip, probe));
                     },
@@ -582,6 +591,10 @@ mod tests {
             mdns: false,
             netbios: false,
             upnp: false,
+            deep: false,
+            http: false,
+            tls: false,
+            smb: false,
             snmp: false,
             snmp_community: "public".to_string(),
             lldp: false,

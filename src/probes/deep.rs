@@ -49,6 +49,19 @@ pub struct TlsCertificate {
     pub not_after: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProbeOptions {
+    pub deep: bool,
+    pub http: bool,
+    pub tls: bool,
+}
+
+impl ProbeOptions {
+    pub fn any(self) -> bool {
+        self.deep || self.http || self.tls
+    }
+}
+
 const PORTS: &[(u16, &str)] = &[
     (21, "ftp"),
     (22, "ssh"),
@@ -75,6 +88,7 @@ pub async fn probe_hosts_with_callback<F>(
     local_addr: IpAddr,
     timeout: Duration,
     limiter: Arc<Semaphore>,
+    options: ProbeOptions,
     mut on_probe: F,
 ) -> HashMap<IpAddr, Vec<PortProbe>>
 where
@@ -83,15 +97,17 @@ where
     let mut tasks = JoinSet::new();
 
     for ip in ips {
-        for (port, service) in PORTS {
+        for &(port, service) in PORTS {
+            if !probe_source_enabled(service, options) {
+                continue;
+            }
             let limiter = Arc::clone(&limiter);
-            let service = (*service).to_string();
-            let port = *port;
+            let service = service.to_string();
             tasks.spawn(async move {
                 let Ok(_permit) = limiter.acquire_owned().await else {
                     return None;
                 };
-                probe_port(ip, local_addr, port, service, timeout)
+                probe_port(ip, local_addr, port, service, timeout, options)
                     .await
                     .map(|probe| (ip, probe))
             });
@@ -118,6 +134,7 @@ async fn probe_port(
     port: u16,
     service: String,
     timeout: Duration,
+    options: ProbeOptions,
 ) -> Option<PortProbe> {
     // A successful TCP connect is enough to record the service. Protocol-specific
     // reads below enrich the row when they succeed, but failure to read a banner
@@ -134,15 +151,15 @@ async fn probe_port(
     };
 
     match service.as_str() {
-        "http" | "http-alt" | "http-proxy" | "upnp-http" => {
+        "http" | "http-alt" | "http-proxy" | "upnp-http" if options.deep || options.http => {
             // HTTP metadata often contains product strings even when a device
             // has no mDNS/UPnP name. Capture headers and favicon hashes as
             // evidence for rules, but do not classify directly here.
-            if let Some(web) = web_probe(ip, local_addr, port, false, timeout).await {
+            if let Some(web) = web_probe(ip, local_addr, port, false, timeout, options.http).await {
                 probe.banner = web.banner;
                 probe.http_headers = web.headers;
                 probe.favicon = web.favicon;
-            } else {
+            } else if options.deep {
                 probe.banner = http_banner(&mut stream, ip, timeout).await;
             }
         }
@@ -150,20 +167,44 @@ async fn probe_port(
             // TLS subjects/issuers are useful for appliance UIs and embedded
             // web servers. Invalid/self-signed certs are accepted because local
             // devices commonly use them; the hash is the fingerprint.
-            if let Some(web) = web_probe(ip, local_addr, port, true, timeout).await {
+            if (options.deep || options.http)
+                && let Some(web) =
+                    web_probe(ip, local_addr, port, true, timeout, options.http).await
+            {
                 probe.banner = web.banner;
                 probe.http_headers = web.headers;
                 probe.favicon = web.favicon;
             }
-            probe.tls = tls_certificate_probe(ip, local_addr, port, timeout).await;
+            if options.tls {
+                probe.tls = tls_certificate_probe(ip, local_addr, port, timeout).await;
+            }
         }
-        "ssh" | "ftp" | "telnet" => {
+        "ssh" | "ftp" | "telnet" if options.deep => {
             probe.banner = passive_banner(&mut stream, timeout).await;
         }
         _ => {}
     }
 
-    Some(probe)
+    probe_has_enabled_evidence(&probe, options).then_some(probe)
+}
+
+fn probe_source_enabled(service: &str, options: ProbeOptions) -> bool {
+    options.deep
+        || (options.http && web_probe_service(service))
+        || (options.tls && service == "https")
+}
+
+fn web_probe_service(service: &str) -> bool {
+    matches!(
+        service,
+        "http" | "http-alt" | "http-proxy" | "upnp-http" | "https"
+    )
+}
+
+fn probe_has_enabled_evidence(probe: &PortProbe, options: ProbeOptions) -> bool {
+    options.deep
+        || (options.http && (!probe.http_headers.is_empty() || probe.favicon.is_some()))
+        || (options.tls && probe.tls.is_some())
 }
 
 async fn http_banner(stream: &mut TcpStream, ip: IpAddr, timeout: Duration) -> Option<String> {
@@ -219,11 +260,14 @@ async fn web_probe(
     port: u16,
     https: bool,
     timeout: Duration,
+    fetch_favicon: bool,
 ) -> Option<WebProbe> {
-    tokio::task::spawn_blocking(move || blocking_web_probe(ip, local_addr, port, https, timeout))
-        .await
-        .ok()
-        .flatten()
+    tokio::task::spawn_blocking(move || {
+        blocking_web_probe(ip, local_addr, port, https, timeout, fetch_favicon)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn blocking_web_probe(
@@ -232,6 +276,7 @@ fn blocking_web_probe(
     port: u16,
     https: bool,
     timeout: Duration,
+    fetch_favicon: bool,
 ) -> Option<WebProbe> {
     if !super::same_ip_family(local_addr, ip) {
         return None;
@@ -254,12 +299,16 @@ fn blocking_web_probe(
     let mut headers = interesting_headers(response.headers());
     let banner = http_banner_from_response(response.status().as_u16(), &headers);
 
-    let favicon_url = format!("{base_url}/favicon.ico");
-    let favicon = client
-        .get(&favicon_url)
-        .send()
-        .ok()
-        .and_then(|response| favicon_fingerprint_from_response(response, favicon_url));
+    let favicon = if fetch_favicon {
+        let favicon_url = format!("{base_url}/favicon.ico");
+        client
+            .get(&favicon_url)
+            .send()
+            .ok()
+            .and_then(|response| favicon_fingerprint_from_response(response, favicon_url))
+    } else {
+        None
+    };
 
     headers.truncate(16);
     Some(WebProbe {
@@ -556,6 +605,7 @@ mod tests {
             port,
             false,
             Duration::from_millis(500),
+            true,
         )
         .unwrap();
 
