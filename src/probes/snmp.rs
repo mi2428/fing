@@ -7,7 +7,10 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicI32, Ordering},
+    },
     time::Duration,
 };
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -26,6 +29,7 @@ const SYSTEM_OIDS: &[(&str, &[u32])] = &[
     ("sysLocation", SYS_LOCATION_OID),
     ("sysServices", SYS_SERVICES_OID),
 ];
+static NEXT_REQUEST_ID: AtomicI32 = AtomicI32::new(0x4f52_0002);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SnmpInfo {
@@ -86,17 +90,32 @@ async fn probe_system_one(
     // Request the system group fields in one packet. Devices that reject SNMP,
     // time out, or return an error simply produce no evidence for that host.
     let oids = SYSTEM_OIDS.iter().map(|(_, oid)| *oid).collect::<Vec<_>>();
-    let packet = build_get_request_for_oids(0x4f52_0002, &community, &oids);
+    let request_id = next_request_id();
+    let packet = build_get_request_for_oids(request_id, &community, &oids);
     let socket = tokio::net::UdpSocket::bind(SocketAddr::new(local_addr, 0))
         .await
         .ok()?;
     socket.send_to(&packet, (ip, 161)).await.ok()?;
 
     let mut buffer = [0_u8; 4096];
-    match tokio::time::timeout(timeout, socket.recv_from(&mut buffer)).await {
-        Ok(Ok((len, _))) => parse_system_response(&buffer[..len]),
-        _ => None,
-    }
+    tokio::time::timeout(timeout, async {
+        loop {
+            let (len, source) = socket.recv_from(&mut buffer).await.ok()?;
+            if source.ip() != ip {
+                continue;
+            }
+            if let Some(info) = parse_system_response_for_request(&buffer[..len], request_id) {
+                return Some(info);
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn next_request_id() -> i32 {
+    NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 pub fn build_get_request_for_oids(request_id: i32, community: &str, oids: &[&[u32]]) -> Vec<u8> {
@@ -113,8 +132,20 @@ pub fn build_get_request_for_oids(request_id: i32, community: &str, oids: &[&[u3
     sequence([integer(1), tlv(0x04, community.as_bytes()), pdu])
 }
 
+#[cfg(test)]
 pub fn parse_system_response(buf: &[u8]) -> Option<SnmpInfo> {
-    let values = parse_response_values(buf)?;
+    parse_system_response_with_request_id(buf, None)
+}
+
+fn parse_system_response_for_request(buf: &[u8], request_id: i32) -> Option<SnmpInfo> {
+    parse_system_response_with_request_id(buf, Some(request_id))
+}
+
+fn parse_system_response_with_request_id(
+    buf: &[u8],
+    expected_request_id: Option<i32>,
+) -> Option<SnmpInfo> {
+    let values = parse_response_values_with_request_id(buf, expected_request_id)?;
     let sys_services = values
         .get(&oid_key(SYS_SERVICES_OID))
         .and_then(|value| value.parse::<u32>().ok());
@@ -137,7 +168,10 @@ pub fn parse_system_response(buf: &[u8]) -> Option<SnmpInfo> {
     .then_some(info)
 }
 
-pub fn parse_response_values(buf: &[u8]) -> Option<HashMap<String, String>> {
+fn parse_response_values_with_request_id(
+    buf: &[u8],
+    expected_request_id: Option<i32>,
+) -> Option<HashMap<String, String>> {
     // SNMP responses are BER TLV trees. Parse structurally and reject error
     // status values before trusting any varbind payloads.
     let (_, message) = read_tlv_expect(buf, 0x30)?;
@@ -150,7 +184,10 @@ pub fn parse_response_values(buf: &[u8]) -> Option<HashMap<String, String>> {
     }
 
     let mut pdu_body = pdu.value;
-    let _request_id = read_next(&mut pdu_body, 0x02)?;
+    let request_id = read_next(&mut pdu_body, 0x02).and_then(decode_integer)?;
+    if expected_request_id.is_some_and(|expected| request_id != i64::from(expected)) {
+        return None;
+    }
     let error_status = read_next(&mut pdu_body, 0x02)?;
     if error_status.iter().any(|byte| *byte != 0) {
         return None;
@@ -391,6 +428,20 @@ mod tests {
         let info = parse_system_response(&packet).unwrap();
 
         assert_eq!(info.sys_descr.as_deref(), Some("Linux router 6.1"));
+    }
+
+    #[test]
+    fn rejects_response_for_different_request_id() {
+        let value = tlv(0x04, b"Linux router 6.1");
+        let varbind = sequence([oid(SYS_DESCR_OID), value]);
+        let response_pdu = tlv(
+            0xa2,
+            &concat([integer(7), integer(0), integer(0), sequence([varbind])]),
+        );
+        let packet = sequence([integer(1), tlv(0x04, b"public"), response_pdu]);
+
+        assert!(parse_system_response_for_request(&packet, 8).is_none());
+        assert!(parse_system_response_for_request(&packet, 7).is_some());
     }
 
     #[test]

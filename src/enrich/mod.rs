@@ -19,7 +19,10 @@ use std::{
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -29,6 +32,7 @@ const IEEE_OUI_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_IEEE_OUI_CSV_BYTES: usize = 32 * 1024 * 1024;
 const MDNS_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const MDNS_PORT: u16 = 5353;
+static NEXT_NETBIOS_TRANSACTION_ID: AtomicU16 = AtomicU16::new(0x4000);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MdnsInfo {
@@ -701,21 +705,25 @@ where
             let Ok(_permit) = limiter.acquire_owned().await else {
                 return None;
             };
-            let query = build_netbios_query(0x4000);
+            let transaction_id = next_netbios_transaction_id();
+            let query = build_netbios_query(transaction_id);
             let socket = tokio::net::UdpSocket::bind((local_ip, 0)).await.ok()?;
             let _ = socket.send_to(&query, (ipv4, 137)).await.ok()?;
             let mut buf = [0_u8; 1500];
-            match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
-                Ok(Ok((len, _))) => {
-                    let names = parse_netbios_response(&buf[..len]).names;
-                    if names.is_empty() {
-                        None
-                    } else {
-                        Some((IpAddr::V4(ipv4), names))
+            tokio::time::timeout(timeout, async {
+                loop {
+                    let (len, source) = socket.recv_from(&mut buf).await.ok()?;
+                    if source.ip() != IpAddr::V4(ipv4) {
+                        continue;
+                    }
+                    if let Some(names) = matching_netbios_names(&buf[..len], transaction_id) {
+                        return Some((IpAddr::V4(ipv4), names));
                     }
                 }
-                _ => None,
-            }
+            })
+            .await
+            .ok()
+            .flatten()
         });
     }
 
@@ -727,6 +735,10 @@ where
         }
     }
     result
+}
+
+fn next_netbios_transaction_id() -> u16 {
+    NEXT_NETBIOS_TRANSACTION_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -815,6 +827,15 @@ pub fn parse_netbios_response(buf: &[u8]) -> NetbiosResponse {
     NetbiosResponse {
         transaction_id,
         names: names.into_keys().collect(),
+    }
+}
+
+fn matching_netbios_names(buf: &[u8], transaction_id: u16) -> Option<Vec<String>> {
+    let response = parse_netbios_response(buf);
+    if response.transaction_id != transaction_id || response.names.is_empty() {
+        None
+    } else {
+        Some(response.names)
     }
 }
 
@@ -1052,5 +1073,10 @@ mod tests {
         let parsed = parse_netbios_response(&response);
         assert_eq!(parsed.transaction_id, 0x1234);
         assert_eq!(parsed.names, vec!["OFFICE".to_string()]);
+        assert_eq!(
+            matching_netbios_names(&response, 0x1234),
+            Some(vec!["OFFICE".to_string()])
+        );
+        assert!(matching_netbios_names(&response, 0x4321).is_none());
     }
 }
