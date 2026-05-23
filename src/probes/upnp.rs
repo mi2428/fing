@@ -266,12 +266,16 @@ pub fn parse_upnp_description(xml: &str) -> Result<UpnpDescription> {
     reader.config_mut().trim_text(true);
 
     let mut current = String::new();
+    let mut device_depth = 0_usize;
     let mut description = UpnpDescription::default();
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(event)) => {
                 current = String::from_utf8_lossy(event.name().as_ref()).to_string();
+                if current == "device" {
+                    device_depth += 1;
+                }
             }
             Ok(Event::Text(event)) => {
                 let text = event.decode()?.trim().to_string();
@@ -279,16 +283,26 @@ pub fn parse_upnp_description(xml: &str) -> Result<UpnpDescription> {
                     continue;
                 }
                 match current.as_str() {
-                    "friendlyName" => description.friendly_name = Some(text),
-                    "manufacturer" => description.manufacturer = Some(text),
-                    "modelName" => description.model_name = Some(text),
-                    "modelDescription" => description.model_description = Some(text),
-                    "deviceType" => description.device_type = Some(text),
-                    "serviceType" => push_unique(&mut description.services, text),
+                    "friendlyName" if device_depth == 1 => description.friendly_name = Some(text),
+                    "manufacturer" if device_depth == 1 => description.manufacturer = Some(text),
+                    "modelName" if device_depth == 1 => description.model_name = Some(text),
+                    "modelDescription" if device_depth == 1 => {
+                        description.model_description = Some(text);
+                    }
+                    "deviceType" if device_depth == 1 => description.device_type = Some(text),
+                    "serviceType" if device_depth > 0 => {
+                        push_unique(&mut description.services, text)
+                    }
                     _ => {}
                 }
             }
-            Ok(Event::End(_)) => current.clear(),
+            Ok(Event::End(event)) => {
+                let ended = String::from_utf8_lossy(event.name().as_ref()).to_string();
+                if ended == "device" {
+                    device_depth = device_depth.saturating_sub(1);
+                }
+                current.clear();
+            }
             Ok(Event::Eof) => break,
             Err(err) => return Err(err).context("failed to parse UPnP description XML"),
             _ => {}
@@ -454,6 +468,50 @@ mod tests {
         assert_eq!(description.manufacturer.as_deref(), Some("Sony"));
         assert_eq!(description.model_name.as_deref(), Some("BRAVIA"));
         assert_eq!(description.services.len(), 1);
+    }
+
+    #[test]
+    fn upnp_description_keeps_root_device_identity_over_embedded_devices() {
+        let xml = r#"
+            <root>
+              <device>
+                <deviceType>urn:schemas-upnp-org:device:InternetGatewayDevice:1</deviceType>
+                <friendlyName>Home Gateway</friendlyName>
+                <manufacturer>Example Networks</manufacturer>
+                <modelName>Gateway 9000</modelName>
+                <serviceList>
+                  <service><serviceType>urn:schemas-upnp-org:service:Layer3Forwarding:1</serviceType></service>
+                </serviceList>
+                <deviceList>
+                  <device>
+                    <deviceType>urn:schemas-upnp-org:device:WANDevice:1</deviceType>
+                    <friendlyName>WAN Device</friendlyName>
+                    <manufacturer>Wrong Vendor</manufacturer>
+                    <modelName>Wrong Model</modelName>
+                    <serviceList>
+                      <service><serviceType>urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1</serviceType></service>
+                    </serviceList>
+                  </device>
+                </deviceList>
+              </device>
+            </root>
+        "#;
+
+        let description = parse_upnp_description(xml).unwrap();
+
+        assert_eq!(description.friendly_name.as_deref(), Some("Home Gateway"));
+        assert_eq!(
+            description.manufacturer.as_deref(),
+            Some("Example Networks")
+        );
+        assert_eq!(description.model_name.as_deref(), Some("Gateway 9000"));
+        assert_eq!(
+            description.device_type.as_deref(),
+            Some("urn:schemas-upnp-org:device:InternetGatewayDevice:1")
+        );
+        assert!(description.services.iter().any(|service| {
+            service == "urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1"
+        }));
     }
 
     #[test]
