@@ -75,12 +75,23 @@ pub fn parse_cdp_frame(packet: &[u8]) -> Option<CdpInfo> {
     if frame_len > 1500 {
         return None;
     }
+    let frame_len = usize::from(frame_len);
+    if frame_len < LLC_SNAP_LEN + CDP_HEADER_LEN {
+        return None;
+    }
+    let frame_end = ETHERNET_HEADER_LEN + frame_len;
+    if frame_end > packet.len() {
+        return None;
+    }
     if packet[ETHERNET_HEADER_LEN..ETHERNET_HEADER_LEN + LLC_SNAP_LEN] != LLC_SNAP_HEADER {
         return None;
     }
 
     let source_mac = format_mac(&packet[6..12])?;
-    parse_cdp_payload(&packet[ETHERNET_HEADER_LEN + LLC_SNAP_LEN..], source_mac)
+    parse_cdp_payload(
+        &packet[ETHERNET_HEADER_LEN + LLC_SNAP_LEN..frame_end],
+        source_mac,
+    )
 }
 
 pub fn parse_cdp_payload(payload: &[u8], source_mac: String) -> Option<CdpInfo> {
@@ -284,6 +295,23 @@ mod tests {
         let frame = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
 
         assert!(parse_cdp_frame(&frame).is_none());
+    }
+
+    #[test]
+    fn parses_cdp_frame_with_ethernet_padding() {
+        let payload = [
+            cdp_header(),
+            tlv(0x0001, b"switch1"),
+            tlv(0x0003, b"GigabitEthernet1/0/1"),
+        ]
+        .concat();
+        let mut frame = cdp_frame(&payload);
+        frame.extend_from_slice(&[0_u8; 32]);
+
+        let info = parse_cdp_frame(&frame).unwrap();
+
+        assert_eq!(info.device_id.as_deref(), Some("switch1"));
+        assert_eq!(info.port_id.as_deref(), Some("GigabitEthernet1/0/1"));
     }
 
     fn cdp_frame(payload: &[u8]) -> Vec<u8> {
