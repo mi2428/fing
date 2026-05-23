@@ -31,7 +31,7 @@ $ make -C fing install
 > Pick the asset that matches your machine, make it executable, and place it on your `PATH`.
 >
 > ```console
-> $ curl -L -o fing https://github.com/mi2428/fing/releases/download/v0.9.0/fing-v0.9.0-darwin-arm64
+> $ curl -L -o fing https://github.com/mi2428/fing/releases/download/v0.9.3/fing-v0.9.3-darwin-arm64
 > $ chmod +x ./fing
 > ```
 
@@ -57,10 +57,11 @@ Options:
       --output.live <LIVE>              Live TUI mode: auto uses it only for interactive table output [default: auto] [possible values: auto, always, never]
       --output.mask-mac                 Mask the lower 24 bits of MAC addresses in output
   -h, --help                            Print help
+  -V, --version                         Print version
 
 Fingerprint Options:
       --fingerprint.source <SOURCE>
-          Limit fingerprint sources. Defaults to profile-appropriate sources when omitted [possible values: oui, rdns, mdns, netbios, upnp, snmp, lldp, cdp, dhcp]
+          Limit fingerprint sources. Defaults to profile-appropriate sources when omitted [possible values: oui, rdns, mdns, netbios, upnp, deep, http, tls, smb, snmp, lldp, cdp, dhcp]
       --dhcp.leases <DHCP_LEASES>
           Read DHCP leases from an explicit lease file. Can be repeated
       --snmp.community <SNMP_COMMUNITY>
@@ -85,7 +86,7 @@ $ fing oui update --output.path ./oui.json
 >[!NOTE]
 > LLDP and CDP collection are passive and run by default with the `deep` profile.
 > In live/continuous mode, both listeners stay up across scan rounds and update matching devices as advertisements arrive.
-> In one-shot output mode, LLDP listens for at least 30 seconds and CDP listens for at least 65 seconds because common Cisco defaults advertise every 60 seconds.
+> In one-shot output mode, an enabled LLDP listener waits at least 30 seconds and an enabled CDP listener waits at least 65 seconds because common Cisco defaults advertise every 60 seconds.
 > You can also request them explicitly with `--fingerprint.source lldp` or `--fingerprint.source cdp`.
 
 ## Development

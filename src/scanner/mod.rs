@@ -33,6 +33,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     net::IpAddr,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -61,6 +62,9 @@ pub async fn scan_continuously_with_events(
 
     let (mut passive_manager, mut passive_rx, _passive_listeners) =
         ContinuousPassiveManager::start(&configs)?;
+    for warning in passive_manager.take_startup_warnings() {
+        emit(&Some(events.clone()), ScanEvent::Warning(warning));
+    }
     let round_configs = round_scan_configs(&configs);
     let mut round = 1_u64;
     loop {
@@ -71,6 +75,7 @@ pub async fn scan_continuously_with_events(
             &mut passive_manager,
         )
         .await;
+        emit(&Some(events.clone()), ScanEvent::RoundStarted { round });
         emit(
             &Some(events.clone()),
             ScanEvent::Phase(format!("scan round {round}")),
@@ -87,6 +92,8 @@ pub async fn scan_continuously_with_events(
                 &Some(events.clone()),
                 ScanEvent::Warning(format!("scan round {round} failed: {err}")),
             );
+        } else {
+            emit(&Some(events.clone()), ScanEvent::RoundFinished { round });
         }
         if let Some(phase) = idle_phase(interval, round) {
             emit(&Some(events.clone()), ScanEvent::Phase(phase));
@@ -146,6 +153,7 @@ struct ContinuousPassiveManager {
     states: BTreeMap<String, ContinuousPassiveInterfaceState>,
     rules: identity_rules::RuleDb,
     oui_db: HashMap<String, String>,
+    startup_warnings: Vec<String>,
 }
 
 struct ContinuousPassiveInterfaceState {
@@ -286,10 +294,12 @@ impl ContinuousPassiveManager {
             .first()
             .map(|config| config.oui_path.clone())
             .unwrap_or_else(enrich::default_oui_db_path);
+        let (oui_db, oui_warning) = load_oui_db_or_warning(&oui_path);
         let manager = Self {
             states,
             rules: identity_rules::load_rule_db()?,
-            oui_db: enrich::load_oui_db(&oui_path).unwrap_or_default(),
+            oui_db,
+            startup_warnings: oui_warning.into_iter().collect(),
         };
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -331,6 +341,10 @@ impl ContinuousPassiveManager {
             }
             other => other,
         }
+    }
+
+    fn take_startup_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.startup_warnings)
     }
 
     fn observe_device(&mut self, device: &mut Device) {
@@ -378,14 +392,16 @@ impl ContinuousPassiveManager {
         state
             .pending_observations
             .insert(observation.key.clone(), observation.clone());
+        let received_at = observation.received_at;
 
         let mut events = Vec::new();
         for ip in observation.target_ips(&state.devices, &state.targets) {
             let device = state
                 .devices
                 .entry(ip)
-                .or_insert_with(|| passive_device(ip, interface));
+                .or_insert_with(|| passive_device(ip, interface, received_at));
             let before = device.clone();
+            device.last_seen = received_at;
             observation.apply_to_device(device, state.oui.then_some(&self.oui_db));
             identity_rules::apply_identity_rules(device, &self.rules);
             if *device != before {
@@ -438,7 +454,7 @@ async fn continuous_l2_listener(
     let worker_updates = updates.clone();
     let worker_cancel = Arc::clone(&cancel);
     let result = tokio::task::spawn_blocking(move || {
-        discovery::l2::listen_until(
+        discovery::l2::listen_until_repeating(
             &worker_iface,
             protocols,
             || worker_cancel.load(Ordering::Relaxed) || stop_updates.is_closed(),
@@ -614,15 +630,19 @@ async fn wait_until_resumed_with_passive(
     }
 }
 
-fn passive_device(ip: IpAddr, interface: &str) -> Device {
-    let mut device = Device::new(ip, Utc::now());
+fn passive_device(ip: IpAddr, interface: &str, now: DateTime<Utc>) -> Device {
+    let mut device = Device::new(ip, now);
     device.interface = Some(interface.to_string());
     device
 }
 
 fn merge_known_device(state: &mut ContinuousPassiveInterfaceState, incoming: Device) {
     if let Some(existing) = state.devices.get_mut(&incoming.ip) {
-        merge_device_snapshot(existing, incoming);
+        if device_mac_changed(existing, &incoming) {
+            *existing = incoming;
+        } else {
+            merge_device_snapshot(existing, incoming);
+        }
     } else {
         state.devices.insert(incoming.ip, incoming);
     }
@@ -713,7 +733,8 @@ async fn scan_many_inner(
         let Some(config) = configs.pop() else {
             anyhow::bail!("no scan targets configured");
         };
-        return scan_inner(config, events, emit_finished).await;
+        let probe_limiter = Arc::new(Semaphore::new(config.concurrency.max(1)));
+        return scan_inner(config, events, emit_finished, probe_limiter).await;
     }
 
     let scanned_at = Utc::now();
@@ -743,6 +764,7 @@ async fn scan_many_inner(
 
     let scan_concurrency = configs[0].concurrency.max(1);
     let semaphore = Arc::new(Semaphore::new(scan_concurrency));
+    let probe_limiter = Arc::new(Semaphore::new(configs[0].concurrency.max(1)));
     let mut handles = Vec::new();
 
     for mut config in configs {
@@ -752,6 +774,7 @@ async fn scan_many_inner(
         config.cache_enabled = false;
         let events = events.clone();
         let semaphore = Arc::clone(&semaphore);
+        let probe_limiter = Arc::clone(&probe_limiter);
         handles.push(tokio::spawn(async move {
             let _permit = semaphore
                 .acquire_owned()
@@ -759,7 +782,7 @@ async fn scan_many_inner(
                 .context("scan concurrency limiter closed")?;
             let (child_tx, child_rx) = tokio::sync::mpsc::unbounded_channel();
             let forwarder = tokio::spawn(forward_child_events(child_rx, events));
-            let result = scan_inner(config, Some(child_tx), false).await;
+            let result = scan_inner(config, Some(child_tx), false, probe_limiter).await;
             let _ = forwarder.await;
             result
         }));
@@ -797,7 +820,7 @@ async fn scan_many_inner(
         match store::load_scan_cache(&cache_path) {
             Ok(previous) => {
                 store::merge_previous_scan(&mut devices, &previous);
-                finish_devices_update(&events, devices.iter_mut(), &identity_rules);
+                finish_device_snapshots(&events, devices.iter_mut(), &identity_rules);
                 if let Err(err) = store::save_scan_cache(&cache_path, &devices) {
                     let warning = format!("failed to save scan cache: {err}");
                     push_unique_warning(&mut warnings, warning.clone());
@@ -837,11 +860,12 @@ async fn scan_inner(
     config: ScanConfig,
     events: Option<UnboundedSender<ScanEvent>>,
     emit_finished: bool,
+    probe_limiter: Arc<Semaphore>,
 ) -> Result<ScanResult> {
     let scanned_at = Utc::now();
     let iface = net::select_interface(config.iface.as_deref())?;
     let target = net::parse_target(config.target.as_deref(), &iface)?;
-    let oui_db = crate::enrich::load_oui_db(&config.oui_path).unwrap_or_default();
+    let (oui_db, oui_warning) = load_oui_db_or_warning(&config.oui_path);
     let identity_rules = identity_rules::load_rule_db()?;
 
     let mut warnings = Vec::new();
@@ -855,6 +879,10 @@ async fn scan_inner(
             profile: config.profile,
         },
     );
+    if let Some(warning) = oui_warning {
+        warnings.push(warning.clone());
+        emit(&events, ScanEvent::Warning(warning));
+    }
     emit(&events, ScanEvent::Phase("ARP discovery".to_string()));
 
     let arp_iface = iface.clone();
@@ -868,12 +896,11 @@ async fn scan_inner(
         discovery::arp_sweep_with_callback(&arp_iface, arp_target, arp_timeout, |hit| {
             let mut device = Device::new(IpAddr::V4(hit.ip), scanned_at);
             device.interface = Some(arp_iface.name.clone());
-            device.mac = Some(hit.mac.clone());
+            apply_arp_mac(&mut device, &hit.mac);
             if arp_oui_enabled {
                 device.vendor = crate::enrich::lookup_vendor(&hit.mac, &arp_oui_db);
             }
-            identity_rules::apply_identity_rules(&mut device, &arp_rules);
-            emit_device(&arp_events, &device);
+            finish_observed_device_update(&arp_events, &mut device, &arp_rules);
         })
     })
     .await
@@ -887,22 +914,22 @@ async fn scan_inner(
                 if config.oui {
                     device.vendor = crate::enrich::lookup_vendor(&hit.mac, &oui_db);
                 }
-                device.mac = Some(hit.mac);
-                finish_device_update(&events, device, &identity_rules);
+                apply_arp_mac(device, &hit.mac);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
         }
         Err(err) => {
             let warning = format!("ARP sweep failed ({err}); falling back to the OS ARP table");
             warnings.push(warning.clone());
             emit(&events, ScanEvent::Warning(warning));
-            for hit in discovery::arp_table(target) {
+            for hit in discovery::arp_table(target, &iface.name) {
                 let device =
                     upsert_device(&mut devices, IpAddr::V4(hit.ip), scanned_at, &iface.name);
                 if config.oui {
                     device.vendor = crate::enrich::lookup_vendor(&hit.mac, &oui_db);
                 }
-                device.mac = Some(hit.mac);
-                finish_device_update(&events, device, &identity_rules);
+                apply_arp_mac(device, &hit.mac);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
         }
     }
@@ -918,13 +945,13 @@ async fn scan_inner(
             "local",
             0.95,
         );
-        finish_device_update(&events, self_device, &identity_rules);
+        finish_observed_device_update(&events, self_device, &identity_rules);
     }
 
     if config.oui {
         apply_oui(&mut devices, &oui_db);
     }
-    finish_devices_update(&events, devices.values_mut(), &identity_rules);
+    finish_device_snapshots(&events, devices.values_mut(), &identity_rules);
 
     let lldp_context = LldpApplyContext {
         now: scanned_at,
@@ -966,12 +993,15 @@ async fn scan_inner(
                 // Lease files are often host-global rather than per-interface.
                 // Scope them back to this interface's target network before
                 // using hostnames or vendor-class strings as identity evidence.
+                // They are passive and can be stale, so they only enrich
+                // devices that this scan already observed by IP or MAC.
                 if !target_contains_ip(target, lease.ip) {
                     continue;
                 }
-                let device = upsert_device(&mut devices, lease.ip, scanned_at, &iface.name);
-                apply_dhcp_lease(device, lease, config.oui.then_some(&oui_db));
-                finish_device_update(&events, device, &identity_rules);
+                if let Some(device) = observed_device_for_dhcp_lease(&mut devices, &lease) {
+                    apply_dhcp_lease(device, lease, config.oui.then_some(&oui_db));
+                    finish_observed_device_update(&events, device, &identity_rules);
+                }
             }
         }
     }
@@ -991,12 +1021,12 @@ async fn scan_inner(
             MulticastUpdate::Mdns(ip, mdns) => {
                 let device = upsert_device(devices, ip, scanned_at, &iface.name);
                 apply_mdns_info(device, mdns);
-                finish_device_update(&events, device, &identity_rules);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
             MulticastUpdate::Upnp(ip, info) => {
                 let device = upsert_device(devices, ip, scanned_at, &iface.name);
                 apply_upnp_info(device, info);
-                finish_device_update(&events, device, &identity_rules);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
         },
     )
@@ -1016,9 +1046,16 @@ async fn scan_inner(
 
     let ips = devices.keys().copied().collect::<Vec<_>>();
     let (name_tx, mut name_rx) = tokio::sync::mpsc::unbounded_channel();
-    let name_future = run_name_enrichment(&config, ips.clone(), &events, move |update| {
-        let _ = name_tx.send(update);
-    });
+    let name_future = run_name_enrichment(
+        &config,
+        iface.ip,
+        ips.clone(),
+        &events,
+        Arc::clone(&probe_limiter),
+        move |update| {
+            let _ = name_tx.send(update);
+        },
+    );
     let _ = await_with_lldp_and_phase_updates(
         name_future,
         &mut name_rx,
@@ -1029,7 +1066,7 @@ async fn scan_inner(
             NameUpdate::Rdns(ip, name) => {
                 let device = upsert_device(devices, ip, scanned_at, &iface.name);
                 device.add_name(name, "rdns", 0.65);
-                finish_device_update(&events, device, &identity_rules);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
             NameUpdate::Netbios(ip, names) => {
                 let device = upsert_device(devices, ip, scanned_at, &iface.name);
@@ -1037,7 +1074,7 @@ async fn scan_inner(
                     device.add_name(name, "netbios", 0.8);
                 }
                 device.set_os_guess("Windows/SMB capable", "netbios", 0.45);
-                finish_device_update(&events, device, &identity_rules);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
         },
     )
@@ -1045,9 +1082,21 @@ async fn scan_inner(
 
     let ips = devices.keys().copied().collect::<Vec<_>>();
     let (probe_tx, mut probe_rx) = tokio::sync::mpsc::unbounded_channel();
-    let probe_future = run_deep_and_snmp_enrichment(&config, ips.clone(), &events, move |update| {
-        let _ = probe_tx.send(update);
-    });
+    let deep_options = crate::probes::deep::ProbeOptions {
+        deep: config.deep,
+        http: config.http,
+        tls: config.tls,
+    };
+    let probe_future = run_deep_and_snmp_enrichment(
+        &config,
+        iface.ip,
+        ips.clone(),
+        &events,
+        Arc::clone(&probe_limiter),
+        move |update| {
+            let _ = probe_tx.send(update);
+        },
+    );
     let _ = await_with_lldp_and_phase_updates(
         probe_future,
         &mut probe_rx,
@@ -1057,39 +1106,44 @@ async fn scan_inner(
         |devices, update| match update {
             ProbeUpdate::Deep(ip, probe) => {
                 let device = upsert_device(devices, ip, scanned_at, &iface.name);
-                apply_deep_probes(device, vec![probe]);
-                finish_device_update(&events, device, &identity_rules);
+                apply_deep_probes(device, vec![probe], deep_options);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
             ProbeUpdate::Snmp(ip, info) => {
                 let device = upsert_device(devices, ip, scanned_at, &iface.name);
                 apply_snmp_info(device, info);
-                finish_device_update(&events, device, &identity_rules);
+                finish_observed_device_update(&events, device, &identity_rules);
             }
         },
     )
     .await;
 
-    if config.profile.includes_deep_probes() {
+    if config.smb {
         // A listening 445/139 port only proves SMB reachability. SMB2 negotiate
         // adds dialect/signing/native strings before identity rules promote
         // the device toward Windows, Samba, NAS, or file-server hints.
-        let smb_ips = devices
-            .iter()
-            .filter(|(_, device)| {
-                device
-                    .services
-                    .iter()
-                    .any(|service| matches!(service.port, Some(445)))
-            })
-            .map(|(ip, _)| *ip)
-            .collect::<Vec<_>>();
+        let smb_ips = if config.deep {
+            devices
+                .iter()
+                .filter(|(_, device)| {
+                    device
+                        .services
+                        .iter()
+                        .any(|service| matches!(service.port, Some(445)))
+                })
+                .map(|(ip, _)| *ip)
+                .collect::<Vec<_>>()
+        } else {
+            devices.keys().copied().collect::<Vec<_>>()
+        };
         if !smb_ips.is_empty() {
             emit(&events, ScanEvent::Phase("SMB fingerprinting".to_string()));
             let (smb_tx, mut smb_rx) = tokio::sync::mpsc::unbounded_channel();
             let smb_future = smb::probe_hosts_with_callback(
                 smb_ips,
+                IpAddr::V4(iface.ip),
                 config.timeout,
-                config.concurrency,
+                Arc::clone(&probe_limiter),
                 move |ip, info| {
                     let _ = smb_tx.send((ip, info));
                 },
@@ -1103,7 +1157,7 @@ async fn scan_inner(
                 |devices, (ip, info)| {
                     let device = upsert_device(devices, ip, scanned_at, &iface.name);
                     apply_smb_info(device, info);
-                    finish_device_update(&events, device, &identity_rules);
+                    finish_observed_device_update(&events, device, &identity_rules);
                 },
             )
             .await;
@@ -1126,7 +1180,7 @@ async fn scan_inner(
         match store::load_scan_cache(&config.cache_path) {
             Ok(previous) => {
                 store::merge_previous_scan(&mut devices, &previous);
-                finish_devices_update(&events, devices.iter_mut(), &identity_rules);
+                finish_device_snapshots(&events, devices.iter_mut(), &identity_rules);
                 if let Err(err) = store::save_scan_cache(&config.cache_path, &devices) {
                     let warning = format!("failed to save scan cache: {err}");
                     warnings.push(warning.clone());
@@ -1168,6 +1222,16 @@ fn push_unique_warning(warnings: &mut Vec<String>, warning: String) {
     }
 }
 
+fn load_oui_db_or_warning(path: &Path) -> (HashMap<String, String>, Option<String>) {
+    match enrich::load_oui_db(path) {
+        Ok(db) => (db, None),
+        Err(err) => (
+            HashMap::new(),
+            Some(format!("failed to load OUI DB {}: {err}", path.display())),
+        ),
+    }
+}
+
 fn upsert_device<'a>(
     devices: &'a mut BTreeMap<IpAddr, Device>,
     ip: IpAddr,
@@ -1179,6 +1243,41 @@ fn upsert_device<'a>(
         device.interface = Some(interface.to_string());
     }
     device
+}
+
+fn apply_arp_mac(device: &mut Device, mac: &str) {
+    device.mac = Some(mac.to_string());
+    device.add_evidence("arp", "mac", mac, 0.5);
+    if let Some(prefix) = enrich::normalize_oui_prefix(mac) {
+        device.add_evidence("arp", "mac_oui", prefix, 0.5);
+    }
+}
+
+fn observed_device_for_dhcp_lease<'a>(
+    devices: &'a mut BTreeMap<IpAddr, Device>,
+    lease: &dhcp::DhcpLease,
+) -> Option<&'a mut Device> {
+    if let Some(device) = devices.get(&lease.ip) {
+        match (device.mac.as_deref(), lease.mac.as_deref()) {
+            (Some(device_mac), Some(lease_mac)) if !same_mac(device_mac, lease_mac) => {
+                return None;
+            }
+            (Some(_), None) => return None,
+            _ => return devices.get_mut(&lease.ip),
+        }
+    }
+
+    let lease_mac = lease.mac.as_deref()?;
+    let matching_ip = devices
+        .iter()
+        .find(|(_, device)| {
+            device
+                .mac
+                .as_deref()
+                .is_some_and(|device_mac| same_mac(device_mac, lease_mac))
+        })
+        .map(|(ip, _)| *ip)?;
+    devices.get_mut(&matching_ip)
 }
 
 async fn await_with_lldp<F, T>(
@@ -1312,7 +1411,7 @@ fn apply_passive_update(
     for ip in update.target_ips(devices, &[context.target]) {
         let device = upsert_device(devices, ip, context.now, context.interface);
         update.apply_to_device(device, context.oui_db);
-        finish_device_update(context.events, device, context.rules);
+        finish_observed_device_update(context.events, device, context.rules);
     }
 }
 
@@ -1383,6 +1482,13 @@ fn same_mac(left: &str, right: &str) -> bool {
     normalize_mac(left) == normalize_mac(right)
 }
 
+fn device_mac_changed(existing: &Device, incoming: &Device) -> bool {
+    matches!(
+        (existing.mac.as_deref(), incoming.mac.as_deref()),
+        (Some(existing), Some(incoming)) if !same_mac(existing, incoming)
+    )
+}
+
 fn normalize_mac(value: &str) -> String {
     value
         .chars()
@@ -1391,7 +1497,16 @@ fn normalize_mac(value: &str) -> String {
         .collect()
 }
 
-fn finish_device_update(
+fn finish_observed_device_update(
+    events: &Option<UnboundedSender<ScanEvent>>,
+    device: &mut Device,
+    rules: &identity_rules::RuleDb,
+) {
+    device.last_seen = Utc::now();
+    finish_device_snapshot(events, device, rules);
+}
+
+fn finish_device_snapshot(
     events: &Option<UnboundedSender<ScanEvent>>,
     device: &mut Device,
     rules: &identity_rules::RuleDb,
@@ -1403,7 +1518,7 @@ fn finish_device_update(
     emit_device(events, device);
 }
 
-fn finish_devices_update<'a, I>(
+fn finish_device_snapshots<'a, I>(
     events: &Option<UnboundedSender<ScanEvent>>,
     devices: I,
     rules: &identity_rules::RuleDb,
@@ -1411,7 +1526,7 @@ fn finish_devices_update<'a, I>(
     I: IntoIterator<Item = &'a mut Device>,
 {
     for device in devices {
-        finish_device_update(events, device, rules);
+        finish_device_snapshot(events, device, rules);
     }
 }
 
@@ -1438,11 +1553,50 @@ fn ip_sort_key(ip: IpAddr) -> (u8, u128) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn profile_timeouts_are_ordered_by_depth() {
         assert!(ScanProfile::Fast.default_timeout() < ScanProfile::Normal.default_timeout());
         assert!(ScanProfile::Normal.default_timeout() < ScanProfile::Deep.default_timeout());
+    }
+
+    #[test]
+    fn invalid_oui_db_falls_back_with_warning() {
+        let path = std::env::temp_dir().join(format!(
+            "fing-invalid-oui-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "{not-json").unwrap();
+
+        let (db, warning) = load_oui_db_or_warning(&path);
+
+        let _ = std::fs::remove_file(&path);
+        assert!(db.is_empty());
+        let warning = warning.expect("invalid OUI DB should produce a warning");
+        assert!(warning.contains("failed to load OUI DB"));
+        assert!(warning.contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn missing_oui_db_falls_back_without_warning() {
+        let path = std::env::temp_dir().join(format!(
+            "fing-missing-oui-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let (db, warning) = load_oui_db_or_warning(&path);
+
+        assert!(db.is_empty());
+        assert!(warning.is_none());
     }
 
     #[test]
@@ -1467,6 +1621,86 @@ mod tests {
         let merged = merge_devices_by_interface_ip(vec![left, right]);
 
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn dhcp_lease_does_not_create_unobserved_device() {
+        let mut devices = BTreeMap::new();
+        let lease = dhcp::DhcpLease {
+            ip: "192.168.1.44".parse().unwrap(),
+            mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+            hostname: Some("stale-host".to_string()),
+            client_id: None,
+            vendor_class: None,
+            expires_at: None,
+            source: None,
+        };
+
+        assert!(observed_device_for_dhcp_lease(&mut devices, &lease).is_none());
+        assert!(devices.is_empty());
+    }
+
+    #[test]
+    fn dhcp_lease_can_enrich_observed_device_by_mac() {
+        let now = Utc::now();
+        let mut devices = BTreeMap::new();
+        let mut observed = Device::new("192.168.1.44".parse().unwrap(), now);
+        observed.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+        devices.insert(observed.ip, observed);
+        let lease = dhcp::DhcpLease {
+            ip: "192.168.1.88".parse().unwrap(),
+            mac: Some("AA-BB-CC-DD-EE-FF".to_string()),
+            hostname: Some("observed-host".to_string()),
+            client_id: None,
+            vendor_class: None,
+            expires_at: None,
+            source: None,
+        };
+
+        let device = observed_device_for_dhcp_lease(&mut devices, &lease)
+            .expect("lease should match the observed MAC");
+
+        assert_eq!(device.ip.to_string(), "192.168.1.44");
+    }
+
+    #[test]
+    fn dhcp_lease_same_ip_is_rejected_when_mac_conflicts() {
+        let now = Utc::now();
+        let mut devices = BTreeMap::new();
+        let mut observed = Device::new("192.168.1.44".parse().unwrap(), now);
+        observed.mac = Some("00:11:22:33:44:55".to_string());
+        devices.insert(observed.ip, observed);
+        let lease = dhcp::DhcpLease {
+            ip: "192.168.1.44".parse().unwrap(),
+            mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+            hostname: Some("stale-host".to_string()),
+            client_id: None,
+            vendor_class: None,
+            expires_at: None,
+            source: None,
+        };
+
+        assert!(observed_device_for_dhcp_lease(&mut devices, &lease).is_none());
+    }
+
+    #[test]
+    fn dhcp_lease_without_mac_is_rejected_for_mac_observed_device() {
+        let now = Utc::now();
+        let mut devices = BTreeMap::new();
+        let mut observed = Device::new("192.168.1.44".parse().unwrap(), now);
+        observed.mac = Some("00:11:22:33:44:55".to_string());
+        devices.insert(observed.ip, observed);
+        let lease = dhcp::DhcpLease {
+            ip: "192.168.1.44".parse().unwrap(),
+            mac: None,
+            hostname: Some("unverified-host".to_string()),
+            client_id: None,
+            vendor_class: None,
+            expires_at: None,
+            source: None,
+        };
+
+        assert!(observed_device_for_dhcp_lease(&mut devices, &lease).is_none());
     }
 
     #[test]
@@ -1557,7 +1791,34 @@ mod tests {
     }
 
     #[test]
-    fn continuous_passive_duplicate_observation_does_not_emit_unchanged_update() {
+    fn continuous_passive_replaces_same_ip_when_scan_mac_changes() {
+        let mut manager = passive_manager();
+        let ip = "192.168.1.44".parse().unwrap();
+        let first_seen = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let later_seen = Utc.with_ymd_and_hms(2026, 1, 1, 0, 5, 0).unwrap();
+
+        let mut first = Device::new(ip, first_seen);
+        first.interface = Some("en0".to_string());
+        first.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+        first.add_name("old-host.local", "mdns", 0.9);
+        let _ = manager.observe_scan_event(ScanEvent::DeviceUpdated(Box::new(first)));
+
+        let mut replacement = Device::new(ip, later_seen);
+        replacement.interface = Some("en0".to_string());
+        replacement.mac = Some("00:11:22:33:44:55".to_string());
+        let event = manager.observe_scan_event(ScanEvent::DeviceUpdated(Box::new(replacement)));
+        let ScanEvent::DeviceUpdated(device) = event else {
+            panic!("expected device update");
+        };
+
+        assert_eq!(device.mac.as_deref(), Some("00:11:22:33:44:55"));
+        assert!(device.hostname.is_none());
+        assert_eq!(device.first_seen, later_seen);
+        assert_eq!(device.last_seen, later_seen);
+    }
+
+    #[test]
+    fn continuous_passive_duplicate_observation_refreshes_last_seen() {
         let mut manager = passive_manager();
         let advertisement = discovery::l2::L2Advertisement::Lldp(discovery::lldp::LldpInfo {
             source_mac: "aa:bb:cc:dd:ee:ff".to_string(),
@@ -1574,12 +1835,18 @@ mod tests {
             enabled_capabilities: vec!["bridge".to_string()],
             management_addresses: vec!["192.168.1.2".parse().unwrap()],
         });
+        let first_seen = Utc::now();
+        let later_seen = first_seen + chrono::Duration::seconds(5);
 
-        let first = manager.apply_passive_update(passive_update(advertisement.clone()));
-        let second = manager.apply_passive_update(passive_update(advertisement));
+        let first =
+            manager.apply_passive_update(passive_update_at(advertisement.clone(), first_seen));
+        let second = manager.apply_passive_update(passive_update_at(advertisement, later_seen));
 
         assert_eq!(first.len(), 1);
-        assert!(second.is_empty());
+        let [ScanEvent::DeviceUpdated(device)] = second.as_slice() else {
+            panic!("expected refreshed device update");
+        };
+        assert_eq!(device.last_seen, later_seen);
     }
 
     #[test]
@@ -1629,10 +1896,16 @@ mod tests {
         );
     }
 
-    fn passive_update(advertisement: discovery::l2::L2Advertisement) -> ContinuousPassiveUpdate {
+    fn passive_update_at(
+        advertisement: discovery::l2::L2Advertisement,
+        received_at: DateTime<Utc>,
+    ) -> ContinuousPassiveUpdate {
         ContinuousPassiveUpdate::Observation {
             interface: "en0".to_string(),
-            observation: Box::new(PassiveObservation::from_advertisement(advertisement)),
+            observation: Box::new(PassiveObservation::from_advertisement_at(
+                advertisement,
+                received_at,
+            )),
         }
     }
 
@@ -1651,6 +1924,7 @@ mod tests {
             states,
             rules: identity_rules::RuleDb::default(),
             oui_db: HashMap::new(),
+            startup_warnings: Vec::new(),
         }
     }
 }

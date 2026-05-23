@@ -6,12 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::HashMap,
-    net::{IpAddr, SocketAddr, TcpStream as StdTcpStream},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, io::Read, net::IpAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -54,6 +49,19 @@ pub struct TlsCertificate {
     pub not_after: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProbeOptions {
+    pub deep: bool,
+    pub http: bool,
+    pub tls: bool,
+}
+
+impl ProbeOptions {
+    pub fn any(self) -> bool {
+        self.deep || self.http || self.tls
+    }
+}
+
 const PORTS: &[(u16, &str)] = &[
     (21, "ftp"),
     (22, "ssh"),
@@ -69,6 +77,7 @@ const PORTS: &[(u16, &str)] = &[
     (8080, "http-proxy"),
     (9100, "printer"),
 ];
+const MAX_FAVICON_BYTES: usize = 256 * 1024;
 
 // Deep probing stays deliberately narrow: only ports already useful for device
 // identity are touched, and only for hosts discovered by ARP/mDNS/UPnP/etc. This
@@ -76,26 +85,29 @@ const PORTS: &[(u16, &str)] = &[
 // broad port scanner or vulnerability probe.
 pub async fn probe_hosts_with_callback<F>(
     ips: Vec<IpAddr>,
+    local_addr: IpAddr,
     timeout: Duration,
-    concurrency: usize,
+    limiter: Arc<Semaphore>,
+    options: ProbeOptions,
     mut on_probe: F,
 ) -> HashMap<IpAddr, Vec<PortProbe>>
 where
     F: FnMut(IpAddr, PortProbe),
 {
-    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut tasks = JoinSet::new();
 
     for ip in ips {
-        for (port, service) in PORTS {
-            let semaphore = Arc::clone(&semaphore);
-            let service = (*service).to_string();
-            let port = *port;
+        for &(port, service) in PORTS {
+            if !probe_source_enabled(service, options) {
+                continue;
+            }
+            let limiter = Arc::clone(&limiter);
+            let service = service.to_string();
             tasks.spawn(async move {
-                let Ok(_permit) = semaphore.acquire_owned().await else {
+                let Ok(_permit) = limiter.acquire_owned().await else {
                     return None;
                 };
-                probe_port(ip, port, service, timeout)
+                probe_port(ip, local_addr, port, service, timeout, options)
                     .await
                     .map(|probe| (ip, probe))
             });
@@ -118,17 +130,16 @@ where
 
 async fn probe_port(
     ip: IpAddr,
+    local_addr: IpAddr,
     port: u16,
     service: String,
     timeout: Duration,
+    options: ProbeOptions,
 ) -> Option<PortProbe> {
     // A successful TCP connect is enough to record the service. Protocol-specific
     // reads below enrich the row when they succeed, but failure to read a banner
     // should not discard the open-port signal.
-    let mut stream = tokio::time::timeout(timeout, TcpStream::connect((ip, port)))
-        .await
-        .ok()?
-        .ok()?;
+    let mut stream = super::connect_tcp_from(local_addr, ip, port, timeout).await?;
 
     let mut probe = PortProbe {
         port,
@@ -140,15 +151,15 @@ async fn probe_port(
     };
 
     match service.as_str() {
-        "http" | "http-alt" | "http-proxy" | "upnp-http" => {
+        "http" | "http-alt" | "http-proxy" | "upnp-http" if options.deep || options.http => {
             // HTTP metadata often contains product strings even when a device
             // has no mDNS/UPnP name. Capture headers and favicon hashes as
             // evidence for rules, but do not classify directly here.
-            if let Some(web) = web_probe(ip, port, false, timeout).await {
+            if let Some(web) = web_probe(ip, local_addr, port, false, timeout, options.http).await {
                 probe.banner = web.banner;
                 probe.http_headers = web.headers;
                 probe.favicon = web.favicon;
-            } else {
+            } else if options.deep {
                 probe.banner = http_banner(&mut stream, ip, timeout).await;
             }
         }
@@ -156,20 +167,44 @@ async fn probe_port(
             // TLS subjects/issuers are useful for appliance UIs and embedded
             // web servers. Invalid/self-signed certs are accepted because local
             // devices commonly use them; the hash is the fingerprint.
-            if let Some(web) = web_probe(ip, port, true, timeout).await {
+            if (options.deep || options.http)
+                && let Some(web) =
+                    web_probe(ip, local_addr, port, true, timeout, options.http).await
+            {
                 probe.banner = web.banner;
                 probe.http_headers = web.headers;
                 probe.favicon = web.favicon;
             }
-            probe.tls = tls_certificate_probe(ip, port, timeout).await;
+            if options.tls {
+                probe.tls = tls_certificate_probe(ip, local_addr, port, timeout).await;
+            }
         }
-        "ssh" | "ftp" | "telnet" => {
+        "ssh" | "ftp" | "telnet" if options.deep => {
             probe.banner = passive_banner(&mut stream, timeout).await;
         }
         _ => {}
     }
 
-    Some(probe)
+    probe_has_enabled_evidence(&probe, options).then_some(probe)
+}
+
+fn probe_source_enabled(service: &str, options: ProbeOptions) -> bool {
+    options.deep
+        || (options.http && web_probe_service(service))
+        || (options.tls && service == "https")
+}
+
+fn web_probe_service(service: &str) -> bool {
+    matches!(
+        service,
+        "http" | "http-alt" | "http-proxy" | "upnp-http" | "https"
+    )
+}
+
+fn probe_has_enabled_evidence(probe: &PortProbe, options: ProbeOptions) -> bool {
+    options.deep
+        || (options.http && (!probe.http_headers.is_empty() || probe.favicon.is_some()))
+        || (options.tls && probe.tls.is_some())
 }
 
 async fn http_banner(stream: &mut TcpStream, ip: IpAddr, timeout: Duration) -> Option<String> {
@@ -219,21 +254,42 @@ struct WebProbe {
     favicon: Option<FaviconFingerprint>,
 }
 
-async fn web_probe(ip: IpAddr, port: u16, https: bool, timeout: Duration) -> Option<WebProbe> {
-    tokio::task::spawn_blocking(move || blocking_web_probe(ip, port, https, timeout))
-        .await
-        .ok()
-        .flatten()
+async fn web_probe(
+    ip: IpAddr,
+    local_addr: IpAddr,
+    port: u16,
+    https: bool,
+    timeout: Duration,
+    fetch_favicon: bool,
+) -> Option<WebProbe> {
+    tokio::task::spawn_blocking(move || {
+        blocking_web_probe(ip, local_addr, port, https, timeout, fetch_favicon)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
-fn blocking_web_probe(ip: IpAddr, port: u16, https: bool, timeout: Duration) -> Option<WebProbe> {
+fn blocking_web_probe(
+    ip: IpAddr,
+    local_addr: IpAddr,
+    port: u16,
+    https: bool,
+    timeout: Duration,
+    fetch_favicon: bool,
+) -> Option<WebProbe> {
+    if !super::same_ip_family(local_addr, ip) {
+        return None;
+    }
+
     // reqwest's blocking client handles redirects and invalid local certs more
     // robustly than a hand-rolled HTTP parser. It is isolated on the blocking
     // pool by the async wrapper.
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
+        .local_address(local_addr)
         .danger_accept_invalid_certs(true)
-        .redirect(reqwest::redirect::Policy::limited(2))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()?;
     let scheme = if https { "https" } else { "http" };
@@ -243,20 +299,16 @@ fn blocking_web_probe(ip: IpAddr, port: u16, https: bool, timeout: Duration) -> 
     let mut headers = interesting_headers(response.headers());
     let banner = http_banner_from_response(response.status().as_u16(), &headers);
 
-    let favicon = client
-        .get(format!("{base_url}/favicon.ico"))
-        .send()
-        .ok()
-        .filter(|response| response.status().is_success())
-        .and_then(|response| response.bytes().ok())
-        // Favicons are fingerprints, not payloads. Cap size to avoid retaining
-        // arbitrary web content from misconfigured local devices.
-        .filter(|bytes| !bytes.is_empty() && bytes.len() <= 256 * 1024)
-        .map(|bytes| FaviconFingerprint {
-            url: format!("{base_url}/favicon.ico"),
-            sha256: hex::encode(Sha256::digest(&bytes)),
-            bytes: bytes.len(),
-        });
+    let favicon = if fetch_favicon {
+        let favicon_url = format!("{base_url}/favicon.ico");
+        client
+            .get(&favicon_url)
+            .send()
+            .ok()
+            .and_then(|response| favicon_fingerprint_from_response(response, favicon_url))
+    } else {
+        None
+    };
 
     headers.truncate(16);
     Some(WebProbe {
@@ -266,19 +318,64 @@ fn blocking_web_probe(ip: IpAddr, port: u16, https: bool, timeout: Duration) -> 
     })
 }
 
-async fn tls_certificate_probe(ip: IpAddr, port: u16, timeout: Duration) -> Option<TlsCertificate> {
-    tokio::task::spawn_blocking(move || blocking_tls_certificate_probe(ip, port, timeout))
-        .await
-        .ok()
-        .flatten()
+fn favicon_fingerprint_from_response(
+    response: reqwest::blocking::Response,
+    url: String,
+) -> Option<FaviconFingerprint> {
+    if !response.status().is_success() {
+        return None;
+    }
+    let content_length = response.content_length();
+    favicon_fingerprint_from_reader(response, url, content_length)
+}
+
+fn favicon_fingerprint_from_reader(
+    reader: impl Read,
+    url: String,
+    content_length: Option<u64>,
+) -> Option<FaviconFingerprint> {
+    // Favicons are fingerprints, not payloads. Reject known-oversized bodies
+    // before reading, and cap unknown-size reads to MAX_FAVICON_BYTES + 1 so a
+    // misconfigured local device cannot force an unbounded allocation here.
+    if content_length.is_some_and(|len| len > MAX_FAVICON_BYTES as u64) {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+    let mut limited = reader.take(MAX_FAVICON_BYTES as u64 + 1);
+    limited.read_to_end(&mut bytes).ok()?;
+    if bytes.is_empty() || bytes.len() > MAX_FAVICON_BYTES {
+        return None;
+    }
+
+    Some(FaviconFingerprint {
+        url,
+        sha256: hex::encode(Sha256::digest(&bytes)),
+        bytes: bytes.len(),
+    })
+}
+
+async fn tls_certificate_probe(
+    ip: IpAddr,
+    local_addr: IpAddr,
+    port: u16,
+    timeout: Duration,
+) -> Option<TlsCertificate> {
+    tokio::task::spawn_blocking(move || {
+        blocking_tls_certificate_probe(ip, local_addr, port, timeout)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn blocking_tls_certificate_probe(
     ip: IpAddr,
+    local_addr: IpAddr,
     port: u16,
     timeout: Duration,
 ) -> Option<TlsCertificate> {
-    let stream = StdTcpStream::connect_timeout(&SocketAddr::new(ip, port), timeout).ok()?;
+    let stream = super::connect_blocking_tcp_from(local_addr, ip, port, timeout)?;
     stream.set_read_timeout(Some(timeout)).ok()?;
     stream.set_write_timeout(Some(timeout)).ok()?;
     let connector = native_tls::TlsConnector::builder()
@@ -394,6 +491,13 @@ pub fn device_type_hint_from_port(port: u16) -> Option<(&'static str, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::Write as _,
+        net::{Ipv4Addr, TcpListener},
+        sync::mpsc,
+        thread,
+        time::{Duration as StdDuration, Instant},
+    };
 
     #[test]
     fn extracts_http_server_header() {
@@ -438,5 +542,112 @@ mod tests {
 
         assert!(banner.contains("HTTP 200"));
         assert!(banner.contains("server: nginx"));
+    }
+
+    #[test]
+    fn web_probe_does_not_follow_redirects() {
+        let redirect_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        redirect_listener.set_nonblocking(true).unwrap();
+        let redirect_port = redirect_listener.local_addr().unwrap().port();
+        let (hit_tx, hit_rx) = mpsc::channel();
+        let redirect_target = thread::spawn(move || {
+            let deadline = Instant::now() + StdDuration::from_millis(400);
+            while Instant::now() < deadline {
+                match redirect_listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+                        let _ = hit_tx.send(());
+                        return;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(StdDuration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let redirect_url = format!("http://127.0.0.1:{redirect_port}/outside");
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + StdDuration::from_secs(2);
+            let mut handled = 0;
+            while handled < 2 && Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(StdDuration::from_millis(10));
+                    continue;
+                };
+                let mut request = [0_u8; 1024];
+                let len = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..len]);
+                let response = if request.starts_with("HEAD ") {
+                    format!(
+                        "HTTP/1.1 302 Found\r\n\
+                         Location: {redirect_url}\r\n\
+                         Server: redirector\r\n\
+                         Content-Length: 0\r\n\
+                         \r\n"
+                    )
+                } else {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string()
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+                handled += 1;
+            }
+        });
+
+        let probe = blocking_web_probe(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+            false,
+            Duration::from_millis(500),
+            true,
+        )
+        .unwrap();
+
+        server.join().unwrap();
+        redirect_target.join().unwrap();
+
+        assert!(hit_rx.try_recv().is_err());
+        assert!(
+            probe.banner.as_deref().is_some_and(|banner| {
+                banner.contains("HTTP 302") && banner.contains("location:")
+            })
+        );
+    }
+
+    #[test]
+    fn favicon_fingerprint_rejects_large_content_length_without_reading() {
+        struct PanicReader;
+
+        impl std::io::Read for PanicReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("oversized favicon should be rejected before reading")
+            }
+        }
+
+        let fingerprint = favicon_fingerprint_from_reader(
+            PanicReader,
+            "http://192.168.1.1/favicon.ico".to_string(),
+            Some(MAX_FAVICON_BYTES as u64 + 1),
+        );
+
+        assert!(fingerprint.is_none());
+    }
+
+    #[test]
+    fn favicon_fingerprint_rejects_unknown_size_body_above_limit() {
+        let body = vec![b'a'; MAX_FAVICON_BYTES + 1];
+        let fingerprint = favicon_fingerprint_from_reader(
+            std::io::Cursor::new(body),
+            "http://192.168.1.1/favicon.ico".to_string(),
+            None,
+        );
+
+        assert!(fingerprint.is_none());
     }
 }

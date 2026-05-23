@@ -22,8 +22,6 @@ pub(super) const SOURCE_LEGEND: &[(&str, &str)] = &[
     ("S", "SNMP"),
     ("H", "HTTP"),
     ("T", "TLS"),
-    ("I", "ICMP"),
-    ("P", "TCP"),
     ("K", "Cache"),
 ];
 
@@ -70,15 +68,19 @@ fn collect_device_sources(device: &Device) -> Vec<String> {
         .filter(|source| *source != "identity_rule")
         .map(str::to_string)
         .collect::<Vec<_>>();
-    if device.mac.is_some() {
-        sources.push("arp".to_string());
-    }
-    if device.vendor.is_some() {
+    if device.vendor.is_some() && !vendor_was_filled_from_cache(device) {
         sources.push("oui".to_string());
     }
     sources.sort();
     sources.dedup();
     sources
+}
+
+fn vendor_was_filled_from_cache(device: &Device) -> bool {
+    device
+        .evidence
+        .iter()
+        .any(|evidence| evidence.source == "cache" && evidence.key == "vendor")
 }
 
 fn source_code(source: &str) -> char {
@@ -98,8 +100,6 @@ fn source_code(source: &str) -> char {
         "tls" => 'T',
         "smb" => 'B',
         "snmp" => 'S',
-        "icmp" => 'I',
-        "tcp" => 'P',
         "cache" => 'K',
         other => other
             .chars()
@@ -120,11 +120,34 @@ mod tests {
         let mut device = Device::new("192.168.1.10".parse().unwrap(), now);
         device.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
         device.vendor = Some("Example Inc".to_string());
+        device.add_evidence("arp", "mac", "aa:bb:cc:dd:ee:ff", 0.5);
         device.set_device_type_guess("smart-home", "identity_rule", 0.68);
         device.add_evidence("identity_rule", "rule", "example-device", 0.68);
 
         assert_eq!(source_summary(&device), "arp,oui");
         assert_eq!(compact_source_summary(&device), "AO");
+    }
+
+    #[test]
+    fn source_summary_marks_cached_vendor_as_cache() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut device = Device::new("192.168.1.10".parse().unwrap(), now);
+        device.vendor = Some("Example Inc".to_string());
+        device.add_evidence("cache", "vendor", "Example Inc", 0.55);
+
+        assert_eq!(source_summary(&device), "cache");
+        assert_eq!(compact_source_summary(&device), "K");
+    }
+
+    #[test]
+    fn mac_without_arp_evidence_is_not_reported_as_arp() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut device = Device::new("192.168.1.10".parse().unwrap(), now);
+        device.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+        device.add_evidence("dhcp", "mac", "aa:bb:cc:dd:ee:ff", 0.55);
+
+        assert_eq!(source_summary(&device), "dhcp");
+        assert_eq!(compact_source_summary(&device), "C");
     }
 
     #[test]
@@ -134,10 +157,22 @@ mod tests {
         device.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
         device.vendor = Some("Example Inc".to_string());
         device.add_name("host.local", "mdns", 0.9);
+        device.add_evidence("arp", "mac", "aa:bb:cc:dd:ee:ff", 0.5);
         device.add_evidence("deep", "port", "443", 0.55);
         device.add_evidence("local", "hostname", "host", 0.95);
 
         assert_eq!(source_summary(&device), "arp,deep,local,mdns,oui");
         assert_eq!(compact_source_summary(&device), "ADLMO");
+    }
+
+    #[test]
+    fn source_legend_omits_unemitted_transport_sources() {
+        let labels = SOURCE_LEGEND
+            .iter()
+            .map(|(_, label)| *label)
+            .collect::<Vec<_>>();
+
+        assert!(!labels.contains(&"ICMP"));
+        assert!(!labels.contains(&"TCP"));
     }
 }

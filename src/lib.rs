@@ -15,3 +15,4 @@ mod output;
 mod probes;
 mod scanner;
 mod store;
+mod version;

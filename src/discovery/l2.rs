@@ -76,6 +76,51 @@ where
     F: FnMut(&L2Advertisement),
     ShouldStop: FnMut() -> bool,
 {
+    listen_until_inner(
+        iface,
+        protocols,
+        &mut should_stop,
+        &mut on_advertisement,
+        DuplicatePolicy::FirstOnly,
+    )
+}
+
+pub fn listen_until_repeating<F, ShouldStop>(
+    iface: &InterfaceInfo,
+    protocols: L2Protocols,
+    mut should_stop: ShouldStop,
+    mut on_advertisement: F,
+) -> Result<L2Advertisements>
+where
+    F: FnMut(&L2Advertisement),
+    ShouldStop: FnMut() -> bool,
+{
+    listen_until_inner(
+        iface,
+        protocols,
+        &mut should_stop,
+        &mut on_advertisement,
+        DuplicatePolicy::EmitRepeats,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DuplicatePolicy {
+    FirstOnly,
+    EmitRepeats,
+}
+
+fn listen_until_inner<F, ShouldStop>(
+    iface: &InterfaceInfo,
+    protocols: L2Protocols,
+    should_stop: &mut ShouldStop,
+    on_advertisement: &mut F,
+    duplicate_policy: DuplicatePolicy,
+) -> Result<L2Advertisements>
+where
+    F: FnMut(&L2Advertisement),
+    ShouldStop: FnMut() -> bool,
+{
     if !protocols.any() {
         return Ok(L2Advertisements::default());
     }
@@ -106,7 +151,14 @@ where
             continue;
         };
 
-        if let Some(advertisement) = demux_frame(packet, protocols, &mut lldp_keys, &mut cdp_keys) {
+        let advertisement = match duplicate_policy {
+            DuplicatePolicy::FirstOnly => {
+                demux_frame(packet, protocols, &mut lldp_keys, &mut cdp_keys)
+            }
+            DuplicatePolicy::EmitRepeats => demux_frame_repeating(packet, protocols),
+        };
+
+        if let Some(advertisement) = advertisement {
             on_advertisement(&advertisement);
             match advertisement {
                 L2Advertisement::Lldp(info) => result.lldp.push(info),
@@ -124,16 +176,24 @@ fn demux_frame(
     lldp_keys: &mut BTreeSet<String>,
     cdp_keys: &mut BTreeSet<String>,
 ) -> Option<L2Advertisement> {
+    let advertisement = demux_frame_repeating(packet, protocols)?;
+    match &advertisement {
+        L2Advertisement::Lldp(info) if !lldp_keys.insert(info.identity_key()) => return None,
+        L2Advertisement::Cdp(info) if !cdp_keys.insert(info.identity_key()) => return None,
+        _ => {}
+    }
+    Some(advertisement)
+}
+
+fn demux_frame_repeating(packet: &[u8], protocols: L2Protocols) -> Option<L2Advertisement> {
     if protocols.lldp
         && let Some(info) = lldp::parse_lldp_frame(packet)
-        && lldp_keys.insert(info.identity_key())
     {
         return Some(L2Advertisement::Lldp(info));
     }
 
     if protocols.cdp
         && let Some(info) = cdp::parse_cdp_frame(packet)
-        && cdp_keys.insert(info.identity_key())
     {
         return Some(L2Advertisement::Cdp(info));
     }
@@ -161,6 +221,23 @@ mod tests {
         ));
         assert!(demux_frame(&lldp_frame(), protocols, &mut lldp_keys, &mut cdp_keys).is_none());
         assert!(demux_frame(&cdp_frame(), protocols, &mut lldp_keys, &mut cdp_keys).is_none());
+    }
+
+    #[test]
+    fn repeating_l2_demux_emits_duplicate_advertisements() {
+        let protocols = L2Protocols {
+            lldp: true,
+            cdp: false,
+        };
+
+        assert!(matches!(
+            demux_frame_repeating(&lldp_frame(), protocols),
+            Some(L2Advertisement::Lldp(_))
+        ));
+        assert!(matches!(
+            demux_frame_repeating(&lldp_frame(), protocols),
+            Some(L2Advertisement::Lldp(_))
+        ));
     }
 
     #[test]

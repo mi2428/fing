@@ -472,6 +472,12 @@ dist-smoke: ## Smoke-test Linux dist binaries in a Debian container
 			-w /workspace \
 			$(LINUX_SMOKE_IMAGE) \
 			"/workspace/$$binary" --version >/dev/null; \
+		$(DOCKER) run --rm \
+			--platform "$$platform" \
+			-v "$(CURDIR):/workspace:ro" \
+			-w /workspace \
+			$(LINUX_SMOKE_IMAGE) \
+			"/workspace/$$binary" oui update --help >/dev/null; \
 	done
 
 .PHONY: checksums

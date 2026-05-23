@@ -74,49 +74,62 @@ pub(super) fn apply_upnp_info(device: &mut Device, info: upnp::UpnpInfo) {
     }
 }
 
-pub(super) fn apply_deep_probes(device: &mut Device, probes: Vec<deep::PortProbe>) {
+pub(super) fn apply_deep_probes(
+    device: &mut Device,
+    probes: Vec<deep::PortProbe>,
+    options: deep::ProbeOptions,
+) {
     for probe in probes {
-        // An open port is weak identity by itself, but it is still useful as a
-        // service signal and as input to built-in identity rules.
-        device.add_service(probe.service.clone(), "deep", Some(probe.port), 0.7);
-        if let Some((device_type, confidence)) = deep::device_type_hint_from_port(probe.port) {
-            device.set_device_type_guess(device_type, "deep", confidence);
-        }
-        if probe.port == 445 || probe.port == 139 {
-            device.set_os_guess("Windows/SMB capable", "deep", 0.45);
-        }
-        if let Some(banner) = probe.banner {
-            device.add_evidence(
-                "deep",
-                &format!("{}_banner", probe.service),
-                banner.clone(),
-                0.75,
-            );
-            if let Some(server) = deep::http_server_from_banner(&banner) {
-                device.add_evidence("deep", "http_server", server, 0.7);
+        if options.deep {
+            // An open port is weak identity by itself, but it is still useful as
+            // a service signal and as input to built-in identity rules.
+            device.add_service(probe.service.clone(), "deep", Some(probe.port), 0.7);
+            if let Some((device_type, confidence)) = deep::device_type_hint_from_port(probe.port) {
+                device.set_device_type_guess(device_type, "deep", confidence);
             }
-            if let Some((os, confidence)) = deep::os_hint_from_banner(&probe.service, &banner) {
-                device.set_os_guess(os, "deep", confidence);
+            if probe.port == 445 || probe.port == 139 {
+                device.set_os_guess("Windows/SMB capable", "deep", 0.45);
             }
-        }
-        for header in probe.http_headers {
-            // HTTP headers get their own source because they often outlive the
-            // generic TCP probe in exports and rule matching.
-            let key = deep::header_evidence_key(&header.name);
-            device.add_evidence("http", &key, header.value.clone(), 0.75);
-            if header.name == "server" {
-                device.add_evidence("http", "http_server", header.value.clone(), 0.75);
-                if let Some((os, confidence)) = deep::os_hint_from_banner("http", &header.value) {
-                    device.set_os_guess(os, "http", confidence);
+            if let Some(banner) = &probe.banner {
+                device.add_evidence(
+                    "deep",
+                    &format!("{}_banner", probe.service),
+                    banner.clone(),
+                    0.75,
+                );
+                if let Some(server) = deep::http_server_from_banner(banner) {
+                    device.add_evidence("deep", "http_server", server, 0.7);
+                }
+                if let Some((os, confidence)) = deep::os_hint_from_banner(&probe.service, banner) {
+                    device.set_os_guess(os, "deep", confidence);
                 }
             }
         }
-        if let Some(favicon) = probe.favicon {
-            device.add_evidence("http", "favicon_sha256", favicon.sha256, 0.72);
-            device.add_evidence("http", "favicon_url", favicon.url, 0.55);
-            device.add_evidence("http", "favicon_bytes", favicon.bytes.to_string(), 0.5);
+
+        if options.http {
+            // HTTP headers get their own source because they often outlive the
+            // generic TCP probe in exports and rule matching.
+            for header in probe.http_headers {
+                let key = deep::header_evidence_key(&header.name);
+                device.add_evidence("http", &key, header.value.clone(), 0.75);
+                if header.name == "server" {
+                    device.add_evidence("http", "http_server", header.value.clone(), 0.75);
+                    if let Some((os, confidence)) = deep::os_hint_from_banner("http", &header.value)
+                    {
+                        device.set_os_guess(os, "http", confidence);
+                    }
+                }
+            }
+            if let Some(favicon) = probe.favicon {
+                device.add_evidence("http", "favicon_sha256", favicon.sha256, 0.72);
+                device.add_evidence("http", "favicon_url", favicon.url, 0.55);
+                device.add_evidence("http", "favicon_bytes", favicon.bytes.to_string(), 0.5);
+            }
         }
-        if let Some(tls) = probe.tls {
+
+        if options.tls
+            && let Some(tls) = probe.tls
+        {
             device.add_evidence("tls", "tls_cert_sha256", tls.sha256, 0.72);
             if let Some(subject) = tls.subject {
                 device.add_evidence("tls", "tls_subject", subject, 0.7);
@@ -138,16 +151,18 @@ pub(super) fn apply_dhcp_lease(
 ) {
     // DHCP is passive and sometimes stale. It can fill missing MAC/vendor/name
     // fields, but it must not replace direct ARP or protocol evidence.
-    if let Some(mac) = lease.mac {
+    let lease_mac = lease.mac;
+    if let Some(mac) = lease_mac.as_ref() {
         if device.mac.is_none() {
             device.mac = Some(mac.clone());
         }
-        if device.vendor.is_none()
-            && let Some(oui_db) = oui_db
-        {
-            device.vendor = enrich::lookup_vendor(&mac, oui_db);
-        }
-        device.add_evidence("dhcp", "mac", mac, 0.55);
+        device.add_evidence("dhcp", "mac", mac.clone(), 0.55);
+    }
+    let vendor_mac = device.mac.as_deref().or(lease_mac.as_deref());
+    if device.vendor.is_none()
+        && let (Some(mac), Some(oui_db)) = (vendor_mac, oui_db)
+    {
+        device.vendor = enrich::lookup_vendor(mac, oui_db);
     }
     if let Some(hostname) = lease.hostname {
         device.add_name(hostname, "dhcp", 0.72);
@@ -566,6 +581,11 @@ mod tests {
                     not_after: Some("2028-01-01".to_string()),
                 }),
             }],
+            deep::ProbeOptions {
+                deep: true,
+                http: true,
+                tls: true,
+            },
         );
         apply_snmp_info(
             &mut device,
@@ -616,6 +636,52 @@ mod tests {
                 .iter()
                 .any(|service| service.source == "smb" && service.port == Some(445))
         );
+    }
+
+    #[test]
+    fn deep_probe_application_respects_source_options() {
+        let mut device = device();
+
+        apply_deep_probes(
+            &mut device,
+            vec![deep::PortProbe {
+                port: 443,
+                service: "https".to_string(),
+                banner: Some("HTTP 200 | server: OpenWrt".to_string()),
+                http_headers: vec![deep::HttpHeader {
+                    name: "server".to_string(),
+                    value: "uhttpd".to_string(),
+                }],
+                favicon: None,
+                tls: Some(deep::TlsCertificate {
+                    sha256: "def456".to_string(),
+                    subject: None,
+                    issuer: None,
+                    not_before: None,
+                    not_after: None,
+                }),
+            }],
+            deep::ProbeOptions {
+                deep: false,
+                http: true,
+                tls: false,
+            },
+        );
+
+        assert!(
+            !device
+                .services
+                .iter()
+                .any(|service| service.source == "deep")
+        );
+        assert!(!device.evidence.iter().any(|item| item.source == "deep"));
+        assert!(has_evidence(
+            &device,
+            "http",
+            "http_header_server",
+            "uhttpd"
+        ));
+        assert!(!device.evidence.iter().any(|item| item.source == "tls"));
     }
 
     #[test]
@@ -716,11 +782,14 @@ mod tests {
     }
 
     #[test]
-    fn dhcp_lease_fills_missing_identity_without_replacing_existing_mac() {
+    fn dhcp_lease_does_not_use_conflicting_mac_for_vendor() {
         let mut device = device();
         device.mac = Some("00:11:22:33:44:55".to_string());
         let ip = device.ip;
-        let oui_db = HashMap::from([("AABBCC".to_string(), "Example Vendor".to_string())]);
+        let oui_db = HashMap::from([
+            ("AABBCC".to_string(), "Lease Vendor".to_string()),
+            ("001122".to_string(), "Observed Vendor".to_string()),
+        ]);
 
         apply_dhcp_lease(
             &mut device,
@@ -730,13 +799,14 @@ mod tests {
                 hostname: Some("workstation".to_string()),
                 client_id: Some("client-1".to_string()),
                 vendor_class: Some("MSFT 5.0".to_string()),
+                expires_at: None,
                 source: Some("/tmp/leases".into()),
             },
             Some(&oui_db),
         );
 
         assert_eq!(device.mac.as_deref(), Some("00:11:22:33:44:55"));
-        assert_eq!(device.vendor.as_deref(), Some("Example Vendor"));
+        assert_eq!(device.vendor.as_deref(), Some("Observed Vendor"));
         assert_eq!(device.hostname.as_deref(), Some("workstation"));
         assert!(has_evidence(&device, "dhcp", "mac", "aa:bb:cc:dd:ee:ff"));
         assert!(has_evidence(&device, "dhcp", "vendor_class", "MSFT 5.0"));

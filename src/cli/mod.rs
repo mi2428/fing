@@ -6,7 +6,7 @@
 use crate::{
     enrich, net, output,
     scanner::{self, ScanConfig, ScanProfile},
-    store,
+    store, version,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -15,7 +15,9 @@ use std::{io::IsTerminal, path::PathBuf, time::Duration};
 #[derive(Debug, Parser)]
 #[command(name = "fing")]
 #[command(version)]
+#[command(long_version = version::LONG_VERSION)]
 #[command(about = "Generic Fing - scan local IPv4 networks and enrich device identities")]
+#[command(propagate_version = true)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -63,6 +65,10 @@ enum FingerprintSourceArg {
     Mdns,
     Netbios,
     Upnp,
+    Deep,
+    Http,
+    Tls,
+    Smb,
     Snmp,
     Lldp,
     Cdp,
@@ -76,6 +82,10 @@ struct FingerprintSelection {
     mdns: bool,
     netbios: bool,
     upnp: bool,
+    deep: bool,
+    http: bool,
+    tls: bool,
+    smb: bool,
     snmp: bool,
     lldp: bool,
     cdp: bool,
@@ -91,6 +101,10 @@ impl FingerprintSelection {
                 mdns: true,
                 netbios: true,
                 upnp: true,
+                deep: profile.includes_deep_probes(),
+                http: profile.includes_deep_probes(),
+                tls: profile.includes_deep_probes(),
+                smb: profile.includes_deep_probes(),
                 snmp: true,
                 lldp: profile.includes_lldp_fingerprints(),
                 cdp: profile.includes_cdp_fingerprints(),
@@ -104,6 +118,10 @@ impl FingerprintSelection {
             mdns: sources.contains(&FingerprintSourceArg::Mdns),
             netbios: sources.contains(&FingerprintSourceArg::Netbios),
             upnp: sources.contains(&FingerprintSourceArg::Upnp),
+            deep: sources.contains(&FingerprintSourceArg::Deep),
+            http: sources.contains(&FingerprintSourceArg::Http),
+            tls: sources.contains(&FingerprintSourceArg::Tls),
+            smb: sources.contains(&FingerprintSourceArg::Smb),
             snmp: sources.contains(&FingerprintSourceArg::Snmp),
             lldp: sources.contains(&FingerprintSourceArg::Lldp),
             cdp: sources.contains(&FingerprintSourceArg::Cdp),
@@ -332,6 +350,10 @@ fn scan_configs_from_args(args: &ScanArgs, timeout: Duration) -> Result<Vec<Scan
                     mdns: fingerprints.mdns,
                     netbios: fingerprints.netbios,
                     upnp: fingerprints.upnp,
+                    deep: fingerprints.deep,
+                    http: fingerprints.http,
+                    tls: fingerprints.tls,
+                    smb: fingerprints.smb,
                     snmp: fingerprints.snmp,
                     snmp_community: args.snmp_community.clone(),
                     lldp: fingerprints.lldp,
@@ -462,6 +484,38 @@ mod tests {
     }
 
     #[test]
+    fn version_flags_split_short_and_long_output() {
+        let short = Cli::try_parse_from(["fing", "-V"]).unwrap_err();
+        let long = Cli::try_parse_from(["fing", "--version"]).unwrap_err();
+
+        assert_eq!(short.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(long.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            short.to_string(),
+            format!("fing {}\n", env!("CARGO_PKG_VERSION"))
+        );
+
+        let long = long.to_string();
+        assert!(long.starts_with(&format!("fing {} (git ", env!("CARGO_PKG_VERSION"))));
+        assert!(long.contains("; commit "));
+        assert!(long.contains("; commit date "));
+        assert!(long.contains("; built "));
+        assert!(long.contains(") on "));
+        assert_ne!(long, short.to_string());
+    }
+
+    #[test]
+    fn version_flags_propagate_to_subcommands() {
+        let short = Cli::try_parse_from(["fing", "scan", "-V"]).unwrap_err();
+
+        assert_eq!(short.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            short.to_string(),
+            format!("fing-scan {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
     fn builds_configs_for_every_interface_range_pair() {
         let mut args = scan_args();
         args.interfaces = vec!["en0".to_string(), "en0.100".to_string()];
@@ -517,6 +571,10 @@ mod tests {
         assert!(configs[0].mdns);
         assert!(configs[0].netbios);
         assert!(configs[0].upnp);
+        assert!(!configs[0].deep);
+        assert!(!configs[0].http);
+        assert!(!configs[0].tls);
+        assert!(!configs[0].smb);
         assert!(configs[0].snmp);
         assert!(!configs[0].lldp);
         assert!(!configs[0].cdp);
@@ -524,12 +582,16 @@ mod tests {
     }
 
     #[test]
-    fn deep_scan_enables_l2_neighbor_protocols_by_default() {
+    fn deep_scan_enables_deep_and_l2_sources_by_default() {
         let mut args = scan_args();
         args.profile = ScanProfile::Deep;
 
         let configs = scan_configs_from_args(&args, Duration::from_millis(1)).unwrap();
 
+        assert!(configs[0].deep);
+        assert!(configs[0].http);
+        assert!(configs[0].tls);
+        assert!(configs[0].smb);
         assert!(configs[0].lldp);
         assert!(configs[0].cdp);
     }
@@ -650,10 +712,43 @@ mod tests {
         assert!(configs[0].mdns);
         assert!(!configs[0].netbios);
         assert!(!configs[0].upnp);
+        assert!(!configs[0].deep);
+        assert!(!configs[0].http);
+        assert!(!configs[0].tls);
+        assert!(!configs[0].smb);
         assert!(configs[0].snmp);
         assert!(configs[0].lldp);
         assert!(configs[0].cdp);
         assert!(configs[0].dhcp);
+    }
+
+    #[test]
+    fn fingerprint_allowlist_can_enable_deep_http_tls_and_smb_independently() {
+        let cli = Cli::try_parse_from([
+            "fing",
+            "scan",
+            "--scan.profile",
+            "deep",
+            "--fingerprint.source",
+            "oui,http,tls,smb",
+            "en0",
+        ])
+        .unwrap();
+
+        let Commands::Scan(args) = cli.command else {
+            panic!("expected scan command");
+        };
+
+        let configs = scan_configs_from_args(&args, Duration::from_millis(1)).unwrap();
+        assert!(configs[0].oui);
+        assert!(!configs[0].deep);
+        assert!(configs[0].http);
+        assert!(configs[0].tls);
+        assert!(configs[0].smb);
+        assert!(!configs[0].snmp);
+        assert!(!configs[0].lldp);
+        assert!(!configs[0].cdp);
+        assert!(!configs[0].dhcp);
     }
 
     #[test]

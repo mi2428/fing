@@ -79,17 +79,6 @@ pub fn observations_for_device(device: &Device) -> Vec<Observation> {
     // This keeps the identity-rule engine simple across protocols:
     // "model contains BRAVIA" can match UPnP or mDNS without needing
     // protocol-specific Rust code.
-    if let Some(mac) = &device.mac {
-        push(&mut observations, "arp", "mac", mac, 0.5);
-        let prefix = mac
-            .chars()
-            .filter(|ch| ch.is_ascii_hexdigit())
-            .take(6)
-            .collect::<String>();
-        if prefix.len() == 6 {
-            push(&mut observations, "arp", "mac_oui", prefix, 0.5);
-        }
-    }
     if let Some(vendor) = &device.vendor {
         push(&mut observations, "oui", "vendor", vendor, 0.55);
     }
@@ -385,13 +374,20 @@ mod tests {
     fn observations_include_names_services_and_evidence() {
         let now = Utc::now();
         let mut device = Device::new("192.168.1.10".parse().unwrap(), now);
+        device.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
         device.vendor = Some("Nintendo Co.,Ltd".to_string());
         device.add_name("switch", "mdns", 0.9);
         device.add_service("http", "deep", Some(80), 0.7);
+        device.add_evidence("arp", "mac", "aa:bb:cc:dd:ee:ff", 0.5);
         device.add_evidence("http", "http_header_server", "uhttpd", 0.8);
 
         let observations = observations_for_device(&device);
 
+        assert!(
+            observations
+                .iter()
+                .any(|item| item.source == "arp" && item.key == "mac")
+        );
         assert!(observations.iter().any(|item| item.key == "vendor"));
         assert!(observations.iter().any(|item| item.key == "name"));
         assert!(observations.iter().any(|item| item.value == "80"));
@@ -399,6 +395,21 @@ mod tests {
             observations
                 .iter()
                 .any(|item| item.key == "http_header_server")
+        );
+    }
+
+    #[test]
+    fn mac_without_arp_evidence_is_not_an_arp_observation() {
+        let now = Utc::now();
+        let mut device = Device::new("192.168.1.10".parse().unwrap(), now);
+        device.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+
+        let observations = observations_for_device(&device);
+
+        assert!(
+            observations
+                .iter()
+                .all(|item| item.source != "arp" && item.key != "mac_oui")
         );
     }
 

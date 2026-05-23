@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::Semaphore,
     task::JoinSet,
@@ -33,25 +33,29 @@ pub struct NtlmHostInfo {
     pub dns_domain_name: Option<String>,
 }
 
+const MAX_SMB_RESPONSE_BYTES: usize = 128 * 1024;
+
 pub async fn probe_hosts_with_callback<F>(
     ips: Vec<IpAddr>,
+    local_addr: IpAddr,
     timeout: Duration,
-    concurrency: usize,
+    limiter: Arc<Semaphore>,
     mut on_result: F,
 ) -> HashMap<IpAddr, SmbInfo>
 where
     F: FnMut(IpAddr, SmbInfo),
 {
-    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut tasks = JoinSet::new();
 
     for ip in ips {
-        let semaphore = Arc::clone(&semaphore);
+        let limiter = Arc::clone(&limiter);
         tasks.spawn(async move {
-            let Ok(_permit) = semaphore.acquire_owned().await else {
+            let Ok(_permit) = limiter.acquire_owned().await else {
                 return None;
             };
-            probe_one(ip, timeout).await.map(|info| (ip, info))
+            probe_one(ip, local_addr, timeout)
+                .await
+                .map(|info| (ip, info))
         });
     }
 
@@ -65,27 +69,20 @@ where
     result
 }
 
-async fn probe_one(ip: IpAddr, timeout: Duration) -> Option<SmbInfo> {
+async fn probe_one(ip: IpAddr, local_addr: IpAddr, timeout: Duration) -> Option<SmbInfo> {
     // The negotiate request is a low-impact identity probe: it stops before
     // authentication and records protocol metadata rather than enumerating
     // shares. That is enough to separate Windows, Samba, NAS, and embedded SMB
     // stacks when combined with vendor/name evidence.
-    let mut stream = tokio::time::timeout(timeout, TcpStream::connect((ip, 445)))
-        .await
-        .ok()?
-        .ok()?;
+    let mut stream = super::connect_tcp_from(local_addr, ip, 445, timeout).await?;
     let request = smb2_negotiate_request();
     tokio::time::timeout(timeout, stream.write_all(&request))
         .await
         .ok()?
         .ok()?;
 
-    let mut buffer = [0_u8; 4096];
-    let len = tokio::time::timeout(timeout, stream.read(&mut buffer))
-        .await
-        .ok()?
-        .ok()?;
-    let mut info = parse_smb2_negotiate_response(&buffer[..len])?;
+    let packet = read_netbios_session_packet(&mut stream, timeout, MAX_SMB_RESPONSE_BYTES).await?;
+    let mut info = parse_smb2_negotiate_response(&packet)?;
     if let Some(host_info) = smb2_ntlm_hostname_probe(&mut stream, timeout).await {
         info.netbios_computer_name = host_info.netbios_computer_name;
         info.dns_computer_name = host_info.dns_computer_name;
@@ -150,14 +147,15 @@ pub fn parse_smb2_negotiate_response(buf: &[u8]) -> Option<SmbInfo> {
     let guid = body.get(8..24).map(hex_guid);
     let security_offset = read_u16_le(body, 56).unwrap_or(0) as usize;
     let security_len = read_u16_le(body, 58).unwrap_or(0) as usize;
-    let security_blob = if security_offset >= start
-        && security_offset + security_len <= buf.len()
-        && security_len > 0
-    {
-        &buf[security_offset..security_offset + security_len]
-    } else {
-        &[]
-    };
+    let security_blob = start
+        .checked_add(security_offset)
+        .and_then(|security_start| {
+            security_start
+                .checked_add(security_len)
+                .and_then(|security_end| buf.get(security_start..security_end))
+        })
+        .filter(|_| security_len > 0)
+        .unwrap_or(&[]);
     // Some servers leak native OS/LANMAN strings in the security blob. Treat
     // them as hints only; the NTLM challenge below gives cleaner host names.
     let ascii = ascii_tokens(security_blob);
@@ -192,12 +190,40 @@ async fn smb2_ntlm_hostname_probe(
         .ok()?
         .ok()?;
 
-    let mut buffer = [0_u8; 8192];
-    let len = tokio::time::timeout(timeout, stream.read(&mut buffer))
-        .await
-        .ok()?
-        .ok()?;
-    parse_smb2_session_setup_ntlm_host_info(&buffer[..len])
+    let packet = read_netbios_session_packet(stream, timeout, MAX_SMB_RESPONSE_BYTES).await?;
+    parse_smb2_session_setup_ntlm_host_info(&packet)
+}
+
+async fn read_netbios_session_packet<R>(
+    stream: &mut R,
+    timeout: Duration,
+    max_payload_len: usize,
+) -> Option<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    tokio::time::timeout(timeout, async {
+        loop {
+            let mut header = [0_u8; 4];
+            stream.read_exact(&mut header).await.ok()?;
+            let payload_len = netbios_session_payload_len(header);
+            if header[0] == 0x85 && payload_len == 0 {
+                continue;
+            }
+            if header[0] != 0 || payload_len == 0 || payload_len > max_payload_len {
+                return None;
+            }
+
+            let mut packet = Vec::with_capacity(4 + payload_len);
+            packet.extend_from_slice(&header);
+            packet.resize(4 + payload_len, 0);
+            stream.read_exact(&mut packet[4..]).await.ok()?;
+            return Some(packet);
+        }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 pub fn smb2_session_setup_request() -> Vec<u8> {
@@ -312,6 +338,10 @@ fn smb2_start(buf: &[u8]) -> Option<usize> {
         return Some(4);
     }
     None
+}
+
+fn netbios_session_payload_len(header: [u8; 4]) -> usize {
+    ((header[1] as usize) << 16) | ((header[2] as usize) << 8) | header[3] as usize
 }
 
 fn dialect_name(dialect: u16) -> &'static str {
@@ -512,30 +542,38 @@ mod tests {
 
     #[test]
     fn parses_smb2_negotiate_response() {
-        let mut packet = vec![0, 0, 0, 0];
-        packet.extend_from_slice(&smb2_header());
-        let body_start = packet.len();
-        packet.resize(body_start + 64, 0);
-        packet[body_start..body_start + 2].copy_from_slice(&65_u16.to_le_bytes());
-        packet[body_start + 2..body_start + 4].copy_from_slice(&2_u16.to_le_bytes());
-        packet[body_start + 4..body_start + 6].copy_from_slice(&0x0311_u16.to_le_bytes());
-        packet[body_start + 8..body_start + 24].copy_from_slice(&[1_u8; 16]);
-        let security = b"Windows Server\x00";
-        let security_offset = packet.len() as u16;
-        packet.extend_from_slice(security);
-        packet[body_start + 56..body_start + 58].copy_from_slice(&security_offset.to_le_bytes());
-        packet[body_start + 58..body_start + 60]
-            .copy_from_slice(&(security.len() as u16).to_le_bytes());
-        let len = (packet.len() - 4) as u32;
-        packet[1] = ((len >> 16) & 0xff) as u8;
-        packet[2] = ((len >> 8) & 0xff) as u8;
-        packet[3] = (len & 0xff) as u8;
+        let packet = smb2_negotiate_response_packet();
 
         let parsed = parse_smb2_negotiate_response(&packet).unwrap();
 
         assert_eq!(parsed.dialect.as_deref(), Some("SMB 3.1.1"));
         assert_eq!(parsed.signing_required, Some(true));
         assert_eq!(parsed.native_os.as_deref(), Some("Windows Server"));
+    }
+
+    #[tokio::test]
+    async fn reads_netbios_session_packet_across_fragmented_writes() {
+        let packet = smb2_negotiate_response_packet();
+        let expected = packet.clone();
+        let (mut client, mut server) = tokio::io::duplex(8);
+        let writer = tokio::spawn(async move {
+            for chunk in packet.chunks(3) {
+                server.write_all(chunk).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let read = read_netbios_session_packet(
+            &mut client,
+            Duration::from_secs(1),
+            MAX_SMB_RESPONSE_BYTES,
+        )
+        .await
+        .unwrap();
+        writer.await.unwrap();
+
+        assert_eq!(read, expected);
+        assert!(parse_smb2_negotiate_response(&read).is_some());
     }
 
     #[test]
@@ -626,5 +664,24 @@ mod tests {
 
     fn utf16le(value: &str) -> Vec<u8> {
         value.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    fn smb2_negotiate_response_packet() -> Vec<u8> {
+        let mut packet = vec![0, 0, 0, 0];
+        packet.extend_from_slice(&smb2_header());
+        let body_start = packet.len();
+        packet.resize(body_start + 64, 0);
+        packet[body_start..body_start + 2].copy_from_slice(&65_u16.to_le_bytes());
+        packet[body_start + 2..body_start + 4].copy_from_slice(&2_u16.to_le_bytes());
+        packet[body_start + 4..body_start + 6].copy_from_slice(&0x0311_u16.to_le_bytes());
+        packet[body_start + 8..body_start + 24].copy_from_slice(&[1_u8; 16]);
+        let security = b"Windows Server\x00";
+        let security_offset = (64 + 64) as u16;
+        packet.extend_from_slice(security);
+        packet[body_start + 56..body_start + 58].copy_from_slice(&security_offset.to_le_bytes());
+        packet[body_start + 58..body_start + 60]
+            .copy_from_slice(&(security.len() as u16).to_le_bytes());
+        set_netbios_len(&mut packet);
+        packet
     }
 }

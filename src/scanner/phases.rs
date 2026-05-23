@@ -17,9 +17,13 @@ use ipnet::Ipv4Net;
 use std::{
     collections::{BTreeMap, HashMap},
     net::{IpAddr, Ipv4Addr},
+    sync::Arc,
     time::Duration,
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::{
+    Semaphore,
+    mpsc::{UnboundedReceiver, UnboundedSender},
+};
 
 pub(super) type MdnsRun = Result<BTreeMap<IpAddr, enrich::MdnsInfo>>;
 pub(super) type UpnpRun = Result<BTreeMap<IpAddr, upnp::UpnpInfo>>;
@@ -53,7 +57,7 @@ const DEEP_LLDP_LISTEN_TIMEOUT: Duration = Duration::from_secs(30);
 const CDP_LISTEN_TIMEOUT: Duration = Duration::from_secs(65);
 
 fn lldp_listen_timeout(config: &ScanConfig) -> Duration {
-    if config.profile.includes_lldp_fingerprints() {
+    if config.lldp {
         config.timeout.max(DEEP_LLDP_LISTEN_TIMEOUT)
     } else {
         config.timeout
@@ -92,6 +96,7 @@ pub(super) async fn forward_child_events(
                     ScanEvent::Phase(format!("{interface}: scanning {target}")),
                 );
             }
+            ScanEvent::RoundStarted { .. } | ScanEvent::RoundFinished { .. } => {}
             ScanEvent::Phase(phase) => {
                 emit(
                     &events,
@@ -208,8 +213,10 @@ pub(super) async fn run_multicast_enrichment(
 
 pub(super) async fn run_name_enrichment(
     config: &ScanConfig,
+    interface_ip: Ipv4Addr,
     ips: Vec<IpAddr>,
     events: &Option<UnboundedSender<ScanEvent>>,
+    limiter: Arc<Semaphore>,
     mut on_update: impl FnMut(NameUpdate),
 ) -> (Option<RdnsRun>, Option<NetbiosRun>) {
     if config.rdns {
@@ -231,13 +238,15 @@ pub(super) async fn run_name_enrichment(
     // and stream whichever answers first instead of waiting for both maps.
     let rdns_ips = ips.clone();
     let netbios_ips = ips;
+    let rdns_limiter = Arc::clone(&limiter);
+    let netbios_limiter = Arc::clone(&limiter);
     let rdns = async {
         if config.rdns {
             Some(
                 enrich::reverse_dns_with_callback(
                     rdns_ips,
                     config.timeout,
-                    config.concurrency,
+                    rdns_limiter,
                     move |ip, name| {
                         let _ = rdns_tx.send(NameUpdate::Rdns(ip, name));
                     },
@@ -253,8 +262,9 @@ pub(super) async fn run_name_enrichment(
             Some(
                 enrich::netbios_probe_with_callback(
                     netbios_ips,
+                    interface_ip,
                     config.timeout,
-                    config.concurrency,
+                    netbios_limiter,
                     move |ip, names| {
                         let _ = netbios_tx.send(NameUpdate::Netbios(ip, names));
                     },
@@ -283,15 +293,25 @@ pub(super) async fn run_name_enrichment(
 
 pub(super) async fn run_deep_and_snmp_enrichment(
     config: &ScanConfig,
+    interface_ip: Ipv4Addr,
     ips: Vec<IpAddr>,
     events: &Option<UnboundedSender<ScanEvent>>,
+    limiter: Arc<Semaphore>,
     mut on_update: impl FnMut(ProbeUpdate),
 ) -> (Option<DeepRun>, Option<SnmpRun>) {
-    if config.profile.includes_deep_probes() {
+    let probe_options = deep::ProbeOptions {
+        deep: config.deep,
+        http: config.http,
+        tls: config.tls,
+    };
+
+    if probe_options.deep {
         emit(
             events,
             ScanEvent::Phase("deep port/banner enrichment".to_string()),
         );
+    } else if probe_options.http || probe_options.tls {
+        emit(events, ScanEvent::Phase("HTTP/TLS enrichment".to_string()));
     }
     if config.snmp {
         emit(
@@ -310,13 +330,17 @@ pub(super) async fn run_deep_and_snmp_enrichment(
     // of "probe" updates while each collector owns its concurrency limits.
     let deep_ips = ips.clone();
     let snmp_ips = ips;
+    let deep_limiter = Arc::clone(&limiter);
+    let snmp_limiter = Arc::clone(&limiter);
     let deep = async {
-        if config.profile.includes_deep_probes() {
+        if probe_options.any() {
             Some(
                 deep::probe_hosts_with_callback(
                     deep_ips,
+                    IpAddr::V4(interface_ip),
                     config.timeout,
-                    config.concurrency,
+                    deep_limiter,
+                    probe_options,
                     move |ip, probe| {
                         let _ = deep_tx.send(ProbeUpdate::Deep(ip, probe));
                     },
@@ -332,9 +356,10 @@ pub(super) async fn run_deep_and_snmp_enrichment(
             Some(
                 snmp::probe_system_with_callback(
                     snmp_ips,
+                    IpAddr::V4(interface_ip),
                     config.snmp_community.clone(),
                     config.timeout,
-                    config.concurrency,
+                    snmp_limiter,
                     move |ip, info| {
                         let _ = snmp_tx.send(ProbeUpdate::Snmp(ip, info));
                     },
@@ -396,15 +421,22 @@ async fn run_upnp(
     timeout: Duration,
     updates: tokio::sync::mpsc::UnboundedSender<MulticastUpdate>,
 ) -> Result<BTreeMap<IpAddr, upnp::UpnpInfo>> {
+    let allowed_target = target;
     let callback_target = target;
     // UPnP discovery can optionally fetch HTTP description XML, so it also runs
     // off the async executor. The callback still preserves progressive updates.
     let upnp = tokio::task::spawn_blocking(move || {
-        upnp::ssdp_probe_with_callback(interface_ip, timeout, true, move |ip, info| {
-            if target_contains_ip(callback_target, ip) {
-                let _ = updates.send(MulticastUpdate::Upnp(ip, info));
-            }
-        })
+        upnp::ssdp_probe_with_callback(
+            interface_ip,
+            timeout,
+            true,
+            move |ip| target_contains_ip(allowed_target, ip),
+            move |ip, info| {
+                if target_contains_ip(callback_target, ip) {
+                    let _ = updates.send(MulticastUpdate::Upnp(ip, info));
+                }
+            },
+        )
     })
     .await
     .context("UPnP worker failed")??;
@@ -466,6 +498,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explicit_lldp_uses_minimum_listen_window() {
+        let mut config = scan_config();
+        config.profile = ScanProfile::Normal;
+        config.lldp = true;
+        config.timeout = Duration::from_millis(500);
+
+        assert_eq!(lldp_listen_timeout(&config), DEEP_LLDP_LISTEN_TIMEOUT);
+
+        config.lldp = false;
+        assert_eq!(lldp_listen_timeout(&config), Duration::from_millis(500));
+    }
+
     #[tokio::test]
     async fn child_events_are_forwarded_as_parent_phase_stream() {
         let (child_tx, child_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -524,7 +569,18 @@ mod tests {
 
     #[test]
     fn scan_target_summary_deduplicates_configured_ranges() {
-        let mut config = ScanConfig {
+        let mut config = scan_config();
+        let same = config.clone();
+        config.target = Some("10.0.0.0/24".to_string());
+
+        assert_eq!(
+            scan_target_summary(&[same, config]),
+            "192.168.1.0/24,10.0.0.0/24"
+        );
+    }
+
+    fn scan_config() -> ScanConfig {
+        ScanConfig {
             target: Some("192.168.1.0/24".to_string()),
             iface: Some("en0".to_string()),
             profile: ScanProfile::Normal,
@@ -535,6 +591,10 @@ mod tests {
             mdns: false,
             netbios: false,
             upnp: false,
+            deep: false,
+            http: false,
+            tls: false,
+            smb: false,
             snmp: false,
             snmp_community: "public".to_string(),
             lldp: false,
@@ -544,13 +604,6 @@ mod tests {
             cache_enabled: false,
             cache_path: "cache.json".into(),
             oui_path: "oui.json".into(),
-        };
-        let same = config.clone();
-        config.target = Some("10.0.0.0/24".to_string());
-
-        assert_eq!(
-            scan_target_summary(&[same, config]),
-            "192.168.1.0/24,10.0.0.0/24"
-        );
+        }
     }
 }

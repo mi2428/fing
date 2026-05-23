@@ -4,18 +4,20 @@
 //! description XML adds friendly names, manufacturer, model, and device type.
 //! The scanner later decides how strongly to trust those facts.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use quick_xml::{Reader, events::Event};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
     collections::{HashMap, HashSet},
+    io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket},
     time::{Duration, Instant},
 };
 
 const SSDP_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const SSDP_PORT: u16 = 1900;
+const MAX_UPNP_DESCRIPTION_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpnpInfo {
@@ -44,14 +46,16 @@ pub struct UpnpDescription {
     pub services: Vec<String>,
 }
 
-pub fn ssdp_probe_with_callback<F>(
+pub fn ssdp_probe_with_callback<F, AllowSource>(
     interface_ip: Ipv4Addr,
     timeout: Duration,
     fetch_descriptions: bool,
+    mut allow_source: AllowSource,
     mut on_result: F,
 ) -> Result<HashMap<IpAddr, UpnpInfo>>
 where
     F: FnMut(IpAddr, UpnpInfo),
+    AllowSource: FnMut(IpAddr) -> bool,
 {
     let socket = ssdp_socket(interface_ip)?;
     let request = ssdp_request();
@@ -66,7 +70,7 @@ where
     let deadline = Instant::now() + timeout;
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::limited(3))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to build UPnP HTTP client")?;
 
@@ -81,20 +85,16 @@ where
                 let Some(response) = parse_ssdp_response(&buffer[..len]) else {
                     continue;
                 };
-                let info = responses.entry(source_ip).or_default();
-                merge_ssdp_headers(info, &response.headers);
-                on_result(source_ip, info.clone());
-
-                // Fetch each LOCATION once per scan. Several SSDP responses from
-                // the same device often point at the same XML description.
-                if fetch_descriptions
-                    && let Some(location) = info.location.clone()
-                    && fetched_locations.insert(location.clone())
-                    && let Ok(description) = fetch_description(&client, &location)
-                {
-                    merge_description(info, description);
-                    on_result(source_ip, info.clone());
-                }
+                let mut fetcher = |location: &str| fetch_description(&client, location);
+                let mut context = SsdpResponseContext {
+                    fetch_descriptions,
+                    allow_source: &mut allow_source,
+                    fetched_locations: &mut fetched_locations,
+                    responses: &mut responses,
+                    fetch_description: &mut fetcher,
+                    on_result: &mut on_result,
+                };
+                apply_ssdp_response(source_ip, response, &mut context);
             }
             Err(err)
                 if err.kind() == std::io::ErrorKind::WouldBlock
@@ -104,6 +104,45 @@ where
     }
 
     Ok(responses)
+}
+
+struct SsdpResponseContext<'a, F, AllowSource, FetchDescription> {
+    fetch_descriptions: bool,
+    allow_source: &'a mut AllowSource,
+    fetched_locations: &'a mut HashSet<String>,
+    responses: &'a mut HashMap<IpAddr, UpnpInfo>,
+    fetch_description: &'a mut FetchDescription,
+    on_result: &'a mut F,
+}
+
+fn apply_ssdp_response<F, AllowSource, FetchDescription>(
+    source_ip: IpAddr,
+    response: SsdpResponse,
+    context: &mut SsdpResponseContext<'_, F, AllowSource, FetchDescription>,
+) where
+    F: FnMut(IpAddr, UpnpInfo),
+    AllowSource: FnMut(IpAddr) -> bool,
+    FetchDescription: FnMut(&str) -> Result<UpnpDescription>,
+{
+    if !(context.allow_source)(source_ip) {
+        return;
+    }
+
+    let info = context.responses.entry(source_ip).or_default();
+    merge_ssdp_headers(info, &response.headers);
+    (context.on_result)(source_ip, info.clone());
+
+    // Fetch each LOCATION once per scan. Several SSDP responses from the same
+    // device often point at the same XML description.
+    if context.fetch_descriptions
+        && let Some(location) = info.location.clone()
+        && description_location_allowed(&location, source_ip)
+        && context.fetched_locations.insert(location.clone())
+        && let Ok(description) = (context.fetch_description)(&location)
+    {
+        merge_description(info, description);
+        (context.on_result)(source_ip, info.clone());
+    }
 }
 
 fn ssdp_socket(interface_ip: Ipv4Addr) -> Result<UdpSocket> {
@@ -174,10 +213,50 @@ fn fetch_description(
         .get(location)
         .send()
         .with_context(|| format!("failed to fetch UPnP description from {location}"))?;
-    let text = response
-        .text()
-        .with_context(|| format!("failed to read UPnP description from {location}"))?;
+    if !response.status().is_success() {
+        bail!(
+            "UPnP description fetch from {location} failed with status {}",
+            response.status()
+        );
+    }
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_UPNP_DESCRIPTION_BYTES as u64)
+    {
+        bail!("UPnP description from {location} exceeded {MAX_UPNP_DESCRIPTION_BYTES} bytes");
+    }
+
+    let text = read_limited_description_body(response, location)?;
     parse_upnp_description(&text)
+}
+
+fn description_location_allowed(location: &str, source_ip: IpAddr) -> bool {
+    let Ok(url) = reqwest::Url::parse(location) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+
+    url.host_str()
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .is_some_and(|host_ip| host_ip == source_ip)
+}
+
+fn read_limited_description_body(reader: impl Read, location: &str) -> Result<String> {
+    let mut bytes = Vec::new();
+    let mut limited = reader.take(MAX_UPNP_DESCRIPTION_BYTES as u64 + 1);
+    limited
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read UPnP description from {location}"))?;
+    if bytes.len() > MAX_UPNP_DESCRIPTION_BYTES {
+        bail!("UPnP description from {location} exceeded {MAX_UPNP_DESCRIPTION_BYTES} bytes");
+    }
+
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 pub fn parse_upnp_description(xml: &str) -> Result<UpnpDescription> {
@@ -187,12 +266,16 @@ pub fn parse_upnp_description(xml: &str) -> Result<UpnpDescription> {
     reader.config_mut().trim_text(true);
 
     let mut current = String::new();
+    let mut device_depth = 0_usize;
     let mut description = UpnpDescription::default();
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(event)) => {
                 current = String::from_utf8_lossy(event.name().as_ref()).to_string();
+                if current == "device" {
+                    device_depth += 1;
+                }
             }
             Ok(Event::Text(event)) => {
                 let text = event.decode()?.trim().to_string();
@@ -200,16 +283,26 @@ pub fn parse_upnp_description(xml: &str) -> Result<UpnpDescription> {
                     continue;
                 }
                 match current.as_str() {
-                    "friendlyName" => description.friendly_name = Some(text),
-                    "manufacturer" => description.manufacturer = Some(text),
-                    "modelName" => description.model_name = Some(text),
-                    "modelDescription" => description.model_description = Some(text),
-                    "deviceType" => description.device_type = Some(text),
-                    "serviceType" => push_unique(&mut description.services, text),
+                    "friendlyName" if device_depth == 1 => description.friendly_name = Some(text),
+                    "manufacturer" if device_depth == 1 => description.manufacturer = Some(text),
+                    "modelName" if device_depth == 1 => description.model_name = Some(text),
+                    "modelDescription" if device_depth == 1 => {
+                        description.model_description = Some(text);
+                    }
+                    "deviceType" if device_depth == 1 => description.device_type = Some(text),
+                    "serviceType" if device_depth > 0 => {
+                        push_unique(&mut description.services, text)
+                    }
                     _ => {}
                 }
             }
-            Ok(Event::End(_)) => current.clear(),
+            Ok(Event::End(event)) => {
+                let ended = String::from_utf8_lossy(event.name().as_ref()).to_string();
+                if ended == "device" {
+                    device_depth = device_depth.saturating_sub(1);
+                }
+                current.clear();
+            }
             Ok(Event::Eof) => break,
             Err(err) => return Err(err).context("failed to parse UPnP description XML"),
             _ => {}
@@ -260,6 +353,7 @@ pub fn friendly_device_type(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn parses_ssdp_headers_case_insensitively() {
@@ -274,6 +368,83 @@ mod tests {
             parsed.headers.get("server").map(String::as_str),
             Some("Linux UPnP/1.0")
         );
+    }
+
+    #[test]
+    fn scoped_ssdp_response_ignores_disallowed_source_before_callbacks_or_fetches() {
+        let source = "192.168.1.2".parse().unwrap();
+        let response = SsdpResponse {
+            headers: HashMap::from([
+                (
+                    "location".to_string(),
+                    "http://192.168.1.2/root.xml".to_string(),
+                ),
+                ("server".to_string(), "Linux UPnP/1.0".to_string()),
+            ]),
+        };
+        let mut fetched_locations = HashSet::new();
+        let mut responses = HashMap::new();
+        let mut allow_source = |_| false;
+        let mut fetch_description = |_: &str| -> Result<UpnpDescription> {
+            panic!("disallowed SSDP source must not fetch descriptions")
+        };
+        let mut callback =
+            |_: IpAddr, _: UpnpInfo| panic!("disallowed SSDP source must not emit results");
+
+        let mut context = SsdpResponseContext {
+            fetch_descriptions: true,
+            allow_source: &mut allow_source,
+            fetched_locations: &mut fetched_locations,
+            responses: &mut responses,
+            fetch_description: &mut fetch_description,
+            on_result: &mut callback,
+        };
+
+        apply_ssdp_response(source, response, &mut context);
+
+        assert!(responses.is_empty());
+        assert!(fetched_locations.is_empty());
+    }
+
+    #[test]
+    fn description_location_must_match_source_ip() {
+        let source = "192.168.1.1".parse().unwrap();
+
+        assert!(description_location_allowed(
+            "http://192.168.1.1/root.xml",
+            source
+        ));
+        assert!(description_location_allowed(
+            "https://192.168.1.1/root.xml",
+            source
+        ));
+        assert!(!description_location_allowed(
+            "http://192.168.1.2/root.xml",
+            source
+        ));
+        assert!(!description_location_allowed(
+            "http://example.com/root.xml",
+            source
+        ));
+        assert!(!description_location_allowed(
+            "file:///tmp/root.xml",
+            source
+        ));
+        assert!(!description_location_allowed(
+            "http://user@192.168.1.1/root.xml",
+            source
+        ));
+    }
+
+    #[test]
+    fn upnp_description_body_has_a_size_limit() {
+        let oversized = vec![b'a'; MAX_UPNP_DESCRIPTION_BYTES + 1];
+        let err =
+            read_limited_description_body(Cursor::new(oversized), "http://192.168.1.1/root.xml")
+                .unwrap_err()
+                .to_string();
+
+        assert!(err.contains("exceeded"));
     }
 
     #[test]
@@ -297,6 +468,50 @@ mod tests {
         assert_eq!(description.manufacturer.as_deref(), Some("Sony"));
         assert_eq!(description.model_name.as_deref(), Some("BRAVIA"));
         assert_eq!(description.services.len(), 1);
+    }
+
+    #[test]
+    fn upnp_description_keeps_root_device_identity_over_embedded_devices() {
+        let xml = r#"
+            <root>
+              <device>
+                <deviceType>urn:schemas-upnp-org:device:InternetGatewayDevice:1</deviceType>
+                <friendlyName>Home Gateway</friendlyName>
+                <manufacturer>Example Networks</manufacturer>
+                <modelName>Gateway 9000</modelName>
+                <serviceList>
+                  <service><serviceType>urn:schemas-upnp-org:service:Layer3Forwarding:1</serviceType></service>
+                </serviceList>
+                <deviceList>
+                  <device>
+                    <deviceType>urn:schemas-upnp-org:device:WANDevice:1</deviceType>
+                    <friendlyName>WAN Device</friendlyName>
+                    <manufacturer>Wrong Vendor</manufacturer>
+                    <modelName>Wrong Model</modelName>
+                    <serviceList>
+                      <service><serviceType>urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1</serviceType></service>
+                    </serviceList>
+                  </device>
+                </deviceList>
+              </device>
+            </root>
+        "#;
+
+        let description = parse_upnp_description(xml).unwrap();
+
+        assert_eq!(description.friendly_name.as_deref(), Some("Home Gateway"));
+        assert_eq!(
+            description.manufacturer.as_deref(),
+            Some("Example Networks")
+        );
+        assert_eq!(description.model_name.as_deref(), Some("Gateway 9000"));
+        assert_eq!(
+            description.device_type.as_deref(),
+            Some("urn:schemas-upnp-org:device:InternetGatewayDevice:1")
+        );
+        assert!(description.services.iter().any(|service| {
+            service == "urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1"
+        }));
     }
 
     #[test]

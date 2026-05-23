@@ -6,21 +6,33 @@
 //! scanner/apply and identity-rule layers.
 
 use anyhow::{Context, Result, anyhow, bail};
+use hickory_resolver::{
+    TokioResolver,
+    lookup::Lookup,
+    proto::rr::{Name, RData},
+};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
+    io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{sync::Semaphore, task::JoinSet};
 
 const IEEE_OUI_CSV: &str = "https://standards-oui.ieee.org/oui/oui.csv";
+const IEEE_OUI_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_IEEE_OUI_CSV_BYTES: usize = 32 * 1024 * 1024;
 const MDNS_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const MDNS_PORT: u16 = 5353;
+static NEXT_NETBIOS_TRANSACTION_ID: AtomicU16 = AtomicU16::new(0x4000);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MdnsInfo {
@@ -68,19 +80,115 @@ pub fn default_cache_dir() -> PathBuf {
 }
 
 pub fn update_oui_db(path: &Path) -> Result<usize> {
-    let response = reqwest::blocking::get(IEEE_OUI_CSV)
+    let client = oui_download_client()?;
+    let response = client
+        .get(IEEE_OUI_CSV)
+        .send()
         .with_context(|| format!("failed to download {IEEE_OUI_CSV}"))?;
     if !response.status().is_success() {
         bail!("OUI download failed with status {}", response.status());
     }
-    let text = response.text().context("failed to read OUI CSV body")?;
+    let content_length = response.content_length();
+    let text = read_limited_oui_csv_body(response, IEEE_OUI_CSV, content_length)?;
     let db = parse_ieee_oui_csv(&text)?;
 
+    write_oui_db_atomic(path, &db)?;
+    Ok(db.len())
+}
+
+fn oui_download_client() -> Result<reqwest::blocking::Client> {
+    let bundled_roots = bundled_tls_root_certificates()?;
+    reqwest::blocking::Client::builder()
+        .timeout(IEEE_OUI_DOWNLOAD_TIMEOUT)
+        .tls_certs_merge(bundled_roots)
+        .build()
+        .context("failed to build OUI download client")
+}
+
+fn bundled_tls_root_certificates() -> Result<Vec<reqwest::Certificate>> {
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .map(|cert| {
+            reqwest::Certificate::from_der(cert.as_ref())
+                .context("failed to load bundled TLS root certificate")
+        })
+        .collect()
+}
+
+fn read_limited_oui_csv_body(
+    reader: impl Read,
+    source: &str,
+    content_length: Option<u64>,
+) -> Result<String> {
+    read_limited_text_body(
+        reader,
+        source,
+        content_length,
+        MAX_IEEE_OUI_CSV_BYTES,
+        "OUI CSV",
+    )
+}
+
+fn read_limited_text_body(
+    reader: impl Read,
+    source: &str,
+    content_length: Option<u64>,
+    max_bytes: usize,
+    label: &str,
+) -> Result<String> {
+    if content_length.is_some_and(|len| len > max_bytes as u64) {
+        bail!("{label} from {source} exceeded {max_bytes} bytes");
+    }
+
+    let mut bytes = Vec::new();
+    let mut limited = reader.take(max_bytes as u64 + 1);
+    limited
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {label} body from {source}"))?;
+    if bytes.len() > max_bytes {
+        bail!("{label} from {source} exceeded {max_bytes} bytes");
+    }
+
+    String::from_utf8(bytes).with_context(|| format!("{label} from {source} is not valid UTF-8"))
+}
+
+fn write_oui_db_atomic(path: &Path, db: &HashMap<String, String>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_vec_pretty(&db)?)?;
-    Ok(db.len())
+
+    let bytes = serde_json::to_vec_pretty(db)?;
+    let tmp = atomic_temp_path(path);
+    fs::write(&tmp, bytes)
+        .with_context(|| format!("failed to write temporary OUI DB {}", tmp.display()))?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| {
+            format!(
+                "failed to replace OUI DB {} with {}",
+                path.display(),
+                tmp.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+fn atomic_temp_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("oui.json");
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        suffix
+    ))
 }
 
 pub fn load_oui_db(path: &Path) -> Result<HashMap<String, String>> {
@@ -147,29 +255,34 @@ fn find_header(headers: &csv::StringRecord, name: &str) -> Option<usize> {
 pub async fn reverse_dns_with_callback<F>(
     ips: Vec<IpAddr>,
     timeout: Duration,
-    concurrency: usize,
+    limiter: Arc<Semaphore>,
     mut on_result: F,
 ) -> HashMap<IpAddr, String>
 where
     F: FnMut(IpAddr, String),
 {
-    // `dns_lookup` is blocking, so each lookup runs on the blocking pool while a
-    // semaphore limits outstanding work. Results are streamed to the live UI as
-    // soon as each host resolves.
-    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
+    // Hickory performs PTR queries on Tokio instead of parking blocking libc
+    // resolver calls on the blocking pool. A timed-out lookup can now be
+    // dropped without leaving a worker thread stuck in getnameinfo.
+    let resolver = match TokioResolver::builder_tokio().and_then(|builder| builder.build()) {
+        Ok(resolver) => Arc::new(resolver),
+        Err(_) => return HashMap::new(),
+    };
     let mut tasks = JoinSet::new();
 
     for ip in ips {
-        let semaphore = Arc::clone(&semaphore);
+        let resolver = Arc::clone(&resolver);
+        let limiter = Arc::clone(&limiter);
         tasks.spawn(async move {
-            let Ok(_permit) = semaphore.acquire_owned().await else {
+            let Ok(_permit) = limiter.acquire_owned().await else {
                 return None;
             };
-            let task = tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip));
-            match tokio::time::timeout(timeout, task).await {
-                Ok(Ok(Ok(name))) => Some((ip, name)),
-                _ => None,
-            }
+            let lookup =
+                tokio::time::timeout(timeout, resolver.reverse_lookup(reverse_lookup_name(ip)))
+                    .await
+                    .ok()?
+                    .ok()?;
+            ptr_hostname(&lookup).map(|name| (ip, name))
         });
     }
 
@@ -181,6 +294,22 @@ where
         }
     }
     result
+}
+
+fn reverse_lookup_name(ip: IpAddr) -> Name {
+    let mut name = Name::from(ip);
+    name.set_fqdn(true);
+    name
+}
+
+fn ptr_hostname(lookup: &Lookup) -> Option<String> {
+    lookup
+        .answers()
+        .iter()
+        .find_map(|record| match &record.data {
+            RData::PTR(ptr) => Some(ptr.0.to_utf8().trim_end_matches('.').to_string()),
+            _ => None,
+        })
 }
 
 pub fn mdns_probe_with_callback<F>(
@@ -387,6 +516,7 @@ fn records_to_mdns_info(records: &[MdnsRecord]) -> HashMap<IpAddr, MdnsInfo> {
     // first, then materialize one MdnsInfo per IP.
     let mut host_ips: HashMap<String, Vec<IpAddr>> = HashMap::new();
     let mut host_names: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut host_txt_names: HashMap<String, HashSet<String>> = HashMap::new();
     let mut host_services: HashMap<String, Vec<MdnsService>> = HashMap::new();
     let mut txt_by_name: HashMap<String, Vec<String>> = HashMap::new();
     let mut ptr_targets = HashSet::new();
@@ -404,6 +534,10 @@ fn records_to_mdns_info(records: &[MdnsRecord]) -> HashMap<IpAddr, MdnsInfo> {
                     .entry(target.clone())
                     .or_default()
                     .insert(service_instance_name(name));
+                host_txt_names
+                    .entry(target.clone())
+                    .or_default()
+                    .insert(name.clone());
                 host_services
                     .entry(target.clone())
                     .or_default()
@@ -442,7 +576,7 @@ fn records_to_mdns_info(records: &[MdnsRecord]) -> HashMap<IpAddr, MdnsInfo> {
 
             for (name, attrs) in &txt_by_name {
                 if name == &host
-                    || host_names
+                    || host_txt_names
                         .get(&host)
                         .is_some_and(|names| names.contains(name))
                 {
@@ -566,8 +700,9 @@ fn read_dns_name(buf: &[u8], mut offset: usize) -> Option<(String, usize)> {
 
 pub async fn netbios_probe_with_callback<F>(
     ips: Vec<IpAddr>,
+    local_ip: Ipv4Addr,
     timeout: Duration,
-    concurrency: usize,
+    limiter: Arc<Semaphore>,
     mut on_result: F,
 ) -> HashMap<IpAddr, Vec<String>>
 where
@@ -575,35 +710,36 @@ where
 {
     // NetBIOS name service is UDP/137 and still useful for Windows and Samba
     // hosts that do not publish richer multicast records.
-    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut tasks = JoinSet::new();
 
     for ip in ips {
         let IpAddr::V4(ipv4) = ip else {
             continue;
         };
-        let semaphore = Arc::clone(&semaphore);
+        let limiter = Arc::clone(&limiter);
         tasks.spawn(async move {
-            let Ok(_permit) = semaphore.acquire_owned().await else {
+            let Ok(_permit) = limiter.acquire_owned().await else {
                 return None;
             };
-            let query = build_netbios_query(0x4000);
-            let socket = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-                .await
-                .ok()?;
+            let transaction_id = next_netbios_transaction_id();
+            let query = build_netbios_query(transaction_id);
+            let socket = tokio::net::UdpSocket::bind((local_ip, 0)).await.ok()?;
             let _ = socket.send_to(&query, (ipv4, 137)).await.ok()?;
             let mut buf = [0_u8; 1500];
-            match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
-                Ok(Ok((len, _))) => {
-                    let names = parse_netbios_response(&buf[..len]).names;
-                    if names.is_empty() {
-                        None
-                    } else {
-                        Some((IpAddr::V4(ipv4), names))
+            tokio::time::timeout(timeout, async {
+                loop {
+                    let (len, source) = socket.recv_from(&mut buf).await.ok()?;
+                    if source.ip() != IpAddr::V4(ipv4) {
+                        continue;
+                    }
+                    if let Some(names) = matching_netbios_names(&buf[..len], transaction_id) {
+                        return Some((IpAddr::V4(ipv4), names));
                     }
                 }
-                _ => None,
-            }
+            })
+            .await
+            .ok()
+            .flatten()
         });
     }
 
@@ -615,6 +751,10 @@ where
         }
     }
     result
+}
+
+fn next_netbios_transaction_id() -> u16 {
+    NEXT_NETBIOS_TRANSACTION_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -706,6 +846,15 @@ pub fn parse_netbios_response(buf: &[u8]) -> NetbiosResponse {
     }
 }
 
+fn matching_netbios_names(buf: &[u8], transaction_id: u16) -> Option<Vec<String>> {
+    let response = parse_netbios_response(buf);
+    if response.transaction_id != transaction_id || response.names.is_empty() {
+        None
+    } else {
+        Some(response.names)
+    }
+}
+
 fn skip_nbns_name(buf: &[u8], offset: usize) -> Option<usize> {
     let first = *buf.get(offset)?;
     if first & 0xc0 == 0xc0 {
@@ -765,6 +914,102 @@ mod tests {
     }
 
     #[test]
+    fn bundled_tls_roots_are_available_for_oui_downloads() {
+        let certs = bundled_tls_root_certificates().unwrap();
+
+        assert!(!certs.is_empty());
+        assert_eq!(certs.len(), webpki_root_certs::TLS_SERVER_ROOT_CERTS.len());
+    }
+
+    #[test]
+    fn oui_download_client_builds_with_bundled_tls_roots() {
+        let _client = oui_download_client().unwrap();
+    }
+
+    #[test]
+    fn oui_csv_body_rejects_large_content_length_without_reading() {
+        struct PanicReader;
+
+        impl std::io::Read for PanicReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("oversized OUI CSV should be rejected before reading")
+            }
+        }
+
+        let err = read_limited_text_body(
+            PanicReader,
+            "https://example.test/oui.csv",
+            Some(9),
+            8,
+            "OUI CSV",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("exceeded"));
+    }
+
+    #[test]
+    fn oui_csv_body_rejects_unknown_size_body_above_limit() {
+        let err = read_limited_text_body(
+            std::io::Cursor::new(b"too-large".to_vec()),
+            "https://example.test/oui.csv",
+            None,
+            8,
+            "OUI CSV",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("exceeded"));
+    }
+
+    #[test]
+    fn oui_db_atomic_write_replaces_existing_json() {
+        let dir = unique_test_dir("oui-db-atomic-write");
+        let path = dir.join("oui.json");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, r#"{"001122":"Old Vendor"}"#).unwrap();
+
+        let db = HashMap::from([("AABBCC".to_string(), "Example Inc".to_string())]);
+        write_oui_db_atomic(&path, &db).unwrap();
+
+        let loaded = load_oui_db(&path).unwrap();
+        assert_eq!(
+            loaded.get("AABBCC").map(String::as_str),
+            Some("Example Inc")
+        );
+        assert!(!loaded.contains_key("001122"));
+        assert!(
+            fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!("fing-{name}-{}-{suffix}", std::process::id()))
+    }
+
+    #[test]
+    fn builds_fqdn_reverse_lookup_name() {
+        let ipv4 = reverse_lookup_name("192.168.1.20".parse().unwrap());
+        let ipv6 = reverse_lookup_name("2001:db8::1".parse().unwrap());
+
+        assert_eq!(ipv4.to_ascii(), "20.1.168.192.in-addr.arpa.");
+        assert!(ipv6.is_fqdn());
+        assert!(ipv6.to_ascii().ends_with(".ip6.arpa."));
+    }
+
+    #[test]
     fn parses_mdns_a_record_with_compressed_name() {
         let mut packet = Vec::new();
         packet.extend_from_slice(&0_u16.to_be_bytes());
@@ -790,6 +1035,39 @@ mod tests {
                 host: "host.local".to_string(),
                 ip: "192.168.1.20".parse().unwrap()
             }]
+        );
+    }
+
+    #[test]
+    fn mdns_txt_for_service_instance_enriches_srv_target_host() {
+        let records = vec![
+            MdnsRecord::Address {
+                host: "printer.local".to_string(),
+                ip: "192.168.1.20".parse().unwrap(),
+            },
+            MdnsRecord::Srv {
+                name: "Office._ipp._tcp.local".to_string(),
+                target: "printer.local".to_string(),
+                port: 631,
+            },
+            MdnsRecord::Txt {
+                name: "Office._ipp._tcp.local".to_string(),
+                attrs: vec!["model=OfficeJet Pro".to_string()],
+            },
+        ];
+
+        let info = records_to_mdns_info(&records);
+        let device = info
+            .get(&"192.168.1.20".parse().unwrap())
+            .expect("mDNS info should be keyed by the SRV target host IP");
+
+        assert_eq!(device.model.as_deref(), Some("OfficeJet Pro"));
+        assert!(device.names.iter().any(|name| name == "Office"));
+        assert!(
+            device
+                .services
+                .iter()
+                .any(|service| { service.name == "ipp" && service.port == Some(631) })
         );
     }
 
@@ -824,5 +1102,10 @@ mod tests {
         let parsed = parse_netbios_response(&response);
         assert_eq!(parsed.transaction_id, 0x1234);
         assert_eq!(parsed.names, vec!["OFFICE".to_string()]);
+        assert_eq!(
+            matching_netbios_names(&response, 0x1234),
+            Some(vec!["OFFICE".to_string()])
+        );
+        assert!(matching_netbios_names(&response, 0x4321).is_none());
     }
 }
