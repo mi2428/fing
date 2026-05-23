@@ -46,14 +46,16 @@ pub struct UpnpDescription {
     pub services: Vec<String>,
 }
 
-pub fn ssdp_probe_with_callback<F>(
+pub fn ssdp_probe_with_callback<F, AllowSource>(
     interface_ip: Ipv4Addr,
     timeout: Duration,
     fetch_descriptions: bool,
+    mut allow_source: AllowSource,
     mut on_result: F,
 ) -> Result<HashMap<IpAddr, UpnpInfo>>
 where
     F: FnMut(IpAddr, UpnpInfo),
+    AllowSource: FnMut(IpAddr) -> bool,
 {
     let socket = ssdp_socket(interface_ip)?;
     let request = ssdp_request();
@@ -83,21 +85,16 @@ where
                 let Some(response) = parse_ssdp_response(&buffer[..len]) else {
                     continue;
                 };
-                let info = responses.entry(source_ip).or_default();
-                merge_ssdp_headers(info, &response.headers);
-                on_result(source_ip, info.clone());
-
-                // Fetch each LOCATION once per scan. Several SSDP responses from
-                // the same device often point at the same XML description.
-                if fetch_descriptions
-                    && let Some(location) = info.location.clone()
-                    && description_location_allowed(&location, source_ip)
-                    && fetched_locations.insert(location.clone())
-                    && let Ok(description) = fetch_description(&client, &location)
-                {
-                    merge_description(info, description);
-                    on_result(source_ip, info.clone());
-                }
+                let mut fetcher = |location: &str| fetch_description(&client, location);
+                let mut context = SsdpResponseContext {
+                    fetch_descriptions,
+                    allow_source: &mut allow_source,
+                    fetched_locations: &mut fetched_locations,
+                    responses: &mut responses,
+                    fetch_description: &mut fetcher,
+                    on_result: &mut on_result,
+                };
+                apply_ssdp_response(source_ip, response, &mut context);
             }
             Err(err)
                 if err.kind() == std::io::ErrorKind::WouldBlock
@@ -107,6 +104,45 @@ where
     }
 
     Ok(responses)
+}
+
+struct SsdpResponseContext<'a, F, AllowSource, FetchDescription> {
+    fetch_descriptions: bool,
+    allow_source: &'a mut AllowSource,
+    fetched_locations: &'a mut HashSet<String>,
+    responses: &'a mut HashMap<IpAddr, UpnpInfo>,
+    fetch_description: &'a mut FetchDescription,
+    on_result: &'a mut F,
+}
+
+fn apply_ssdp_response<F, AllowSource, FetchDescription>(
+    source_ip: IpAddr,
+    response: SsdpResponse,
+    context: &mut SsdpResponseContext<'_, F, AllowSource, FetchDescription>,
+) where
+    F: FnMut(IpAddr, UpnpInfo),
+    AllowSource: FnMut(IpAddr) -> bool,
+    FetchDescription: FnMut(&str) -> Result<UpnpDescription>,
+{
+    if !(context.allow_source)(source_ip) {
+        return;
+    }
+
+    let info = context.responses.entry(source_ip).or_default();
+    merge_ssdp_headers(info, &response.headers);
+    (context.on_result)(source_ip, info.clone());
+
+    // Fetch each LOCATION once per scan. Several SSDP responses from the same
+    // device often point at the same XML description.
+    if context.fetch_descriptions
+        && let Some(location) = info.location.clone()
+        && description_location_allowed(&location, source_ip)
+        && context.fetched_locations.insert(location.clone())
+        && let Ok(description) = (context.fetch_description)(&location)
+    {
+        merge_description(info, description);
+        (context.on_result)(source_ip, info.clone());
+    }
 }
 
 fn ssdp_socket(interface_ip: Ipv4Addr) -> Result<UdpSocket> {
@@ -318,6 +354,42 @@ mod tests {
             parsed.headers.get("server").map(String::as_str),
             Some("Linux UPnP/1.0")
         );
+    }
+
+    #[test]
+    fn scoped_ssdp_response_ignores_disallowed_source_before_callbacks_or_fetches() {
+        let source = "192.168.1.2".parse().unwrap();
+        let response = SsdpResponse {
+            headers: HashMap::from([
+                (
+                    "location".to_string(),
+                    "http://192.168.1.2/root.xml".to_string(),
+                ),
+                ("server".to_string(), "Linux UPnP/1.0".to_string()),
+            ]),
+        };
+        let mut fetched_locations = HashSet::new();
+        let mut responses = HashMap::new();
+        let mut allow_source = |_| false;
+        let mut fetch_description = |_: &str| -> Result<UpnpDescription> {
+            panic!("disallowed SSDP source must not fetch descriptions")
+        };
+        let mut callback =
+            |_: IpAddr, _: UpnpInfo| panic!("disallowed SSDP source must not emit results");
+
+        let mut context = SsdpResponseContext {
+            fetch_descriptions: true,
+            allow_source: &mut allow_source,
+            fetched_locations: &mut fetched_locations,
+            responses: &mut responses,
+            fetch_description: &mut fetch_description,
+            on_result: &mut callback,
+        };
+
+        apply_ssdp_response(source, response, &mut context);
+
+        assert!(responses.is_empty());
+        assert!(fetched_locations.is_empty());
     }
 
     #[test]

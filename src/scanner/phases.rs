@@ -397,15 +397,22 @@ async fn run_upnp(
     timeout: Duration,
     updates: tokio::sync::mpsc::UnboundedSender<MulticastUpdate>,
 ) -> Result<BTreeMap<IpAddr, upnp::UpnpInfo>> {
+    let allowed_target = target;
     let callback_target = target;
     // UPnP discovery can optionally fetch HTTP description XML, so it also runs
     // off the async executor. The callback still preserves progressive updates.
     let upnp = tokio::task::spawn_blocking(move || {
-        upnp::ssdp_probe_with_callback(interface_ip, timeout, true, move |ip, info| {
-            if target_contains_ip(callback_target, ip) {
-                let _ = updates.send(MulticastUpdate::Upnp(ip, info));
-            }
-        })
+        upnp::ssdp_probe_with_callback(
+            interface_ip,
+            timeout,
+            true,
+            move |ip| target_contains_ip(allowed_target, ip),
+            move |ip, info| {
+                if target_contains_ip(callback_target, ip) {
+                    let _ = updates.send(MulticastUpdate::Upnp(ip, info));
+                }
+            },
+        )
     })
     .await
     .context("UPnP worker failed")??;
