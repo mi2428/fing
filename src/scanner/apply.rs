@@ -138,16 +138,18 @@ pub(super) fn apply_dhcp_lease(
 ) {
     // DHCP is passive and sometimes stale. It can fill missing MAC/vendor/name
     // fields, but it must not replace direct ARP or protocol evidence.
-    if let Some(mac) = lease.mac {
+    let lease_mac = lease.mac;
+    if let Some(mac) = lease_mac.as_ref() {
         if device.mac.is_none() {
             device.mac = Some(mac.clone());
         }
-        if device.vendor.is_none()
-            && let Some(oui_db) = oui_db
-        {
-            device.vendor = enrich::lookup_vendor(&mac, oui_db);
-        }
-        device.add_evidence("dhcp", "mac", mac, 0.55);
+        device.add_evidence("dhcp", "mac", mac.clone(), 0.55);
+    }
+    let vendor_mac = device.mac.as_deref().or(lease_mac.as_deref());
+    if device.vendor.is_none()
+        && let (Some(mac), Some(oui_db)) = (vendor_mac, oui_db)
+    {
+        device.vendor = enrich::lookup_vendor(mac, oui_db);
     }
     if let Some(hostname) = lease.hostname {
         device.add_name(hostname, "dhcp", 0.72);
@@ -716,11 +718,14 @@ mod tests {
     }
 
     #[test]
-    fn dhcp_lease_fills_missing_identity_without_replacing_existing_mac() {
+    fn dhcp_lease_does_not_use_conflicting_mac_for_vendor() {
         let mut device = device();
         device.mac = Some("00:11:22:33:44:55".to_string());
         let ip = device.ip;
-        let oui_db = HashMap::from([("AABBCC".to_string(), "Example Vendor".to_string())]);
+        let oui_db = HashMap::from([
+            ("AABBCC".to_string(), "Lease Vendor".to_string()),
+            ("001122".to_string(), "Observed Vendor".to_string()),
+        ]);
 
         apply_dhcp_lease(
             &mut device,
@@ -730,13 +735,14 @@ mod tests {
                 hostname: Some("workstation".to_string()),
                 client_id: Some("client-1".to_string()),
                 vendor_class: Some("MSFT 5.0".to_string()),
+                expires_at: None,
                 source: Some("/tmp/leases".into()),
             },
             Some(&oui_db),
         );
 
         assert_eq!(device.mac.as_deref(), Some("00:11:22:33:44:55"));
-        assert_eq!(device.vendor.as_deref(), Some("Example Vendor"));
+        assert_eq!(device.vendor.as_deref(), Some("Observed Vendor"));
         assert_eq!(device.hostname.as_deref(), Some("workstation"));
         assert!(has_evidence(&device, "dhcp", "mac", "aa:bb:cc:dd:ee:ff"));
         assert!(has_evidence(&device, "dhcp", "vendor_class", "MSFT 5.0"));

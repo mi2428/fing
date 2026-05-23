@@ -6,6 +6,7 @@
 //! and DHCP clients vary their on-disk formats.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -20,6 +21,8 @@ pub struct DhcpLease {
     pub hostname: Option<String>,
     pub client_id: Option<String>,
     pub vendor_class: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
     pub source: Option<PathBuf>,
 }
 
@@ -97,8 +100,9 @@ fn read_path(path: &Path) -> Result<Vec<DhcpLease>> {
     }
 
     let text = fs::read_to_string(path).with_context(|| "read failed")?;
-    let mut leases = parse_isc_leases(&text);
-    leases.extend(parse_dnsmasq_leases(&text));
+    let now = Utc::now();
+    let mut leases = parse_isc_leases_at(&text, now);
+    leases.extend(parse_dnsmasq_leases_at(&text, now));
     leases.extend(parse_systemd_lease(&text));
 
     for lease in &mut leases {
@@ -107,7 +111,7 @@ fn read_path(path: &Path) -> Result<Vec<DhcpLease>> {
     Ok(leases)
 }
 
-pub fn parse_isc_leases(input: &str) -> Vec<DhcpLease> {
+fn parse_isc_leases_at(input: &str, now: DateTime<Utc>) -> Vec<DhcpLease> {
     let mut leases = Vec::new();
     let mut current_ip = None;
     let mut current_body = Vec::new();
@@ -124,8 +128,10 @@ pub fn parse_isc_leases(input: &str) -> Vec<DhcpLease> {
             continue;
         }
         if trimmed == "}" {
-            if let Some(ip) = current_ip.take() {
-                leases.push(parse_isc_body(ip, &current_body));
+            if let Some(ip) = current_ip.take()
+                && let Some(lease) = parse_isc_body(ip, &current_body, now)
+            {
+                leases.push(lease);
             }
             current_body.clear();
             continue;
@@ -138,7 +144,7 @@ pub fn parse_isc_leases(input: &str) -> Vec<DhcpLease> {
     leases
 }
 
-pub fn parse_dnsmasq_leases(input: &str) -> Vec<DhcpLease> {
+fn parse_dnsmasq_leases_at(input: &str, now: DateTime<Utc>) -> Vec<DhcpLease> {
     // dnsmasq uses one whitespace-delimited line:
     // expiry mac ip hostname client-id. Lines from other formats are skipped.
     input
@@ -149,7 +155,11 @@ pub fn parse_dnsmasq_leases(input: &str) -> Vec<DhcpLease> {
                 return None;
             }
             let parts = line.split_whitespace().collect::<Vec<_>>();
-            if parts.len() < 4 || parts[0].parse::<u64>().is_err() {
+            if parts.len() < 4 {
+                return None;
+            }
+            let expiry = parts[0].parse::<i64>().ok()?;
+            if expiry != 0 && expiry <= now.timestamp() {
                 return None;
             }
             let ip = parts[2].parse::<IpAddr>().ok()?;
@@ -159,6 +169,9 @@ pub fn parse_dnsmasq_leases(input: &str) -> Vec<DhcpLease> {
                 hostname: hostname_value(parts[3]),
                 client_id: parts.get(4).and_then(|value| optional_value(value)),
                 vendor_class: None,
+                expires_at: (expiry > 0)
+                    .then(|| Utc.timestamp_opt(expiry, 0).single())
+                    .flatten(),
                 source: None,
             })
         })
@@ -198,21 +211,24 @@ pub fn parse_systemd_lease(input: &str) -> Vec<DhcpLease> {
         hostname,
         client_id,
         vendor_class,
+        expires_at: None,
         source: None,
     })
     .into_iter()
     .collect()
 }
 
-fn parse_isc_body(ip: IpAddr, lines: &[String]) -> DhcpLease {
+fn parse_isc_body(ip: IpAddr, lines: &[String], now: DateTime<Utc>) -> Option<DhcpLease> {
     let mut lease = DhcpLease {
         ip,
         mac: None,
         hostname: None,
         client_id: None,
         vendor_class: None,
+        expires_at: None,
         source: None,
     };
+    let mut binding_state = None::<String>;
 
     for line in lines {
         let line = line.trim_end_matches(';').trim();
@@ -228,10 +244,39 @@ fn parse_isc_body(ip: IpAddr, lines: &[String]) -> DhcpLease {
             lease.vendor_class = optional_value(value.trim().trim_matches('"'));
         } else if let Some(value) = line.strip_prefix("option vendor-class-identifier ") {
             lease.vendor_class = optional_value(value.trim().trim_matches('"'));
+        } else if let Some(value) = line.strip_prefix("binding state ") {
+            binding_state = Some(value.trim().to_ascii_lowercase());
+        } else if let Some(value) = line
+            .strip_prefix("ends ")
+            .or_else(|| line.strip_prefix("expire "))
+        {
+            lease.expires_at = parse_isc_lease_time(value);
         }
     }
 
-    lease
+    let active = binding_state
+        .as_deref()
+        .is_none_or(|state| state == "active");
+    let unexpired = lease.expires_at.is_none_or(|expires_at| expires_at > now);
+    (active && unexpired).then_some(lease)
+}
+
+fn parse_isc_lease_time(value: &str) -> Option<DateTime<Utc>> {
+    let value = value.trim().trim_end_matches(';').trim();
+    if value.eq_ignore_ascii_case("never") {
+        return None;
+    }
+
+    let mut parts = value.split_whitespace();
+    let first = parts.next()?;
+    let (date, time) = if first.chars().all(|ch| ch.is_ascii_digit()) {
+        (parts.next()?, parts.next()?)
+    } else {
+        (first, parts.next()?)
+    };
+    let naive =
+        NaiveDateTime::parse_from_str(&format!("{date} {time}"), "%Y/%m/%d %H:%M:%S").ok()?;
+    Some(DateTime::from_naive_utc_and_offset(naive, Utc))
 }
 
 fn normalize_mac(value: &str) -> Option<String> {
@@ -266,6 +311,7 @@ fn optional_value(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn parses_isc_dhcpd_lease() {
@@ -274,25 +320,74 @@ mod tests {
               hardware ethernet aa:bb:cc:dd:ee:ff;
               client-hostname "office";
               set vendor-class-identifier = "MSFT 5.0";
+              binding state active;
+              ends 6 2100/01/01 00:00:00;
             }
         "#;
 
-        let leases = parse_isc_leases(input);
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let leases = parse_isc_leases_at(input, now);
 
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].ip, "192.168.1.44".parse::<IpAddr>().unwrap());
         assert_eq!(leases[0].mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
         assert_eq!(leases[0].hostname.as_deref(), Some("office"));
         assert_eq!(leases[0].vendor_class.as_deref(), Some("MSFT 5.0"));
+        assert!(leases[0].expires_at.is_some());
+    }
+
+    #[test]
+    fn skips_inactive_or_expired_isc_leases() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let input = r#"
+            lease 192.168.1.44 {
+              hardware ethernet aa:bb:cc:dd:ee:ff;
+              client-hostname "active";
+              binding state active;
+              ends 6 2026/01/02 00:00:00;
+            }
+            lease 192.168.1.45 {
+              hardware ethernet 00:11:22:33:44:55;
+              client-hostname "expired";
+              binding state active;
+              ends 3 2025/12/31 00:00:00;
+            }
+            lease 192.168.1.46 {
+              hardware ethernet 66:77:88:99:aa:bb;
+              client-hostname "released";
+              binding state free;
+              ends 6 2026/01/02 00:00:00;
+            }
+        "#;
+
+        let leases = parse_isc_leases_at(input, now);
+
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].hostname.as_deref(), Some("active"));
     }
 
     #[test]
     fn parses_dnsmasq_lease_line() {
-        let leases =
-            parse_dnsmasq_leases("1760000000 aa:bb:cc:dd:ee:ff 192.168.1.10 laptop 01:aa\n");
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let leases = parse_dnsmasq_leases_at(
+            "4102444800 aa:bb:cc:dd:ee:ff 192.168.1.10 laptop 01:aa\n",
+            now,
+        );
 
         assert_eq!(leases[0].hostname.as_deref(), Some("laptop"));
         assert_eq!(leases[0].mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        assert!(leases[0].expires_at.is_some());
+    }
+
+    #[test]
+    fn skips_expired_dnsmasq_lease_line() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let leases = parse_dnsmasq_leases_at(
+            "1760000000 aa:bb:cc:dd:ee:ff 192.168.1.10 laptop 01:aa\n",
+            now,
+        );
+
+        assert!(leases.is_empty());
     }
 
     #[test]

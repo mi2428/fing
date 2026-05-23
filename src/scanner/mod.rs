@@ -1202,8 +1202,14 @@ fn observed_device_for_dhcp_lease<'a>(
     devices: &'a mut BTreeMap<IpAddr, Device>,
     lease: &dhcp::DhcpLease,
 ) -> Option<&'a mut Device> {
-    if devices.contains_key(&lease.ip) {
-        return devices.get_mut(&lease.ip);
+    if let Some(device) = devices.get(&lease.ip) {
+        match (device.mac.as_deref(), lease.mac.as_deref()) {
+            (Some(device_mac), Some(lease_mac)) if !same_mac(device_mac, lease_mac) => {
+                return None;
+            }
+            (Some(_), None) => return None,
+            _ => return devices.get_mut(&lease.ip),
+        }
     }
 
     let lease_mac = lease.mac.as_deref()?;
@@ -1533,6 +1539,7 @@ mod tests {
             hostname: Some("stale-host".to_string()),
             client_id: None,
             vendor_class: None,
+            expires_at: None,
             source: None,
         };
 
@@ -1553,6 +1560,7 @@ mod tests {
             hostname: Some("observed-host".to_string()),
             client_id: None,
             vendor_class: None,
+            expires_at: None,
             source: None,
         };
 
@@ -1560,6 +1568,46 @@ mod tests {
             .expect("lease should match the observed MAC");
 
         assert_eq!(device.ip.to_string(), "192.168.1.44");
+    }
+
+    #[test]
+    fn dhcp_lease_same_ip_is_rejected_when_mac_conflicts() {
+        let now = Utc::now();
+        let mut devices = BTreeMap::new();
+        let mut observed = Device::new("192.168.1.44".parse().unwrap(), now);
+        observed.mac = Some("00:11:22:33:44:55".to_string());
+        devices.insert(observed.ip, observed);
+        let lease = dhcp::DhcpLease {
+            ip: "192.168.1.44".parse().unwrap(),
+            mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+            hostname: Some("stale-host".to_string()),
+            client_id: None,
+            vendor_class: None,
+            expires_at: None,
+            source: None,
+        };
+
+        assert!(observed_device_for_dhcp_lease(&mut devices, &lease).is_none());
+    }
+
+    #[test]
+    fn dhcp_lease_without_mac_is_rejected_for_mac_observed_device() {
+        let now = Utc::now();
+        let mut devices = BTreeMap::new();
+        let mut observed = Device::new("192.168.1.44".parse().unwrap(), now);
+        observed.mac = Some("00:11:22:33:44:55".to_string());
+        devices.insert(observed.ip, observed);
+        let lease = dhcp::DhcpLease {
+            ip: "192.168.1.44".parse().unwrap(),
+            mac: None,
+            hostname: Some("unverified-host".to_string()),
+            client_id: None,
+            vendor_class: None,
+            expires_at: None,
+            source: None,
+        };
+
+        assert!(observed_device_for_dhcp_lease(&mut devices, &lease).is_none());
     }
 
     #[test]
