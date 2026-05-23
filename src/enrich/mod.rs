@@ -80,10 +80,7 @@ pub fn default_cache_dir() -> PathBuf {
 }
 
 pub fn update_oui_db(path: &Path) -> Result<usize> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(IEEE_OUI_DOWNLOAD_TIMEOUT)
-        .build()
-        .context("failed to build OUI download client")?;
+    let client = oui_download_client()?;
     let response = client
         .get(IEEE_OUI_CSV)
         .send()
@@ -97,6 +94,25 @@ pub fn update_oui_db(path: &Path) -> Result<usize> {
 
     write_oui_db_atomic(path, &db)?;
     Ok(db.len())
+}
+
+fn oui_download_client() -> Result<reqwest::blocking::Client> {
+    let bundled_roots = bundled_tls_root_certificates()?;
+    reqwest::blocking::Client::builder()
+        .timeout(IEEE_OUI_DOWNLOAD_TIMEOUT)
+        .tls_certs_merge(bundled_roots)
+        .build()
+        .context("failed to build OUI download client")
+}
+
+fn bundled_tls_root_certificates() -> Result<Vec<reqwest::Certificate>> {
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .map(|cert| {
+            reqwest::Certificate::from_der(cert.as_ref())
+                .context("failed to load bundled TLS root certificate")
+        })
+        .collect()
 }
 
 fn read_limited_oui_csv_body(
@@ -895,6 +911,19 @@ mod tests {
         let db = parse_ieee_oui_csv(csv).unwrap();
 
         assert_eq!(db.get("AABBCC").map(String::as_str), Some("Example Inc"));
+    }
+
+    #[test]
+    fn bundled_tls_roots_are_available_for_oui_downloads() {
+        let certs = bundled_tls_root_certificates().unwrap();
+
+        assert!(!certs.is_empty());
+        assert_eq!(certs.len(), webpki_root_certs::TLS_SERVER_ROOT_CERTS.len());
+    }
+
+    #[test]
+    fn oui_download_client_builds_with_bundled_tls_roots() {
+        let _client = oui_download_client().unwrap();
     }
 
     #[test]
