@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    io::Read,
     net::{IpAddr, SocketAddr, TcpStream as StdTcpStream},
     sync::Arc,
     time::Duration,
@@ -69,6 +70,7 @@ const PORTS: &[(u16, &str)] = &[
     (8080, "http-proxy"),
     (9100, "printer"),
 ];
+const MAX_FAVICON_BYTES: usize = 256 * 1024;
 
 // Deep probing stays deliberately narrow: only ports already useful for device
 // identity are touched, and only for hosts discovered by ARP/mDNS/UPnP/etc. This
@@ -243,26 +245,55 @@ fn blocking_web_probe(ip: IpAddr, port: u16, https: bool, timeout: Duration) -> 
     let mut headers = interesting_headers(response.headers());
     let banner = http_banner_from_response(response.status().as_u16(), &headers);
 
+    let favicon_url = format!("{base_url}/favicon.ico");
     let favicon = client
-        .get(format!("{base_url}/favicon.ico"))
+        .get(&favicon_url)
         .send()
         .ok()
-        .filter(|response| response.status().is_success())
-        .and_then(|response| response.bytes().ok())
-        // Favicons are fingerprints, not payloads. Cap size to avoid retaining
-        // arbitrary web content from misconfigured local devices.
-        .filter(|bytes| !bytes.is_empty() && bytes.len() <= 256 * 1024)
-        .map(|bytes| FaviconFingerprint {
-            url: format!("{base_url}/favicon.ico"),
-            sha256: hex::encode(Sha256::digest(&bytes)),
-            bytes: bytes.len(),
-        });
+        .and_then(|response| favicon_fingerprint_from_response(response, favicon_url));
 
     headers.truncate(16);
     Some(WebProbe {
         banner,
         headers,
         favicon,
+    })
+}
+
+fn favicon_fingerprint_from_response(
+    response: reqwest::blocking::Response,
+    url: String,
+) -> Option<FaviconFingerprint> {
+    if !response.status().is_success() {
+        return None;
+    }
+    let content_length = response.content_length();
+    favicon_fingerprint_from_reader(response, url, content_length)
+}
+
+fn favicon_fingerprint_from_reader(
+    reader: impl Read,
+    url: String,
+    content_length: Option<u64>,
+) -> Option<FaviconFingerprint> {
+    // Favicons are fingerprints, not payloads. Reject known-oversized bodies
+    // before reading, and cap unknown-size reads to MAX_FAVICON_BYTES + 1 so a
+    // misconfigured local device cannot force an unbounded allocation here.
+    if content_length.is_some_and(|len| len > MAX_FAVICON_BYTES as u64) {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+    let mut limited = reader.take(MAX_FAVICON_BYTES as u64 + 1);
+    limited.read_to_end(&mut bytes).ok()?;
+    if bytes.is_empty() || bytes.len() > MAX_FAVICON_BYTES {
+        return None;
+    }
+
+    Some(FaviconFingerprint {
+        url,
+        sha256: hex::encode(Sha256::digest(&bytes)),
+        bytes: bytes.len(),
     })
 }
 
@@ -438,5 +469,36 @@ mod tests {
 
         assert!(banner.contains("HTTP 200"));
         assert!(banner.contains("server: nginx"));
+    }
+
+    #[test]
+    fn favicon_fingerprint_rejects_large_content_length_without_reading() {
+        struct PanicReader;
+
+        impl std::io::Read for PanicReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("oversized favicon should be rejected before reading")
+            }
+        }
+
+        let fingerprint = favicon_fingerprint_from_reader(
+            PanicReader,
+            "http://192.168.1.1/favicon.ico".to_string(),
+            Some(MAX_FAVICON_BYTES as u64 + 1),
+        );
+
+        assert!(fingerprint.is_none());
+    }
+
+    #[test]
+    fn favicon_fingerprint_rejects_unknown_size_body_above_limit() {
+        let body = vec![b'a'; MAX_FAVICON_BYTES + 1];
+        let fingerprint = favicon_fingerprint_from_reader(
+            std::io::Cursor::new(body),
+            "http://192.168.1.1/favicon.ico".to_string(),
+            None,
+        );
+
+        assert!(fingerprint.is_none());
     }
 }
