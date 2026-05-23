@@ -150,14 +150,15 @@ pub fn parse_smb2_negotiate_response(buf: &[u8]) -> Option<SmbInfo> {
     let guid = body.get(8..24).map(hex_guid);
     let security_offset = read_u16_le(body, 56).unwrap_or(0) as usize;
     let security_len = read_u16_le(body, 58).unwrap_or(0) as usize;
-    let security_blob = if security_offset >= start
-        && security_offset + security_len <= buf.len()
-        && security_len > 0
-    {
-        &buf[security_offset..security_offset + security_len]
-    } else {
-        &[]
-    };
+    let security_blob = start
+        .checked_add(security_offset)
+        .and_then(|security_start| {
+            security_start
+                .checked_add(security_len)
+                .and_then(|security_end| buf.get(security_start..security_end))
+        })
+        .filter(|_| security_len > 0)
+        .unwrap_or(&[]);
     // Some servers leak native OS/LANMAN strings in the security blob. Treat
     // them as hints only; the NTLM challenge below gives cleaner host names.
     let ascii = ascii_tokens(security_blob);
@@ -521,7 +522,7 @@ mod tests {
         packet[body_start + 4..body_start + 6].copy_from_slice(&0x0311_u16.to_le_bytes());
         packet[body_start + 8..body_start + 24].copy_from_slice(&[1_u8; 16]);
         let security = b"Windows Server\x00";
-        let security_offset = packet.len() as u16;
+        let security_offset = (64 + 64) as u16;
         packet.extend_from_slice(security);
         packet[body_start + 56..body_start + 58].copy_from_slice(&security_offset.to_le_bytes());
         packet[body_start + 58..body_start + 60]
