@@ -1058,6 +1058,7 @@ mod tests {
         device.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
         device.vendor = Some("Example Inc".to_string());
         device.add_name("host.local", "mdns", 0.9);
+        device.add_evidence("arp", "mac", "aa:bb:cc:dd:ee:ff", 0.5);
         device.add_evidence("deep", "port", "443", 0.55);
         device.add_evidence("local", "hostname", "host", 0.95);
 

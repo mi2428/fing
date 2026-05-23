@@ -875,7 +875,7 @@ async fn scan_inner(
         discovery::arp_sweep_with_callback(&arp_iface, arp_target, arp_timeout, |hit| {
             let mut device = Device::new(IpAddr::V4(hit.ip), scanned_at);
             device.interface = Some(arp_iface.name.clone());
-            device.mac = Some(hit.mac.clone());
+            apply_arp_mac(&mut device, &hit.mac);
             if arp_oui_enabled {
                 device.vendor = crate::enrich::lookup_vendor(&hit.mac, &arp_oui_db);
             }
@@ -893,7 +893,7 @@ async fn scan_inner(
                 if config.oui {
                     device.vendor = crate::enrich::lookup_vendor(&hit.mac, &oui_db);
                 }
-                device.mac = Some(hit.mac);
+                apply_arp_mac(device, &hit.mac);
                 finish_observed_device_update(&events, device, &identity_rules);
             }
         }
@@ -907,7 +907,7 @@ async fn scan_inner(
                 if config.oui {
                     device.vendor = crate::enrich::lookup_vendor(&hit.mac, &oui_db);
                 }
-                device.mac = Some(hit.mac);
+                apply_arp_mac(device, &hit.mac);
                 finish_observed_device_update(&events, device, &identity_rules);
             }
         }
@@ -1188,6 +1188,14 @@ fn upsert_device<'a>(
         device.interface = Some(interface.to_string());
     }
     device
+}
+
+fn apply_arp_mac(device: &mut Device, mac: &str) {
+    device.mac = Some(mac.to_string());
+    device.add_evidence("arp", "mac", mac, 0.5);
+    if let Some(prefix) = enrich::normalize_oui_prefix(mac) {
+        device.add_evidence("arp", "mac_oui", prefix, 0.5);
+    }
 }
 
 fn observed_device_for_dhcp_lease<'a>(

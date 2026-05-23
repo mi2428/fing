@@ -70,9 +70,6 @@ fn collect_device_sources(device: &Device) -> Vec<String> {
         .filter(|source| *source != "identity_rule")
         .map(str::to_string)
         .collect::<Vec<_>>();
-    if device.mac.is_some() {
-        sources.push("arp".to_string());
-    }
     if device.vendor.is_some() && !vendor_was_filled_from_cache(device) {
         sources.push("oui".to_string());
     }
@@ -127,6 +124,7 @@ mod tests {
         let mut device = Device::new("192.168.1.10".parse().unwrap(), now);
         device.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
         device.vendor = Some("Example Inc".to_string());
+        device.add_evidence("arp", "mac", "aa:bb:cc:dd:ee:ff", 0.5);
         device.set_device_type_guess("smart-home", "identity_rule", 0.68);
         device.add_evidence("identity_rule", "rule", "example-device", 0.68);
 
@@ -146,12 +144,24 @@ mod tests {
     }
 
     #[test]
+    fn mac_without_arp_evidence_is_not_reported_as_arp() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut device = Device::new("192.168.1.10".parse().unwrap(), now);
+        device.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+        device.add_evidence("dhcp", "mac", "aa:bb:cc:dd:ee:ff", 0.55);
+
+        assert_eq!(source_summary(&device), "dhcp");
+        assert_eq!(compact_source_summary(&device), "C");
+    }
+
+    #[test]
     fn compact_source_summary_uses_single_letter_source_codes() {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let mut device = Device::new("192.168.1.10".parse().unwrap(), now);
         device.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
         device.vendor = Some("Example Inc".to_string());
         device.add_name("host.local", "mdns", 0.9);
+        device.add_evidence("arp", "mac", "aa:bb:cc:dd:ee:ff", 0.5);
         device.add_evidence("deep", "port", "443", 0.55);
         device.add_evidence("local", "hostname", "host", 0.95);
 
