@@ -85,7 +85,7 @@ $ fing oui update --output.path ./oui.json
 >[!NOTE]
 > LLDP and CDP collection are passive and run by default with the `deep` profile.
 > In live/continuous mode, both listeners stay up across scan rounds and update matching devices as advertisements arrive.
-> In one-shot output mode, LLDP listens for at least 30 seconds and CDP listens for at least 65 seconds because common Cisco defaults advertise every 60 seconds.
+> In one-shot output mode, an enabled LLDP listener waits at least 30 seconds and an enabled CDP listener waits at least 65 seconds because common Cisco defaults advertise every 60 seconds.
 > You can also request them explicitly with `--fingerprint.source lldp` or `--fingerprint.source cdp`.
 
 ## Development

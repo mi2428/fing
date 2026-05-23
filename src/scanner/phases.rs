@@ -57,7 +57,7 @@ const DEEP_LLDP_LISTEN_TIMEOUT: Duration = Duration::from_secs(30);
 const CDP_LISTEN_TIMEOUT: Duration = Duration::from_secs(65);
 
 fn lldp_listen_timeout(config: &ScanConfig) -> Duration {
-    if config.profile.includes_lldp_fingerprints() {
+    if config.lldp {
         config.timeout.max(DEEP_LLDP_LISTEN_TIMEOUT)
     } else {
         config.timeout
@@ -489,6 +489,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explicit_lldp_uses_minimum_listen_window() {
+        let mut config = scan_config();
+        config.profile = ScanProfile::Normal;
+        config.lldp = true;
+        config.timeout = Duration::from_millis(500);
+
+        assert_eq!(lldp_listen_timeout(&config), DEEP_LLDP_LISTEN_TIMEOUT);
+
+        config.lldp = false;
+        assert_eq!(lldp_listen_timeout(&config), Duration::from_millis(500));
+    }
+
     #[tokio::test]
     async fn child_events_are_forwarded_as_parent_phase_stream() {
         let (child_tx, child_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -547,7 +560,18 @@ mod tests {
 
     #[test]
     fn scan_target_summary_deduplicates_configured_ranges() {
-        let mut config = ScanConfig {
+        let mut config = scan_config();
+        let same = config.clone();
+        config.target = Some("10.0.0.0/24".to_string());
+
+        assert_eq!(
+            scan_target_summary(&[same, config]),
+            "192.168.1.0/24,10.0.0.0/24"
+        );
+    }
+
+    fn scan_config() -> ScanConfig {
+        ScanConfig {
             target: Some("192.168.1.0/24".to_string()),
             iface: Some("en0".to_string()),
             profile: ScanProfile::Normal,
@@ -567,13 +591,6 @@ mod tests {
             cache_enabled: false,
             cache_path: "cache.json".into(),
             oui_path: "oui.json".into(),
-        };
-        let same = config.clone();
-        config.target = Some("10.0.0.0/24".to_string());
-
-        assert_eq!(
-            scan_target_summary(&[same, config]),
-            "192.168.1.0/24,10.0.0.0/24"
-        );
+        }
     }
 }
