@@ -22,8 +22,6 @@ pub(super) const SOURCE_LEGEND: &[(&str, &str)] = &[
     ("S", "SNMP"),
     ("H", "HTTP"),
     ("T", "TLS"),
-    ("I", "ICMP"),
-    ("P", "TCP"),
     ("K", "Cache"),
 ];
 
@@ -102,8 +100,6 @@ fn source_code(source: &str) -> char {
         "tls" => 'T',
         "smb" => 'B',
         "snmp" => 'S',
-        "icmp" => 'I',
-        "tcp" => 'P',
         "cache" => 'K',
         other => other
             .chars()
@@ -167,5 +163,16 @@ mod tests {
 
         assert_eq!(source_summary(&device), "arp,deep,local,mdns,oui");
         assert_eq!(compact_source_summary(&device), "ADLMO");
+    }
+
+    #[test]
+    fn source_legend_omits_unemitted_transport_sources() {
+        let labels = SOURCE_LEGEND
+            .iter()
+            .map(|(_, label)| *label)
+            .collect::<Vec<_>>();
+
+        assert!(!labels.contains(&"ICMP"));
+        assert!(!labels.contains(&"TCP"));
     }
 }
