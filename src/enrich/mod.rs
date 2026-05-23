@@ -16,6 +16,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
+    io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket},
     path::{Path, PathBuf},
     sync::Arc,
@@ -24,6 +25,8 @@ use std::{
 use tokio::{sync::Semaphore, task::JoinSet};
 
 const IEEE_OUI_CSV: &str = "https://standards-oui.ieee.org/oui/oui.csv";
+const IEEE_OUI_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_IEEE_OUI_CSV_BYTES: usize = 32 * 1024 * 1024;
 const MDNS_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const MDNS_PORT: u16 = 5353;
 
@@ -73,19 +76,99 @@ pub fn default_cache_dir() -> PathBuf {
 }
 
 pub fn update_oui_db(path: &Path) -> Result<usize> {
-    let response = reqwest::blocking::get(IEEE_OUI_CSV)
+    let client = reqwest::blocking::Client::builder()
+        .timeout(IEEE_OUI_DOWNLOAD_TIMEOUT)
+        .build()
+        .context("failed to build OUI download client")?;
+    let response = client
+        .get(IEEE_OUI_CSV)
+        .send()
         .with_context(|| format!("failed to download {IEEE_OUI_CSV}"))?;
     if !response.status().is_success() {
         bail!("OUI download failed with status {}", response.status());
     }
-    let text = response.text().context("failed to read OUI CSV body")?;
+    let content_length = response.content_length();
+    let text = read_limited_oui_csv_body(response, IEEE_OUI_CSV, content_length)?;
     let db = parse_ieee_oui_csv(&text)?;
 
+    write_oui_db_atomic(path, &db)?;
+    Ok(db.len())
+}
+
+fn read_limited_oui_csv_body(
+    reader: impl Read,
+    source: &str,
+    content_length: Option<u64>,
+) -> Result<String> {
+    read_limited_text_body(
+        reader,
+        source,
+        content_length,
+        MAX_IEEE_OUI_CSV_BYTES,
+        "OUI CSV",
+    )
+}
+
+fn read_limited_text_body(
+    reader: impl Read,
+    source: &str,
+    content_length: Option<u64>,
+    max_bytes: usize,
+    label: &str,
+) -> Result<String> {
+    if content_length.is_some_and(|len| len > max_bytes as u64) {
+        bail!("{label} from {source} exceeded {max_bytes} bytes");
+    }
+
+    let mut bytes = Vec::new();
+    let mut limited = reader.take(max_bytes as u64 + 1);
+    limited
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {label} body from {source}"))?;
+    if bytes.len() > max_bytes {
+        bail!("{label} from {source} exceeded {max_bytes} bytes");
+    }
+
+    String::from_utf8(bytes).with_context(|| format!("{label} from {source} is not valid UTF-8"))
+}
+
+fn write_oui_db_atomic(path: &Path, db: &HashMap<String, String>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_vec_pretty(&db)?)?;
-    Ok(db.len())
+
+    let bytes = serde_json::to_vec_pretty(db)?;
+    let tmp = atomic_temp_path(path);
+    fs::write(&tmp, bytes)
+        .with_context(|| format!("failed to write temporary OUI DB {}", tmp.display()))?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| {
+            format!(
+                "failed to replace OUI DB {} with {}",
+                path.display(),
+                tmp.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+fn atomic_temp_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("oui.json");
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        suffix
+    ))
 }
 
 pub fn load_oui_db(path: &Path) -> Result<HashMap<String, String>> {
@@ -792,6 +875,79 @@ mod tests {
         let db = parse_ieee_oui_csv(csv).unwrap();
 
         assert_eq!(db.get("AABBCC").map(String::as_str), Some("Example Inc"));
+    }
+
+    #[test]
+    fn oui_csv_body_rejects_large_content_length_without_reading() {
+        struct PanicReader;
+
+        impl std::io::Read for PanicReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("oversized OUI CSV should be rejected before reading")
+            }
+        }
+
+        let err = read_limited_text_body(
+            PanicReader,
+            "https://example.test/oui.csv",
+            Some(9),
+            8,
+            "OUI CSV",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("exceeded"));
+    }
+
+    #[test]
+    fn oui_csv_body_rejects_unknown_size_body_above_limit() {
+        let err = read_limited_text_body(
+            std::io::Cursor::new(b"too-large".to_vec()),
+            "https://example.test/oui.csv",
+            None,
+            8,
+            "OUI CSV",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("exceeded"));
+    }
+
+    #[test]
+    fn oui_db_atomic_write_replaces_existing_json() {
+        let dir = unique_test_dir("oui-db-atomic-write");
+        let path = dir.join("oui.json");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, r#"{"001122":"Old Vendor"}"#).unwrap();
+
+        let db = HashMap::from([("AABBCC".to_string(), "Example Inc".to_string())]);
+        write_oui_db_atomic(&path, &db).unwrap();
+
+        let loaded = load_oui_db(&path).unwrap();
+        assert_eq!(
+            loaded.get("AABBCC").map(String::as_str),
+            Some("Example Inc")
+        );
+        assert!(!loaded.contains_key("001122"));
+        assert!(
+            fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!("fing-{name}-{}-{suffix}", std::process::id()))
     }
 
     #[test]
