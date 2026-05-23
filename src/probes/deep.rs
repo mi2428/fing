@@ -6,13 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::HashMap,
-    io::Read,
-    net::{IpAddr, SocketAddr, TcpStream as StdTcpStream},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, io::Read, net::IpAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -78,6 +72,7 @@ const MAX_FAVICON_BYTES: usize = 256 * 1024;
 // broad port scanner or vulnerability probe.
 pub async fn probe_hosts_with_callback<F>(
     ips: Vec<IpAddr>,
+    local_addr: IpAddr,
     timeout: Duration,
     limiter: Arc<Semaphore>,
     mut on_probe: F,
@@ -96,7 +91,7 @@ where
                 let Ok(_permit) = limiter.acquire_owned().await else {
                     return None;
                 };
-                probe_port(ip, port, service, timeout)
+                probe_port(ip, local_addr, port, service, timeout)
                     .await
                     .map(|probe| (ip, probe))
             });
@@ -119,6 +114,7 @@ where
 
 async fn probe_port(
     ip: IpAddr,
+    local_addr: IpAddr,
     port: u16,
     service: String,
     timeout: Duration,
@@ -126,10 +122,7 @@ async fn probe_port(
     // A successful TCP connect is enough to record the service. Protocol-specific
     // reads below enrich the row when they succeed, but failure to read a banner
     // should not discard the open-port signal.
-    let mut stream = tokio::time::timeout(timeout, TcpStream::connect((ip, port)))
-        .await
-        .ok()?
-        .ok()?;
+    let mut stream = super::connect_tcp_from(local_addr, ip, port, timeout).await?;
 
     let mut probe = PortProbe {
         port,
@@ -145,7 +138,7 @@ async fn probe_port(
             // HTTP metadata often contains product strings even when a device
             // has no mDNS/UPnP name. Capture headers and favicon hashes as
             // evidence for rules, but do not classify directly here.
-            if let Some(web) = web_probe(ip, port, false, timeout).await {
+            if let Some(web) = web_probe(ip, local_addr, port, false, timeout).await {
                 probe.banner = web.banner;
                 probe.http_headers = web.headers;
                 probe.favicon = web.favicon;
@@ -157,12 +150,12 @@ async fn probe_port(
             // TLS subjects/issuers are useful for appliance UIs and embedded
             // web servers. Invalid/self-signed certs are accepted because local
             // devices commonly use them; the hash is the fingerprint.
-            if let Some(web) = web_probe(ip, port, true, timeout).await {
+            if let Some(web) = web_probe(ip, local_addr, port, true, timeout).await {
                 probe.banner = web.banner;
                 probe.http_headers = web.headers;
                 probe.favicon = web.favicon;
             }
-            probe.tls = tls_certificate_probe(ip, port, timeout).await;
+            probe.tls = tls_certificate_probe(ip, local_addr, port, timeout).await;
         }
         "ssh" | "ftp" | "telnet" => {
             probe.banner = passive_banner(&mut stream, timeout).await;
@@ -220,19 +213,36 @@ struct WebProbe {
     favicon: Option<FaviconFingerprint>,
 }
 
-async fn web_probe(ip: IpAddr, port: u16, https: bool, timeout: Duration) -> Option<WebProbe> {
-    tokio::task::spawn_blocking(move || blocking_web_probe(ip, port, https, timeout))
+async fn web_probe(
+    ip: IpAddr,
+    local_addr: IpAddr,
+    port: u16,
+    https: bool,
+    timeout: Duration,
+) -> Option<WebProbe> {
+    tokio::task::spawn_blocking(move || blocking_web_probe(ip, local_addr, port, https, timeout))
         .await
         .ok()
         .flatten()
 }
 
-fn blocking_web_probe(ip: IpAddr, port: u16, https: bool, timeout: Duration) -> Option<WebProbe> {
+fn blocking_web_probe(
+    ip: IpAddr,
+    local_addr: IpAddr,
+    port: u16,
+    https: bool,
+    timeout: Duration,
+) -> Option<WebProbe> {
+    if !super::same_ip_family(local_addr, ip) {
+        return None;
+    }
+
     // reqwest's blocking client handles redirects and invalid local certs more
     // robustly than a hand-rolled HTTP parser. It is isolated on the blocking
     // pool by the async wrapper.
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
+        .local_address(local_addr)
         .danger_accept_invalid_certs(true)
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -296,19 +306,27 @@ fn favicon_fingerprint_from_reader(
     })
 }
 
-async fn tls_certificate_probe(ip: IpAddr, port: u16, timeout: Duration) -> Option<TlsCertificate> {
-    tokio::task::spawn_blocking(move || blocking_tls_certificate_probe(ip, port, timeout))
-        .await
-        .ok()
-        .flatten()
+async fn tls_certificate_probe(
+    ip: IpAddr,
+    local_addr: IpAddr,
+    port: u16,
+    timeout: Duration,
+) -> Option<TlsCertificate> {
+    tokio::task::spawn_blocking(move || {
+        blocking_tls_certificate_probe(ip, local_addr, port, timeout)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn blocking_tls_certificate_probe(
     ip: IpAddr,
+    local_addr: IpAddr,
     port: u16,
     timeout: Duration,
 ) -> Option<TlsCertificate> {
-    let stream = StdTcpStream::connect_timeout(&SocketAddr::new(ip, port), timeout).ok()?;
+    let stream = super::connect_blocking_tcp_from(local_addr, ip, port, timeout)?;
     stream.set_read_timeout(Some(timeout)).ok()?;
     stream.set_write_timeout(Some(timeout)).ok()?;
     let connector = native_tls::TlsConnector::builder()
@@ -533,6 +551,7 @@ mod tests {
         });
 
         let probe = blocking_web_probe(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             port,
             false,

@@ -680,6 +680,7 @@ fn read_dns_name(buf: &[u8], mut offset: usize) -> Option<(String, usize)> {
 
 pub async fn netbios_probe_with_callback<F>(
     ips: Vec<IpAddr>,
+    local_ip: Ipv4Addr,
     timeout: Duration,
     limiter: Arc<Semaphore>,
     mut on_result: F,
@@ -701,9 +702,7 @@ where
                 return None;
             };
             let query = build_netbios_query(0x4000);
-            let socket = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-                .await
-                .ok()?;
+            let socket = tokio::net::UdpSocket::bind((local_ip, 0)).await.ok()?;
             let _ = socket.send_to(&query, (ipv4, 137)).await.ok()?;
             let mut buf = [0_u8; 1500];
             match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {

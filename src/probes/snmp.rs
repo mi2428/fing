@@ -4,7 +4,12 @@
 //! single GET request. Keeping the codec local avoids a broad SNMP dependency
 //! while still collecting stable sysName/sysDescr/sysObjectID identity fields.
 
-use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{sync::Semaphore, task::JoinSet};
 
 const SYS_DESCR_OID: &[u32] = &[1, 3, 6, 1, 2, 1, 1, 1, 0];
@@ -34,6 +39,7 @@ pub struct SnmpInfo {
 
 pub async fn probe_system_with_callback<F>(
     ips: Vec<IpAddr>,
+    local_addr: IpAddr,
     community: String,
     timeout: Duration,
     limiter: Arc<Semaphore>,
@@ -51,7 +57,7 @@ where
             let Ok(_permit) = limiter.acquire_owned().await else {
                 return None;
             };
-            probe_system_one(ip, community, timeout)
+            probe_system_one(ip, local_addr, community, timeout)
                 .await
                 .map(|value| (ip, value))
         });
@@ -67,12 +73,23 @@ where
     result
 }
 
-async fn probe_system_one(ip: IpAddr, community: String, timeout: Duration) -> Option<SnmpInfo> {
+async fn probe_system_one(
+    ip: IpAddr,
+    local_addr: IpAddr,
+    community: String,
+    timeout: Duration,
+) -> Option<SnmpInfo> {
+    if !super::same_ip_family(local_addr, ip) {
+        return None;
+    }
+
     // Request the system group fields in one packet. Devices that reject SNMP,
     // time out, or return an error simply produce no evidence for that host.
     let oids = SYSTEM_OIDS.iter().map(|(_, oid)| *oid).collect::<Vec<_>>();
     let packet = build_get_request_for_oids(0x4f52_0002, &community, &oids);
-    let socket = tokio::net::UdpSocket::bind(("0.0.0.0", 0)).await.ok()?;
+    let socket = tokio::net::UdpSocket::bind(SocketAddr::new(local_addr, 0))
+        .await
+        .ok()?;
     socket.send_to(&packet, (ip, 161)).await.ok()?;
 
     let mut buffer = [0_u8; 4096];

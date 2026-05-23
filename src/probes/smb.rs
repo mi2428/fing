@@ -35,6 +35,7 @@ pub struct NtlmHostInfo {
 
 pub async fn probe_hosts_with_callback<F>(
     ips: Vec<IpAddr>,
+    local_addr: IpAddr,
     timeout: Duration,
     limiter: Arc<Semaphore>,
     mut on_result: F,
@@ -50,7 +51,9 @@ where
             let Ok(_permit) = limiter.acquire_owned().await else {
                 return None;
             };
-            probe_one(ip, timeout).await.map(|info| (ip, info))
+            probe_one(ip, local_addr, timeout)
+                .await
+                .map(|info| (ip, info))
         });
     }
 
@@ -64,15 +67,12 @@ where
     result
 }
 
-async fn probe_one(ip: IpAddr, timeout: Duration) -> Option<SmbInfo> {
+async fn probe_one(ip: IpAddr, local_addr: IpAddr, timeout: Duration) -> Option<SmbInfo> {
     // The negotiate request is a low-impact identity probe: it stops before
     // authentication and records protocol metadata rather than enumerating
     // shares. That is enough to separate Windows, Samba, NAS, and embedded SMB
     // stacks when combined with vendor/name evidence.
-    let mut stream = tokio::time::timeout(timeout, TcpStream::connect((ip, 445)))
-        .await
-        .ok()?
-        .ok()?;
+    let mut stream = super::connect_tcp_from(local_addr, ip, 445, timeout).await?;
     let request = smb2_negotiate_request();
     tokio::time::timeout(timeout, stream.write_all(&request))
         .await

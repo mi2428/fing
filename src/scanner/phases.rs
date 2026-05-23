@@ -213,6 +213,7 @@ pub(super) async fn run_multicast_enrichment(
 
 pub(super) async fn run_name_enrichment(
     config: &ScanConfig,
+    interface_ip: Ipv4Addr,
     ips: Vec<IpAddr>,
     events: &Option<UnboundedSender<ScanEvent>>,
     limiter: Arc<Semaphore>,
@@ -261,6 +262,7 @@ pub(super) async fn run_name_enrichment(
             Some(
                 enrich::netbios_probe_with_callback(
                     netbios_ips,
+                    interface_ip,
                     config.timeout,
                     netbios_limiter,
                     move |ip, names| {
@@ -291,6 +293,7 @@ pub(super) async fn run_name_enrichment(
 
 pub(super) async fn run_deep_and_snmp_enrichment(
     config: &ScanConfig,
+    interface_ip: Ipv4Addr,
     ips: Vec<IpAddr>,
     events: &Option<UnboundedSender<ScanEvent>>,
     limiter: Arc<Semaphore>,
@@ -326,6 +329,7 @@ pub(super) async fn run_deep_and_snmp_enrichment(
             Some(
                 deep::probe_hosts_with_callback(
                     deep_ips,
+                    IpAddr::V4(interface_ip),
                     config.timeout,
                     deep_limiter,
                     move |ip, probe| {
@@ -343,6 +347,7 @@ pub(super) async fn run_deep_and_snmp_enrichment(
             Some(
                 snmp::probe_system_with_callback(
                     snmp_ips,
+                    IpAddr::V4(interface_ip),
                     config.snmp_community.clone(),
                     config.timeout,
                     snmp_limiter,

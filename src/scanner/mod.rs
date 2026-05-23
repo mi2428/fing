@@ -1048,6 +1048,7 @@ async fn scan_inner(
     let (name_tx, mut name_rx) = tokio::sync::mpsc::unbounded_channel();
     let name_future = run_name_enrichment(
         &config,
+        iface.ip,
         ips.clone(),
         &events,
         Arc::clone(&probe_limiter),
@@ -1083,6 +1084,7 @@ async fn scan_inner(
     let (probe_tx, mut probe_rx) = tokio::sync::mpsc::unbounded_channel();
     let probe_future = run_deep_and_snmp_enrichment(
         &config,
+        iface.ip,
         ips.clone(),
         &events,
         Arc::clone(&probe_limiter),
@@ -1130,6 +1132,7 @@ async fn scan_inner(
             let (smb_tx, mut smb_rx) = tokio::sync::mpsc::unbounded_channel();
             let smb_future = smb::probe_hosts_with_callback(
                 smb_ips,
+                IpAddr::V4(iface.ip),
                 config.timeout,
                 Arc::clone(&probe_limiter),
                 move |ip, info| {
