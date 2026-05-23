@@ -5,7 +5,7 @@
 //! can still correlate devices by full MAC internally and preserve useful cache
 //! continuity across IP changes.
 
-use crate::model::{Device, ScanResult};
+use crate::model::{Device, Guess, ScanResult};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OutputOptions {
@@ -41,11 +41,25 @@ pub fn csv_mac(mac: Option<&str>, options: OutputOptions) -> String {
     }
 }
 
-pub fn masked_scan_result(result: &ScanResult, options: OutputOptions) -> ScanResult {
-    let mut result = result.clone();
-    for device in &mut result.devices {
+pub fn display_identity(value: &str, options: OutputOptions) -> String {
+    if options.mask_mac() {
+        mask_identity_text(value)
+    } else {
+        value.to_string()
+    }
+}
+
+pub fn masked_devices(devices: &[Device], options: OutputOptions) -> Vec<Device> {
+    let mut devices = devices.to_vec();
+    for device in &mut devices {
         mask_device(device, options);
     }
+    devices
+}
+
+pub fn masked_scan_result(result: &ScanResult, options: OutputOptions) -> ScanResult {
+    let mut result = result.clone();
+    result.devices = masked_devices(&result.devices, options);
     result
 }
 
@@ -58,8 +72,42 @@ fn mask_device(device: &mut Device, options: OutputOptions) {
         device.mac = Some(mask_lower_24_bits(mac));
     }
 
+    mask_optional_identity(&mut device.vendor);
+    mask_optional_identity(&mut device.hostname);
+    for name in &mut device.names {
+        name.name = mask_identity_text(&name.name);
+    }
+    mask_guess_identity(&mut device.make);
+    mask_guess_identity(&mut device.model);
+    mask_guess_identity(&mut device.os);
+    mask_guess_identity(&mut device.device_type);
+    for service in &mut device.services {
+        service.name = mask_identity_text(&service.name);
+    }
+
     for evidence in &mut device.evidence {
         evidence.value = mask_mac_evidence_value(&evidence.key, &evidence.value);
+    }
+}
+
+fn mask_optional_identity(value: &mut Option<String>) {
+    if let Some(value) = value {
+        *value = mask_identity_text(value);
+    }
+}
+
+fn mask_guess_identity(guess: &mut Option<Guess>) {
+    if let Some(guess) = guess {
+        guess.value = mask_identity_text(&guess.value);
+    }
+}
+
+fn mask_identity_text(value: &str) -> String {
+    let masked = mask_compact_mac_tokens(&mask_separated_macs_relaxed(value));
+    if masked == value {
+        value.to_string()
+    } else {
+        masked
     }
 }
 
@@ -114,10 +162,24 @@ fn mask_dhcp_mac_client_id(value: &str) -> Option<String> {
 }
 
 fn mask_separated_macs(value: &str) -> String {
+    mask_separated_macs_with_boundary(value, MacBoundary::Strict)
+}
+
+fn mask_separated_macs_relaxed(value: &str) -> String {
+    mask_separated_macs_with_boundary(value, MacBoundary::Relaxed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacBoundary {
+    Strict,
+    Relaxed,
+}
+
+fn mask_separated_macs_with_boundary(value: &str, boundary: MacBoundary) -> String {
     let mut masked = String::with_capacity(value.len());
     let mut index = 0;
     while index < value.len() {
-        if let Some((end, mac)) = separated_mac_at(value, index) {
+        if let Some((end, mac)) = separated_mac_at(value, index, boundary) {
             masked.push_str(&mask_lower_24_bits(mac));
             index = end;
         } else {
@@ -132,12 +194,12 @@ fn mask_separated_macs(value: &str) -> String {
     masked
 }
 
-fn separated_mac_at(value: &str, start: usize) -> Option<(usize, &str)> {
+fn separated_mac_at(value: &str, start: usize, boundary: MacBoundary) -> Option<(usize, &str)> {
     let bytes = value.as_bytes();
     if start + 17 > bytes.len() {
         return None;
     }
-    if start > 0 && is_mac_token_byte(bytes[start - 1]) {
+    if start > 0 && !mac_start_boundary(bytes[start - 1], boundary) {
         return None;
     }
 
@@ -157,14 +219,65 @@ fn separated_mac_at(value: &str, start: usize) -> Option<(usize, &str)> {
     }
 
     let end = start + 17;
-    if end < bytes.len() && is_mac_token_byte(bytes[end]) {
+    if end < bytes.len() && !mac_end_boundary(bytes[end], boundary) {
         return None;
     }
     Some((end, &value[start..end]))
 }
 
+fn mac_start_boundary(byte: u8, boundary: MacBoundary) -> bool {
+    match boundary {
+        MacBoundary::Strict => !is_mac_token_byte(byte),
+        MacBoundary::Relaxed => !byte.is_ascii_hexdigit(),
+    }
+}
+
+fn mac_end_boundary(byte: u8, boundary: MacBoundary) -> bool {
+    mac_start_boundary(byte, boundary)
+}
+
 fn is_mac_token_byte(byte: u8) -> bool {
     byte.is_ascii_hexdigit() || matches!(byte, b':' | b'-')
+}
+
+fn mask_compact_mac_tokens(value: &str) -> String {
+    let mut masked = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        if let Some((end, mac)) = compact_mac_token_at(value, index) {
+            masked.push_str(&mask_lower_24_bits(mac));
+            index = end;
+        } else {
+            let ch = value[index..]
+                .chars()
+                .next()
+                .expect("index should be at a valid character boundary");
+            masked.push(ch);
+            index += ch.len_utf8();
+        }
+    }
+    masked
+}
+
+fn compact_mac_token_at(value: &str, start: usize) -> Option<(usize, &str)> {
+    let bytes = value.as_bytes();
+    if start + 12 > bytes.len() {
+        return None;
+    }
+    if start > 0 && bytes[start - 1].is_ascii_hexdigit() {
+        return None;
+    }
+    if !bytes[start..start + 12]
+        .iter()
+        .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let end = start + 12;
+    if end < bytes.len() && bytes[end].is_ascii_hexdigit() {
+        return None;
+    }
+    Some((end, &value[start..end]))
 }
 
 fn mask_compact_mac(value: &str) -> Option<String> {
@@ -236,6 +349,12 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let mut device = Device::new("192.168.1.10".parse().unwrap(), now);
         device.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+        device.vendor = Some("vendor aa-bb-cc-dd-ee-ff".to_string());
+        device.add_name("AABBCCDDEEFF", "mdns", 0.9);
+        device.add_name("android-AABBCCDDEEFF", "netbios", 0.8);
+        device.set_model_guess("aa:bb:cc:dd:ee:ff camera", "upnp", 0.85);
+        device.set_os_guess("AA-BB-CC-DD-EE-FF OS", "netbios", 0.8);
+        device.add_service("aa-bb-cc-dd-ee-ff", "mdns", None, 0.7);
         let result = ScanResult {
             target: "192.168.1.0/24".to_string(),
             interface: "en0".to_string(),
@@ -252,7 +371,40 @@ mod tests {
         );
 
         assert_eq!(masked.devices[0].mac.as_deref(), Some("aa:bb:cc:**:**:**"));
+        assert_eq!(
+            masked.devices[0].hostname.as_deref(),
+            Some("aa:bb:cc:**:**:**")
+        );
+        assert!(
+            masked.devices[0]
+                .names
+                .iter()
+                .any(|name| name.name == "android-aa:bb:cc:**:**:**")
+        );
+        assert_eq!(
+            masked.devices[0].vendor.as_deref(),
+            Some("vendor aa:bb:cc:**:**:**")
+        );
+        assert_eq!(
+            masked.devices[0]
+                .model
+                .as_ref()
+                .map(|guess| guess.value.as_str()),
+            Some("aa:bb:cc:**:**:** camera")
+        );
+        assert_eq!(
+            masked.devices[0]
+                .os
+                .as_ref()
+                .map(|guess| guess.value.as_str()),
+            Some("aa:bb:cc:**:**:** OS")
+        );
+        assert_eq!(
+            masked.devices[0].services[0].name.as_str(),
+            "aa:bb:cc:**:**:**"
+        );
         assert_eq!(result.devices[0].mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(result.devices[0].hostname.as_deref(), Some("AABBCCDDEEFF"));
     }
 
     #[test]

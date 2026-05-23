@@ -736,8 +736,8 @@ mod tests {
     use super::*;
     use super::{
         devices::{
-            DeviceColumn, DeviceTableColumn, device_row_style, stale_device_row_style,
-            visible_columns,
+            DeviceColumn, DeviceTableColumn, device_log_summary, device_row_style,
+            stale_device_row_style, visible_columns,
         },
         interfaces::{
             INTERFACE_PANEL_VISIBLE_ROWS, InterfaceColumn, InterfaceTableColumn,
@@ -1084,6 +1084,35 @@ mod tests {
         }
         .value(&device, OutputOptions::default());
         assert_eq!(sources, "ADLMO");
+    }
+
+    #[test]
+    fn live_device_identity_fields_respect_mac_masking() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut device = Device::new("192.168.1.10".parse().unwrap(), now);
+        device.vendor = Some("vendor aa-bb-cc-dd-ee-ff".to_string());
+        device.add_name("AA-BB-CC-DD-EE-FF", "mdns", 0.9);
+        device.set_model_guess("AABBCCDDEEFF", "upnp", 0.85);
+        let options = OutputOptions {
+            mac: MacAddressDisplay::MaskLower24,
+        };
+
+        assert_eq!(
+            DeviceColumn::Vendor.value(&device, options),
+            "vendor aa:bb:cc:**:**:**"
+        );
+        assert_eq!(
+            DeviceColumn::Model.value(&device, options),
+            "aa:bb:cc:**:**:**"
+        );
+        assert_eq!(
+            DeviceColumn::Name.value(&device, options),
+            "aa:bb:cc:**:**:**"
+        );
+        let summary = device_log_summary(&device, options);
+        assert!(summary.contains("aa:bb:cc:**:**:**"));
+        assert!(!summary.contains("AA-BB-CC-DD-EE-FF"));
+        assert!(!summary.contains("AABBCCDDEEFF"));
     }
 
     #[test]

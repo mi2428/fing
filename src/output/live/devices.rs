@@ -134,20 +134,28 @@ impl DeviceColumn {
             Self::Ip => device.ip.to_string(),
             Self::Interface => device.interface.as_deref().unwrap_or("-").to_string(),
             Self::Mac => super::super::privacy::display_mac(device.mac.as_deref(), options),
-            Self::Vendor => device.vendor.as_deref().unwrap_or("-").to_string(),
-            Self::Model => device
-                .model
-                .as_ref()
-                .map(|guess| guess.value.as_str())
-                .unwrap_or("-")
-                .to_string(),
-            Self::Name => device.hostname.as_deref().unwrap_or("-").to_string(),
-            Self::Os => device
-                .os
-                .as_ref()
-                .map(|guess| guess.value.as_str())
-                .unwrap_or("-")
-                .to_string(),
+            Self::Vendor => {
+                display_identity_value(device.vendor.as_deref().unwrap_or("-"), options)
+            }
+            Self::Model => display_identity_value(
+                device
+                    .model
+                    .as_ref()
+                    .map(|guess| guess.value.as_str())
+                    .unwrap_or("-"),
+                options,
+            ),
+            Self::Name => {
+                display_identity_value(device.hostname.as_deref().unwrap_or("-"), options)
+            }
+            Self::Os => display_identity_value(
+                device
+                    .os
+                    .as_ref()
+                    .map(|guess| guess.value.as_str())
+                    .unwrap_or("-"),
+                options,
+            ),
             Self::Confidence => format!("{:.2}", device.identity_confidence()),
             Self::Sources => super::super::sources::compact_source_summary(device),
             Self::Seen => local_time(device.last_seen),
@@ -426,10 +434,10 @@ pub(super) fn device_log_summary(device: &Device, options: super::super::OutputO
             &super::super::privacy::display_mac(device.mac.as_deref(), options),
             17
         ),
-        log_optional_value(device.vendor.as_deref(), 24),
-        log_field_value(guess_value(&device.model), 20),
-        log_optional_value(device.hostname.as_deref(), 24),
-        log_field_value(guess_value(&device.os), 20),
+        log_optional_identity_value(device.vendor.as_deref(), options, 24),
+        log_identity_value(guess_value(&device.model), options, 20),
+        log_optional_identity_value(device.hostname.as_deref(), options, 24),
+        log_identity_value(guess_value(&device.os), options, 20),
         device.identity_confidence(),
         super::super::sources::compact_source_summary(device),
         local_time(device.last_seen),
@@ -438,8 +446,24 @@ pub(super) fn device_log_summary(device: &Device, options: super::super::OutputO
     )
 }
 
-fn log_optional_value(value: Option<&str>, max_chars: usize) -> String {
-    log_field_value(value.unwrap_or("-"), max_chars)
+fn log_optional_identity_value(
+    value: Option<&str>,
+    options: super::super::OutputOptions,
+    max_chars: usize,
+) -> String {
+    log_identity_value(value.unwrap_or("-"), options, max_chars)
+}
+
+fn log_identity_value(
+    value: &str,
+    options: super::super::OutputOptions,
+    max_chars: usize,
+) -> String {
+    log_field_value(&display_identity_value(value, options), max_chars)
+}
+
+fn display_identity_value(value: &str, options: super::super::OutputOptions) -> String {
+    super::super::privacy::display_identity(value, options)
 }
 
 fn log_field_value(value: &str, max_chars: usize) -> String {

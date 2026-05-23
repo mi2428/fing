@@ -13,6 +13,11 @@ pub fn to_table(devices: &[Device], options: OutputOptions) -> String {
     // The human table omits device_type on purpose: type is mainly a rule output
     // used by CSV/JSON consumers, while terminal width is better spent on direct
     // identity fields such as make/model/name/OS.
+    let masked_devices = options
+        .mask_mac()
+        .then(|| privacy::masked_devices(devices, options));
+    let devices = masked_devices.as_deref().unwrap_or(devices);
+
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
     table.set_header(vec![
@@ -76,6 +81,11 @@ pub fn to_json(result: &ScanResult, options: OutputOptions) -> Result<String> {
 pub fn to_csv(devices: &[Device], options: OutputOptions) -> Result<String> {
     // CSV keeps device_type even though the human table omits it; spreadsheets
     // and automation usually benefit from the structured classification.
+    let masked_devices = options
+        .mask_mac()
+        .then(|| privacy::masked_devices(devices, options));
+    let devices = masked_devices.as_deref().unwrap_or(devices);
+
     let mut writer = csv::Writer::from_writer(Vec::new());
     writer.write_record([
         "ip",
@@ -201,6 +211,25 @@ mod tests {
 
         assert!(table.contains("aa:bb:cc:**:**:**"));
         assert!(!table.contains("aa:bb:cc:dd:ee:ff"));
+    }
+
+    #[test]
+    fn table_and_csv_mask_mac_like_identity_fields_when_requested() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut device = Device::new("192.168.1.10".parse().unwrap(), now);
+        device.add_name("AA-BB-CC-DD-EE-FF", "mdns", 0.9);
+        device.set_model_guess("AABBCCDDEEFF", "upnp", 0.85);
+
+        let options = OutputOptions {
+            mac: MacAddressDisplay::MaskLower24,
+        };
+        let table = to_table(&[device.clone()], options);
+        let csv = to_csv(&[device], options).unwrap();
+
+        assert!(table.contains("aa:bb:cc:**:**:**"));
+        assert!(csv.contains("aa:bb:cc:**:**:**"));
+        assert!(!table.contains("AA-BB-CC-DD-EE-FF"));
+        assert!(!csv.contains("AABBCCDDEEFF"));
     }
 
     #[test]
