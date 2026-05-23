@@ -234,7 +234,7 @@ fn blocking_web_probe(ip: IpAddr, port: u16, https: bool, timeout: Duration) -> 
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
         .danger_accept_invalid_certs(true)
-        .redirect(reqwest::redirect::Policy::limited(2))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()?;
     let scheme = if https { "https" } else { "http" };
@@ -424,6 +424,13 @@ pub fn device_type_hint_from_port(port: u16) -> Option<(&'static str, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::Write as _,
+        net::{Ipv4Addr, TcpListener},
+        sync::mpsc,
+        thread,
+        time::{Duration as StdDuration, Instant},
+    };
 
     #[test]
     fn extracts_http_server_header() {
@@ -468,6 +475,80 @@ mod tests {
 
         assert!(banner.contains("HTTP 200"));
         assert!(banner.contains("server: nginx"));
+    }
+
+    #[test]
+    fn web_probe_does_not_follow_redirects() {
+        let redirect_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        redirect_listener.set_nonblocking(true).unwrap();
+        let redirect_port = redirect_listener.local_addr().unwrap().port();
+        let (hit_tx, hit_rx) = mpsc::channel();
+        let redirect_target = thread::spawn(move || {
+            let deadline = Instant::now() + StdDuration::from_millis(400);
+            while Instant::now() < deadline {
+                match redirect_listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+                        let _ = hit_tx.send(());
+                        return;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(StdDuration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let redirect_url = format!("http://127.0.0.1:{redirect_port}/outside");
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + StdDuration::from_secs(2);
+            let mut handled = 0;
+            while handled < 2 && Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(StdDuration::from_millis(10));
+                    continue;
+                };
+                let mut request = [0_u8; 1024];
+                let len = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..len]);
+                let response = if request.starts_with("HEAD ") {
+                    format!(
+                        "HTTP/1.1 302 Found\r\n\
+                         Location: {redirect_url}\r\n\
+                         Server: redirector\r\n\
+                         Content-Length: 0\r\n\
+                         \r\n"
+                    )
+                } else {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string()
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+                handled += 1;
+            }
+        });
+
+        let probe = blocking_web_probe(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+            false,
+            Duration::from_millis(500),
+        )
+        .unwrap();
+
+        server.join().unwrap();
+        redirect_target.join().unwrap();
+
+        assert!(hit_rx.try_recv().is_err());
+        assert!(
+            probe.banner.as_deref().is_some_and(|banner| {
+                banner.contains("HTTP 302") && banner.contains("location:")
+            })
+        );
     }
 
     #[test]
