@@ -31,7 +31,7 @@ $ make -C fing install
 > Pick the asset that matches your machine, make it executable, and place it on your `PATH`.
 >
 > ```console
-> $ curl -L -o fing https://github.com/mi2428/fing/releases/download/v0.10.0/fing-v0.10.0-darwin-arm64
+> $ curl -L -o fing https://github.com/mi2428/fing/releases/download/v0.11.0/fing-v0.11.0-darwin-arm64
 > $ chmod +x ./fing
 > ```
 
