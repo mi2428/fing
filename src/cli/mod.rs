@@ -95,72 +95,104 @@ struct FingerprintSelection {
 }
 
 impl FingerprintSelection {
-    fn from_args(
-        sources: &[FingerprintSourceArg],
-        disabled_sources: &[FingerprintSourceArg],
-        profile: ScanProfile,
-    ) -> Self {
-        let mut selection = if sources.is_empty() {
-            let deep = profile.includes_deep_probes();
-            Self {
+    fn from_profile(profile: ScanProfile) -> Self {
+        match profile {
+            ScanProfile::None => Self::none(),
+            ScanProfile::Fast | ScanProfile::Normal => Self {
                 oui: true,
                 rdns: true,
                 mdns: true,
                 netbios: true,
                 upnp: true,
-                deep,
-                ssh: deep,
-                http: profile.includes_deep_probes(),
-                tls: profile.includes_deep_probes(),
-                smb: profile.includes_deep_probes(),
+                deep: false,
+                ssh: false,
+                http: false,
+                tls: false,
+                smb: false,
                 snmp: true,
-                lldp: profile.includes_lldp_fingerprints(),
-                cdp: profile.includes_cdp_fingerprints(),
+                lldp: false,
+                cdp: false,
                 dhcp: true,
-            }
-        } else {
-            let deep = sources.contains(&FingerprintSourceArg::Deep);
-            Self {
-                oui: sources.contains(&FingerprintSourceArg::Oui),
-                rdns: sources.contains(&FingerprintSourceArg::Rdns),
-                mdns: sources.contains(&FingerprintSourceArg::Mdns),
-                netbios: sources.contains(&FingerprintSourceArg::Netbios),
-                upnp: sources.contains(&FingerprintSourceArg::Upnp),
-                deep,
-                ssh: deep || sources.contains(&FingerprintSourceArg::Ssh),
-                http: sources.contains(&FingerprintSourceArg::Http),
-                tls: sources.contains(&FingerprintSourceArg::Tls),
-                smb: sources.contains(&FingerprintSourceArg::Smb),
-                snmp: sources.contains(&FingerprintSourceArg::Snmp),
-                lldp: sources.contains(&FingerprintSourceArg::Lldp),
-                cdp: sources.contains(&FingerprintSourceArg::Cdp),
-                dhcp: sources.contains(&FingerprintSourceArg::Dhcp),
-            }
-        };
-
-        for source in disabled_sources {
-            match source {
-                FingerprintSourceArg::Oui => selection.oui = false,
-                FingerprintSourceArg::Rdns => selection.rdns = false,
-                FingerprintSourceArg::Mdns => selection.mdns = false,
-                FingerprintSourceArg::Netbios => selection.netbios = false,
-                FingerprintSourceArg::Upnp => selection.upnp = false,
-                FingerprintSourceArg::Deep => {
-                    selection.deep = false;
-                    selection.ssh = false;
-                }
-                FingerprintSourceArg::Ssh => selection.ssh = false,
-                FingerprintSourceArg::Http => selection.http = false,
-                FingerprintSourceArg::Tls => selection.tls = false,
-                FingerprintSourceArg::Smb => selection.smb = false,
-                FingerprintSourceArg::Snmp => selection.snmp = false,
-                FingerprintSourceArg::Lldp => selection.lldp = false,
-                FingerprintSourceArg::Cdp => selection.cdp = false,
-                FingerprintSourceArg::Dhcp => selection.dhcp = false,
-            }
+            },
+            ScanProfile::Deep => Self {
+                oui: true,
+                rdns: true,
+                mdns: true,
+                netbios: true,
+                upnp: true,
+                deep: true,
+                ssh: false,
+                http: true,
+                tls: true,
+                smb: true,
+                snmp: true,
+                lldp: true,
+                cdp: true,
+                dhcp: true,
+            },
         }
+    }
 
-        selection
+    fn none() -> Self {
+        Self {
+            oui: false,
+            rdns: false,
+            mdns: false,
+            netbios: false,
+            upnp: false,
+            deep: false,
+            ssh: false,
+            http: false,
+            tls: false,
+            smb: false,
+            snmp: false,
+            lldp: false,
+            cdp: false,
+            dhcp: false,
+        }
+    }
+
+    fn from_args(
+        sources: &[FingerprintSourceArg],
+        disabled_sources: &[FingerprintSourceArg],
+        profile: ScanProfile,
+    ) -> Self {
+        let base = Self::from_profile(profile);
+        let enabled = |source| sources.contains(&source);
+        let disabled = |source| disabled_sources.contains(&source);
+
+        let deep = (base.deep || enabled(FingerprintSourceArg::Deep))
+            && !disabled(FingerprintSourceArg::Deep);
+
+        Self {
+            oui: (base.oui || enabled(FingerprintSourceArg::Oui))
+                && !disabled(FingerprintSourceArg::Oui),
+            rdns: (base.rdns || enabled(FingerprintSourceArg::Rdns))
+                && !disabled(FingerprintSourceArg::Rdns),
+            mdns: (base.mdns || enabled(FingerprintSourceArg::Mdns))
+                && !disabled(FingerprintSourceArg::Mdns),
+            netbios: (base.netbios || enabled(FingerprintSourceArg::Netbios))
+                && !disabled(FingerprintSourceArg::Netbios),
+            upnp: (base.upnp || enabled(FingerprintSourceArg::Upnp))
+                && !disabled(FingerprintSourceArg::Upnp),
+            deep,
+            ssh: (deep || enabled(FingerprintSourceArg::Ssh))
+                && !disabled(FingerprintSourceArg::Ssh),
+            http: (base.http || enabled(FingerprintSourceArg::Http))
+                && !disabled(FingerprintSourceArg::Http),
+            tls: (base.tls || enabled(FingerprintSourceArg::Tls))
+                && !disabled(FingerprintSourceArg::Tls),
+            smb: (base.smb || enabled(FingerprintSourceArg::Smb))
+                && !disabled(FingerprintSourceArg::Smb),
+            snmp: (base.snmp || enabled(FingerprintSourceArg::Snmp))
+                && !disabled(FingerprintSourceArg::Snmp),
+            lldp: (base.lldp || enabled(FingerprintSourceArg::Lldp))
+                && !disabled(FingerprintSourceArg::Lldp),
+            cdp: (base.cdp || enabled(FingerprintSourceArg::Cdp))
+                && !disabled(FingerprintSourceArg::Cdp),
+            dhcp: (base.dhcp || enabled(FingerprintSourceArg::Dhcp))
+                && !disabled(FingerprintSourceArg::Dhcp),
+        }
     }
 }
 
@@ -198,7 +230,7 @@ struct ScanArgs {
     #[arg(long = "output.mask-mac")]
     mask_mac: bool,
 
-    /// Limit fingerprint sources. Defaults to profile-appropriate sources when omitted.
+    /// Enable additional fingerprint sources on top of the selected profile.
     #[arg(
         long = "fingerprint.source",
         value_enum,
@@ -208,7 +240,7 @@ struct ScanArgs {
     )]
     fingerprints: Vec<FingerprintSourceArg>,
 
-    /// Disable specific fingerprint sources after profile defaults/allowlist selection.
+    /// Disable specific fingerprint sources after profile and additive selection.
     #[arg(
         long = "no-fingerprint.source",
         value_enum,
@@ -627,6 +659,7 @@ mod tests {
         assert!(configs[0].netbios);
         assert!(configs[0].upnp);
         assert!(!configs[0].deep);
+        assert!(!configs[0].ssh);
         assert!(!configs[0].http);
         assert!(!configs[0].tls);
         assert!(!configs[0].smb);
@@ -644,11 +677,35 @@ mod tests {
         let configs = scan_configs_from_args(&args, Duration::from_millis(1)).unwrap();
 
         assert!(configs[0].deep);
+        assert!(configs[0].ssh);
         assert!(configs[0].http);
         assert!(configs[0].tls);
         assert!(configs[0].smb);
         assert!(configs[0].lldp);
         assert!(configs[0].cdp);
+    }
+
+    #[test]
+    fn none_profile_disables_all_fingerprint_sources_by_default() {
+        let mut args = scan_args();
+        args.profile = ScanProfile::None;
+
+        let configs = scan_configs_from_args(&args, Duration::from_millis(1)).unwrap();
+
+        assert!(!configs[0].oui);
+        assert!(!configs[0].rdns);
+        assert!(!configs[0].mdns);
+        assert!(!configs[0].netbios);
+        assert!(!configs[0].upnp);
+        assert!(!configs[0].deep);
+        assert!(!configs[0].ssh);
+        assert!(!configs[0].http);
+        assert!(!configs[0].tls);
+        assert!(!configs[0].smb);
+        assert!(!configs[0].snmp);
+        assert!(!configs[0].lldp);
+        assert!(!configs[0].cdp);
+        assert!(!configs[0].dhcp);
     }
 
     #[test]
@@ -734,14 +791,14 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_sources_are_an_allowlist_when_specified() {
+    fn fingerprint_sources_add_to_profile_defaults_when_specified() {
         let cli = Cli::try_parse_from([
             "fing",
             "scan",
             "--fingerprint.source",
             "dhcp,mdns,lldp,cdp",
             "--fingerprint.source",
-            "snmp",
+            "ssh",
             "en0",
         ])
         .unwrap();
@@ -757,18 +814,18 @@ mod tests {
                 FingerprintSourceArg::Mdns,
                 FingerprintSourceArg::Lldp,
                 FingerprintSourceArg::Cdp,
-                FingerprintSourceArg::Snmp,
+                FingerprintSourceArg::Ssh,
             ]
         );
 
         let configs = scan_configs_from_args(&args, Duration::from_millis(1)).unwrap();
-        assert!(!configs[0].oui);
-        assert!(!configs[0].rdns);
+        assert!(configs[0].oui);
+        assert!(configs[0].rdns);
         assert!(configs[0].mdns);
-        assert!(!configs[0].netbios);
-        assert!(!configs[0].upnp);
+        assert!(configs[0].netbios);
+        assert!(configs[0].upnp);
         assert!(!configs[0].deep);
-        assert!(!configs[0].ssh);
+        assert!(configs[0].ssh);
         assert!(!configs[0].http);
         assert!(!configs[0].tls);
         assert!(!configs[0].smb);
@@ -779,12 +836,10 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_allowlist_can_enable_deep_http_tls_and_smb_independently() {
+    fn fingerprint_sources_can_add_deep_http_tls_and_smb_independently() {
         let cli = Cli::try_parse_from([
             "fing",
             "scan",
-            "--scan.profile",
-            "deep",
             "--fingerprint.source",
             "oui,http,tls,smb",
             "en0",
@@ -802,10 +857,10 @@ mod tests {
         assert!(configs[0].http);
         assert!(configs[0].tls);
         assert!(configs[0].smb);
-        assert!(!configs[0].snmp);
+        assert!(configs[0].snmp);
         assert!(!configs[0].lldp);
         assert!(!configs[0].cdp);
-        assert!(!configs[0].dhcp);
+        assert!(configs[0].dhcp);
     }
 
     #[test]
@@ -835,9 +890,17 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_allowlist_can_enable_ssh_without_other_deep_probes() {
-        let cli =
-            Cli::try_parse_from(["fing", "scan", "--fingerprint.source", "ssh", "en0"]).unwrap();
+    fn none_profile_plus_fingerprint_source_can_enable_ssh_without_other_sources() {
+        let cli = Cli::try_parse_from([
+            "fing",
+            "scan",
+            "--scan.profile",
+            "none",
+            "--fingerprint.source",
+            "ssh",
+            "en0",
+        ])
+        .unwrap();
 
         let Commands::Scan(args) = cli.command else {
             panic!("expected scan command");

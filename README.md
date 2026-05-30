@@ -49,7 +49,7 @@ Arguments:
 
 Options:
       --scan.range <CIDR>               Limit scanning to one or more IPv4 CIDR ranges. Can be repeated or comma-separated
-      --scan.profile <PROFILE>          Scan profile [default: normal] [possible values: fast, normal, deep]
+      --scan.profile <PROFILE>          Scan profile [default: normal] [possible values: none, fast, normal, deep]
       --scan.interval <MS>              Delay between continuous scan rounds in milliseconds. Zero starts the next round immediately [default: 0]
       --scan.timeout <MS>               Per-protocol timeout in milliseconds
       --scan.concurrency <CONCURRENCY>  Concurrent scan/probe worker limit [default: 128]
@@ -61,9 +61,9 @@ Options:
 
 Fingerprint Options:
       --fingerprint.source <SOURCE>
-          Limit fingerprint sources. Defaults to profile-appropriate sources when omitted [possible values: oui, rdns, mdns, netbios, upnp, deep, ssh, http, tls, smb, snmp, lldp, cdp, dhcp]
+          Enable additional fingerprint sources on top of the selected profile [possible values: oui, rdns, mdns, netbios, upnp, deep, ssh, http, tls, smb, snmp, lldp, cdp, dhcp]
       --no-fingerprint.source <SOURCE>
-          Disable specific fingerprint sources after profile defaults/allowlist selection [possible values: oui, rdns, mdns, netbios, upnp, deep, ssh, http, tls, smb, snmp, lldp, cdp, dhcp]
+          Disable specific fingerprint sources after profile and additive selection [possible values: oui, rdns, mdns, netbios, upnp, deep, ssh, http, tls, smb, snmp, lldp, cdp, dhcp]
       --dhcp.leases <DHCP_LEASES>
           Read DHCP leases from an explicit lease file. Can be repeated
       --snmp.community <SNMP_COMMUNITY>
@@ -76,6 +76,7 @@ Scan one or more interfaces. Raw ARP discovery may require elevated privileges o
 $ sudo fing scan en0
 $ sudo fing scan en0 --scan.range 192.168.1.0/24
 $ sudo fing scan en0 --scan.profile deep --output.format json --output.live never
+$ sudo fing scan en0 --scan.profile none --fingerprint.source ssh
 $ sudo fing scan en0 --scan.profile deep --no-fingerprint.source ssh
 ```
 

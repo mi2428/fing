@@ -11,6 +11,7 @@ use std::{path::PathBuf, time::Duration};
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
 pub enum ScanProfile {
+    None,
     Fast,
     Normal,
     Deep,
@@ -19,28 +20,18 @@ pub enum ScanProfile {
 impl ScanProfile {
     pub fn default_timeout(self) -> Duration {
         match self {
+            Self::None => Duration::from_millis(1200),
             Self::Fast => Duration::from_millis(650),
             Self::Normal => Duration::from_millis(1200),
             Self::Deep => Duration::from_millis(2500),
         }
-    }
-
-    pub fn includes_deep_probes(self) -> bool {
-        matches!(self, Self::Deep)
-    }
-
-    pub fn includes_lldp_fingerprints(self) -> bool {
-        matches!(self, Self::Deep)
-    }
-
-    pub fn includes_cdp_fingerprints(self) -> bool {
-        matches!(self, Self::Deep)
     }
 }
 
 impl std::fmt::Display for ScanProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::None => write!(f, "none"),
             Self::Fast => write!(f, "fast"),
             Self::Normal => write!(f, "normal"),
             Self::Deep => write!(f, "deep"),

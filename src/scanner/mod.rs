@@ -1558,6 +1558,10 @@ mod tests {
 
     #[test]
     fn profile_timeouts_are_ordered_by_depth() {
+        assert_eq!(
+            ScanProfile::None.default_timeout(),
+            ScanProfile::Normal.default_timeout()
+        );
         assert!(ScanProfile::Fast.default_timeout() < ScanProfile::Normal.default_timeout());
         assert!(ScanProfile::Normal.default_timeout() < ScanProfile::Deep.default_timeout());
     }
