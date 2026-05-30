@@ -301,11 +301,12 @@ pub(super) async fn run_deep_and_snmp_enrichment(
 ) -> (Option<DeepRun>, Option<SnmpRun>) {
     let probe_options = deep::ProbeOptions {
         deep: config.deep,
+        ssh: config.ssh,
         http: config.http,
         tls: config.tls,
     };
 
-    if probe_options.deep {
+    if probe_options.deep || probe_options.ssh {
         emit(
             events,
             ScanEvent::Phase("deep port/banner enrichment".to_string()),
@@ -592,6 +593,7 @@ mod tests {
             netbios: false,
             upnp: false,
             deep: false,
+            ssh: false,
             http: false,
             tls: false,
             smb: false,

@@ -61,7 +61,9 @@ Options:
 
 Fingerprint Options:
       --fingerprint.source <SOURCE>
-          Limit fingerprint sources. Defaults to profile-appropriate sources when omitted [possible values: oui, rdns, mdns, netbios, upnp, deep, http, tls, smb, snmp, lldp, cdp, dhcp]
+          Limit fingerprint sources. Defaults to profile-appropriate sources when omitted [possible values: oui, rdns, mdns, netbios, upnp, deep, ssh, http, tls, smb, snmp, lldp, cdp, dhcp]
+      --no-fingerprint.source <SOURCE>
+          Disable specific fingerprint sources after profile defaults/allowlist selection [possible values: oui, rdns, mdns, netbios, upnp, deep, ssh, http, tls, smb, snmp, lldp, cdp, dhcp]
       --dhcp.leases <DHCP_LEASES>
           Read DHCP leases from an explicit lease file. Can be repeated
       --snmp.community <SNMP_COMMUNITY>
@@ -74,6 +76,7 @@ Scan one or more interfaces. Raw ARP discovery may require elevated privileges o
 $ sudo fing scan en0
 $ sudo fing scan en0 --scan.range 192.168.1.0/24
 $ sudo fing scan en0 --scan.profile deep --output.format json --output.live never
+$ sudo fing scan en0 --scan.profile deep --no-fingerprint.source ssh
 ```
 
 Update the local IEEE OUI vendor database:

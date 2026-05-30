@@ -64,6 +64,7 @@ pub struct ScanConfig {
     pub netbios: bool,
     pub upnp: bool,
     pub deep: bool,
+    pub ssh: bool,
     pub http: bool,
     pub tls: bool,
     pub smb: bool,

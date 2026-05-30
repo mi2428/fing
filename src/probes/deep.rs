@@ -52,13 +52,21 @@ pub struct TlsCertificate {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProbeOptions {
     pub deep: bool,
+    pub ssh: bool,
     pub http: bool,
     pub tls: bool,
 }
 
 impl ProbeOptions {
     pub fn any(self) -> bool {
-        self.deep || self.http || self.tls
+        self.deep || self.ssh || self.http || self.tls
+    }
+
+    pub fn includes_deep_service(self, service: &str) -> bool {
+        match service {
+            "ssh" => self.ssh,
+            _ => self.deep,
+        }
     }
 }
 
@@ -179,7 +187,10 @@ async fn probe_port(
                 probe.tls = tls_certificate_probe(ip, local_addr, port, timeout).await;
             }
         }
-        "ssh" | "ftp" | "telnet" if options.deep => {
+        "ssh" if options.ssh => {
+            probe.banner = passive_banner(&mut stream, timeout).await;
+        }
+        "ftp" | "telnet" if options.deep => {
             probe.banner = passive_banner(&mut stream, timeout).await;
         }
         _ => {}
@@ -189,7 +200,7 @@ async fn probe_port(
 }
 
 fn probe_source_enabled(service: &str, options: ProbeOptions) -> bool {
-    options.deep
+    options.includes_deep_service(service)
         || (options.http && web_probe_service(service))
         || (options.tls && service == "https")
 }
@@ -202,7 +213,7 @@ fn web_probe_service(service: &str) -> bool {
 }
 
 fn probe_has_enabled_evidence(probe: &PortProbe, options: ProbeOptions) -> bool {
-    options.deep
+    options.includes_deep_service(&probe.service)
         || (options.http && (!probe.http_headers.is_empty() || probe.favicon.is_some()))
         || (options.tls && probe.tls.is_some())
 }
@@ -514,6 +525,19 @@ mod tests {
             os_hint_from_banner("ssh", "SSH-2.0-OpenSSH_9.8").unwrap(),
             ("Unix-like", 0.55)
         );
+    }
+
+    #[test]
+    fn ssh_source_can_run_without_generic_deep_probes() {
+        let options = ProbeOptions {
+            deep: false,
+            ssh: true,
+            http: false,
+            tls: false,
+        };
+
+        assert!(probe_source_enabled("ssh", options));
+        assert!(!probe_source_enabled("ftp", options));
     }
 
     #[test]

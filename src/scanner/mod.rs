@@ -1084,6 +1084,7 @@ async fn scan_inner(
     let (probe_tx, mut probe_rx) = tokio::sync::mpsc::unbounded_channel();
     let deep_options = crate::probes::deep::ProbeOptions {
         deep: config.deep,
+        ssh: config.ssh,
         http: config.http,
         tls: config.tls,
     };

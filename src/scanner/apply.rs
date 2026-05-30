@@ -80,7 +80,7 @@ pub(super) fn apply_deep_probes(
     options: deep::ProbeOptions,
 ) {
     for probe in probes {
-        if options.deep {
+        if options.includes_deep_service(&probe.service) {
             // An open port is weak identity by itself, but it is still useful as
             // a service signal and as input to built-in identity rules.
             device.add_service(probe.service.clone(), "deep", Some(probe.port), 0.7);
@@ -583,6 +583,7 @@ mod tests {
             }],
             deep::ProbeOptions {
                 deep: true,
+                ssh: false,
                 http: true,
                 tls: true,
             },
@@ -663,6 +664,7 @@ mod tests {
             }],
             deep::ProbeOptions {
                 deep: false,
+                ssh: false,
                 http: true,
                 tls: false,
             },
@@ -682,6 +684,37 @@ mod tests {
             "uhttpd"
         ));
         assert!(!device.evidence.iter().any(|item| item.source == "tls"));
+    }
+
+    #[test]
+    fn ssh_deep_probe_application_respects_source_options() {
+        let mut device = device();
+
+        apply_deep_probes(
+            &mut device,
+            vec![deep::PortProbe {
+                port: 22,
+                service: "ssh".to_string(),
+                banner: Some("SSH-2.0-OpenSSH_9.8".to_string()),
+                http_headers: Vec::new(),
+                favicon: None,
+                tls: None,
+            }],
+            deep::ProbeOptions {
+                deep: true,
+                ssh: false,
+                http: false,
+                tls: false,
+            },
+        );
+
+        assert!(
+            !device
+                .services
+                .iter()
+                .any(|service| service.source == "deep" && service.port == Some(22))
+        );
+        assert!(!device.evidence.iter().any(|item| item.key == "ssh_banner"));
     }
 
     #[test]
