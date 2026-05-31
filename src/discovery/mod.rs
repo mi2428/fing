@@ -23,6 +23,7 @@ use pnet::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
+    io,
     net::Ipv4Addr,
     process::Command,
     time::{Duration, Instant},
@@ -32,6 +33,13 @@ const ARP_READ_TIMEOUT: Duration = Duration::from_millis(1);
 const ARP_INTER_BATCH_RECEIVE_WINDOW: Duration = Duration::from_millis(2);
 const ARP_INTER_PASS_RECEIVE_WINDOW: Duration = Duration::from_millis(30);
 const ARP_MIN_BATCH_SIZE: usize = 8;
+
+fn retryable_datalink_read_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArpHit {
@@ -107,7 +115,7 @@ where
                 inter_batch_receive_window,
                 &mut hits,
                 &mut on_hit,
-            );
+            )?;
         }
 
         let receive_window = if pass + 1 == pass_count {
@@ -115,7 +123,7 @@ where
         } else {
             inter_pass_receive_window
         };
-        drain_arp_replies_for(&mut *rx, target, receive_window, &mut hits, &mut on_hit);
+        drain_arp_replies_for(&mut *rx, target, receive_window, &mut hits, &mut on_hit)?;
         batch_size = (batch_size / 2).max(ARP_MIN_BATCH_SIZE);
     }
 
@@ -162,19 +170,24 @@ fn drain_arp_replies_for<F>(
     duration: Duration,
     hits: &mut BTreeMap<Ipv4Addr, ArpHit>,
     on_hit: &mut F,
-) where
+) -> Result<()>
+where
     F: FnMut(&ArpHit),
 {
     if duration.is_zero() {
-        return;
+        return Ok(());
     }
 
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
-        if let Ok(packet) = rx.next() {
-            record_arp_reply(packet, target, hits, on_hit);
+        match rx.next() {
+            Ok(packet) => record_arp_reply(packet, target, hits, on_hit),
+            Err(err) if retryable_datalink_read_error(&err) => continue,
+            Err(err) => return Err(err).context("failed to receive ARP replies"),
         }
     }
+
+    Ok(())
 }
 
 fn record_arp_reply<F>(
@@ -464,6 +477,26 @@ mod tests {
                 "192.168.1.12".parse::<Ipv4Addr>().unwrap()
             ]
         );
+    }
+
+    #[test]
+    fn retries_only_transient_datalink_read_errors() {
+        assert!(retryable_datalink_read_error(&io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timeout"
+        )));
+        assert!(retryable_datalink_read_error(&io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "would block"
+        )));
+        assert!(retryable_datalink_read_error(&io::Error::new(
+            io::ErrorKind::Interrupted,
+            "interrupted"
+        )));
+        assert!(!retryable_datalink_read_error(&io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "broken pipe"
+        )));
     }
 
     fn arp_reply_packet(sender_ip: Ipv4Addr, sender_mac: MacAddr) -> [u8; 42] {

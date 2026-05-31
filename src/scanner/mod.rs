@@ -46,6 +46,8 @@ use tokio::sync::{
     watch,
 };
 
+const CONTINUOUS_FAILURE_RETRY_DELAY: Duration = Duration::from_millis(500);
+
 pub async fn scan_many(configs: Vec<ScanConfig>) -> Result<ScanResult> {
     scan_many_inner(configs, None, true).await
 }
@@ -80,7 +82,7 @@ pub async fn scan_continuously_with_events(
             &Some(events.clone()),
             ScanEvent::Phase(format!("scan round {round}")),
         );
-        if let Err(err) = run_scan_round_with_passive_updates(
+        let round_failed = if let Err(err) = run_scan_round_with_passive_updates(
             round_configs.clone(),
             events.clone(),
             &mut passive_rx,
@@ -92,13 +94,18 @@ pub async fn scan_continuously_with_events(
                 &Some(events.clone()),
                 ScanEvent::Warning(format!("scan round {round} failed: {err}")),
             );
+            true
         } else {
             emit(&Some(events.clone()), ScanEvent::RoundFinished { round });
-        }
-        if let Some(phase) = idle_phase(interval, round) {
-            emit(&Some(events.clone()), ScanEvent::Phase(phase));
+            false
+        };
+        if let Some(delay) = continuous_round_delay(interval, round_failed) {
+            emit(
+                &Some(events.clone()),
+                ScanEvent::Phase(continuous_round_phase(interval, delay, round, round_failed)),
+            );
             wait_interval_or_pause_with_passive(
-                interval,
+                delay,
                 &mut pause_rx,
                 &events,
                 &mut passive_rx,
@@ -502,6 +509,32 @@ fn round_scan_configs(configs: &[ScanConfig]) -> Vec<ScanConfig> {
             config
         })
         .collect()
+}
+
+fn continuous_round_delay(interval: Duration, round_failed: bool) -> Option<Duration> {
+    if !interval.is_zero() {
+        Some(interval)
+    } else if round_failed {
+        Some(CONTINUOUS_FAILURE_RETRY_DELAY)
+    } else {
+        None
+    }
+}
+
+fn continuous_round_phase(
+    interval: Duration,
+    delay: Duration,
+    round: u64,
+    round_failed: bool,
+) -> String {
+    if interval.is_zero() && round_failed {
+        format!(
+            "retrying {}ms after round {round} failure",
+            delay.as_millis()
+        )
+    } else {
+        idle_phase(delay, round).unwrap_or_else(|| format!("idle {}ms", delay.as_millis()))
+    }
 }
 
 async fn run_scan_round_with_passive_updates(
@@ -1733,6 +1766,26 @@ mod tests {
         let merged = merge_devices_by_interface_ip(vec![left, right]);
 
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn failed_zero_interval_rounds_back_off_before_retrying() {
+        assert_eq!(continuous_round_delay(Duration::ZERO, false), None);
+        assert_eq!(
+            continuous_round_delay(Duration::ZERO, true),
+            Some(CONTINUOUS_FAILURE_RETRY_DELAY)
+        );
+        assert_eq!(
+            continuous_round_delay(Duration::from_millis(250), true),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            continuous_round_phase(Duration::ZERO, CONTINUOUS_FAILURE_RETRY_DELAY, 3, true),
+            format!(
+                "retrying {}ms after round 3 failure",
+                CONTINUOUS_FAILURE_RETRY_DELAY.as_millis()
+            )
+        );
     }
 
     #[test]

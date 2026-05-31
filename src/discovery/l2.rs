@@ -147,8 +147,18 @@ where
     let mut lldp_keys = BTreeSet::new();
     let mut cdp_keys = BTreeSet::new();
     while !should_stop() {
-        let Ok(packet) = rx.next() else {
-            continue;
+        let packet = match rx.next() {
+            Ok(packet) => packet,
+            Err(err) if super::retryable_datalink_read_error(&err) => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to read {} frames on {}",
+                        protocols.label(),
+                        iface.name
+                    )
+                });
+            }
         };
 
         let advertisement = match duplicate_policy {
