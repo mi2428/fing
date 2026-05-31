@@ -27,6 +27,9 @@ pub fn load_scan_cache(path: &Path) -> Result<Vec<Device>> {
         return Ok(Vec::new());
     }
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(Vec::new());
+    }
     serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))
 }
 
@@ -34,8 +37,38 @@ pub fn save_scan_cache(path: &Path, devices: &[Device]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_vec_pretty(devices)?)?;
+    let bytes = serde_json::to_vec_pretty(devices)?;
+    let tmp = atomic_temp_path(path);
+    fs::write(&tmp, bytes)
+        .with_context(|| format!("failed to write temporary scan cache {}", tmp.display()))?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| {
+            format!(
+                "failed to replace scan cache {} with {}",
+                path.display(),
+                tmp.display()
+            )
+        });
+    }
     Ok(())
+}
+
+fn atomic_temp_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("last_scan.json");
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        suffix
+    ))
 }
 
 pub fn merge_previous_scan(current: &mut [Device], previous: &[Device]) {
@@ -244,5 +277,41 @@ mod tests {
         assert!(current.hostname.is_none());
         assert!(current.model.is_none());
         assert!(current.os.is_none());
+    }
+
+    #[test]
+    fn empty_cache_file_is_treated_as_no_previous_scan() {
+        let path = temp_cache_path("empty");
+        fs::write(&path, b"").unwrap();
+
+        let loaded = load_scan_cache(&path).unwrap();
+
+        assert!(loaded.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_scan_cache_writes_valid_json_atomically() {
+        let path = temp_cache_path("atomic");
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let device = Device::new("192.168.1.10".parse().unwrap(), now);
+
+        save_scan_cache(&path, &[device]).unwrap();
+        let loaded = load_scan_cache(&path).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert!(path.exists());
+        let _ = fs::remove_file(path);
+    }
+
+    fn temp_cache_path(name: &str) -> PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!(
+            "fing-store-{name}-{}-{suffix}.json",
+            std::process::id()
+        ))
     }
 }
