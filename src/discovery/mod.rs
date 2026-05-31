@@ -28,9 +28,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-const ARP_READ_TIMEOUT: Duration = Duration::from_millis(5);
-const ARP_SEND_BATCH_SIZE: usize = 128;
-const ARP_BATCH_RECEIVE_WINDOW: Duration = Duration::from_millis(5);
+const ARP_READ_TIMEOUT: Duration = Duration::from_millis(1);
+const ARP_INTER_BATCH_RECEIVE_WINDOW: Duration = Duration::from_millis(2);
+const ARP_INTER_PASS_RECEIVE_WINDOW: Duration = Duration::from_millis(30);
+const ARP_MIN_BATCH_SIZE: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArpHit {
@@ -75,39 +76,84 @@ where
         _ => return Err(anyhow!("unsupported datalink channel type")),
     };
 
+    let targets = arp_target_hosts(target, iface.ip);
+    let pass_count = arp_retry_passes(targets.len(), timeout);
+    let inter_batch_receive_window = timeout.min(ARP_INTER_BATCH_RECEIVE_WINDOW);
+    let inter_pass_receive_window = timeout.min(ARP_INTER_PASS_RECEIVE_WINDOW);
     let mut hits = BTreeMap::new();
-    let batch_receive_window = timeout.min(ARP_BATCH_RECEIVE_WINDOW);
-    let mut sent_in_batch = 0;
+    let mut batch_size = arp_batch_size(targets.len());
 
-    for target_ip in target.hosts() {
-        if target_ip == iface.ip {
-            continue;
+    for pass in 0..pass_count {
+        let unresolved = unresolved_targets(&targets, &hits);
+        if unresolved.is_empty() {
+            break;
         }
-        // Broadcast in bounded batches and drain replies between batches. Large
-        // CIDRs can answer while we are still sending; interleaving receive work
-        // keeps the datalink buffer from filling with early replies.
-        let packet = build_arp_request(source_mac, iface.ip, target_ip)?;
-        match tx.send_to(&packet, None) {
-            Some(Ok(())) => {}
-            Some(Err(err)) => return Err(err).context("failed to send ARP request"),
-            None => return Err(anyhow!("datalink sender refused ARP packet")),
-        }
-        sent_in_batch += 1;
-        if sent_in_batch >= ARP_SEND_BATCH_SIZE {
+
+        for chunk in unresolved.chunks(batch_size) {
+            // Wide ranges used to be sent as one large microburst, which could
+            // make some devices skip replying at all. Smaller bursts with a
+            // quick read phase in between are measurably more reliable.
+            for target_ip in chunk {
+                let packet = build_arp_request(source_mac, iface.ip, *target_ip)?;
+                match tx.send_to(&packet, None) {
+                    Some(Ok(())) => {}
+                    Some(Err(err)) => return Err(err).context("failed to send ARP request"),
+                    None => return Err(anyhow!("datalink sender refused ARP packet")),
+                }
+            }
             drain_arp_replies_for(
                 &mut *rx,
                 target,
-                batch_receive_window,
+                inter_batch_receive_window,
                 &mut hits,
                 &mut on_hit,
             );
-            sent_in_batch = 0;
         }
+
+        let receive_window = if pass + 1 == pass_count {
+            timeout
+        } else {
+            inter_pass_receive_window
+        };
+        drain_arp_replies_for(&mut *rx, target, receive_window, &mut hits, &mut on_hit);
+        batch_size = (batch_size / 2).max(ARP_MIN_BATCH_SIZE);
     }
 
-    drain_arp_replies_for(&mut *rx, target, timeout, &mut hits, &mut on_hit);
-
     Ok(hits.into_values().collect())
+}
+
+fn arp_target_hosts(target: Ipv4Net, source_ip: Ipv4Addr) -> Vec<Ipv4Addr> {
+    target
+        .hosts()
+        .filter(|target_ip| *target_ip != source_ip)
+        .collect()
+}
+
+fn unresolved_targets(targets: &[Ipv4Addr], hits: &BTreeMap<Ipv4Addr, ArpHit>) -> Vec<Ipv4Addr> {
+    targets
+        .iter()
+        .copied()
+        .filter(|target_ip| !hits.contains_key(target_ip))
+        .collect()
+}
+
+fn arp_batch_size(host_count: usize) -> usize {
+    match host_count {
+        0..=256 => 16,
+        257..=4096 => 32,
+        4097..=16384 => 64,
+        _ => 128,
+    }
+}
+
+fn arp_retry_passes(host_count: usize, timeout: Duration) -> usize {
+    if host_count <= arp_batch_size(host_count) || timeout < Duration::from_millis(800) {
+        1
+    } else if timeout >= Duration::from_millis(1800) {
+        3
+    } else {
+        2
+    }
 }
 
 fn drain_arp_replies_for<F>(
@@ -369,6 +415,55 @@ mod tests {
 
         assert_eq!(callbacks, 1);
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn arp_batch_size_scales_down_for_smaller_ranges() {
+        assert_eq!(arp_batch_size(32), 16);
+        assert_eq!(arp_batch_size(128), 16);
+        assert_eq!(arp_batch_size(2048), 32);
+        assert_eq!(arp_batch_size(8192), 64);
+        assert_eq!(arp_batch_size(32768), 128);
+    }
+
+    #[test]
+    fn arp_retry_passes_add_an_extra_retry_for_deeper_timeouts() {
+        assert_eq!(arp_retry_passes(128, Duration::from_millis(2500)), 3);
+        assert_eq!(arp_retry_passes(128, Duration::from_millis(1200)), 2);
+        assert_eq!(arp_retry_passes(128, Duration::from_millis(650)), 1);
+    }
+
+    #[test]
+    fn arp_retry_passes_only_retry_when_timeout_budget_allows_it() {
+        assert_eq!(arp_retry_passes(16, Duration::from_millis(1200)), 1);
+        assert_eq!(arp_retry_passes(128, Duration::from_millis(650)), 1);
+        assert_eq!(arp_retry_passes(128, Duration::from_millis(1200)), 2);
+    }
+
+    #[test]
+    fn unresolved_targets_skip_ips_already_recorded() {
+        let targets = vec![
+            "192.168.1.10".parse().unwrap(),
+            "192.168.1.11".parse().unwrap(),
+            "192.168.1.12".parse().unwrap(),
+        ];
+        let mut hits = BTreeMap::new();
+        hits.insert(
+            "192.168.1.11".parse().unwrap(),
+            ArpHit {
+                ip: "192.168.1.11".parse().unwrap(),
+                mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                interface: None,
+            },
+        );
+
+        assert_eq!(
+            unresolved_targets(&targets, &hits),
+            vec![
+                "192.168.1.10".parse::<Ipv4Addr>().unwrap(),
+                "192.168.1.12".parse::<Ipv4Addr>().unwrap()
+            ]
+        );
     }
 
     fn arp_reply_packet(sender_ip: Ipv4Addr, sender_mac: MacAddr) -> [u8; 42] {

@@ -86,6 +86,7 @@ fn vendor_was_filled_from_cache(device: &Device) -> bool {
 fn source_code(source: &str) -> char {
     match source {
         "arp" => 'A',
+        "arp_table" => 'A',
         "oui" => 'O',
         "mdns" => 'M',
         "netbios" => 'N',
@@ -163,6 +164,17 @@ mod tests {
 
         assert_eq!(source_summary(&device), "arp,deep,local,mdns,oui");
         assert_eq!(compact_source_summary(&device), "ADLMO");
+    }
+
+    #[test]
+    fn arp_table_is_rendered_with_the_same_compact_code_as_arp() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut device = Device::new("192.168.1.10".parse().unwrap(), now);
+        device.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+        device.add_evidence("arp_table", "mac", "aa:bb:cc:dd:ee:ff", 0.45);
+
+        assert_eq!(source_summary(&device), "arp_table");
+        assert_eq!(compact_source_summary(&device), "A");
     }
 
     #[test]

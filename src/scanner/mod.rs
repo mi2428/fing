@@ -32,7 +32,7 @@ use phases::{
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr},
     path::Path,
     sync::{
         Arc,
@@ -164,6 +164,7 @@ struct ContinuousPassiveInterfaceState {
 }
 
 const DEFAULT_LLDP_TTL: Duration = Duration::from_secs(120);
+const ARP_REFINE_PREFIX: u8 = 27;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PassiveObservation {
@@ -908,7 +909,9 @@ async fn scan_inner(
 
     match arp_result {
         Ok(hits) => {
+            let mut active_hits = BTreeSet::new();
             for hit in hits {
+                active_hits.insert(hit.ip);
                 let device =
                     upsert_device(&mut devices, IpAddr::V4(hit.ip), scanned_at, &iface.name);
                 if config.oui {
@@ -916,6 +919,69 @@ async fn scan_inner(
                 }
                 apply_arp_mac(device, &hit.mac);
                 finish_observed_device_update(&events, device, &identity_rules);
+            }
+
+            for hit in discovery::arp_table(target, &iface.name) {
+                if active_hits.contains(&hit.ip) {
+                    continue;
+                }
+                let device =
+                    upsert_device(&mut devices, IpAddr::V4(hit.ip), scanned_at, &iface.name);
+                if config.oui {
+                    device.vendor = crate::enrich::lookup_vendor(&hit.mac, &oui_db);
+                }
+                apply_arp_table_mac(device, &hit.mac);
+                finish_observed_device_update(&events, device, &identity_rules);
+            }
+
+            let refine_targets = arp_refine_targets(
+                target,
+                devices.keys().filter_map(|ip| match ip {
+                    IpAddr::V4(ip) => Some(*ip),
+                    _ => None,
+                }),
+            );
+            if !refine_targets.is_empty() {
+                emit(&events, ScanEvent::Phase("ARP refinement".to_string()));
+                let refine_iface = iface.clone();
+                let refine_timeout = config.timeout;
+                let refine_result = tokio::task::spawn_blocking(move || {
+                    let mut refined_hits = Vec::new();
+                    for refine_target in refine_targets {
+                        refined_hits.extend(discovery::arp_sweep_with_callback(
+                            &refine_iface,
+                            refine_target,
+                            refine_timeout,
+                            |_| {},
+                        )?);
+                    }
+                    Ok::<Vec<discovery::ArpHit>, anyhow::Error>(refined_hits)
+                })
+                .await
+                .context("ARP refinement worker failed")?;
+
+                match refine_result {
+                    Ok(refined_hits) => {
+                        for hit in refined_hits {
+                            let device = upsert_device(
+                                &mut devices,
+                                IpAddr::V4(hit.ip),
+                                scanned_at,
+                                &iface.name,
+                            );
+                            if config.oui {
+                                device.vendor = crate::enrich::lookup_vendor(&hit.mac, &oui_db);
+                            }
+                            apply_arp_mac(device, &hit.mac);
+                            finish_observed_device_update(&events, device, &identity_rules);
+                        }
+                    }
+                    Err(err) => {
+                        let warning = format!("ARP refinement failed: {err}");
+                        warnings.push(warning.clone());
+                        emit(&events, ScanEvent::Warning(warning));
+                    }
+                }
             }
         }
         Err(err) => {
@@ -1254,6 +1320,14 @@ fn apply_arp_mac(device: &mut Device, mac: &str) {
     }
 }
 
+fn apply_arp_table_mac(device: &mut Device, mac: &str) {
+    device.mac = Some(mac.to_string());
+    device.add_evidence("arp_table", "mac", mac, 0.45);
+    if let Some(prefix) = enrich::normalize_oui_prefix(mac) {
+        device.add_evidence("arp_table", "mac_oui", prefix, 0.45);
+    }
+}
+
 fn observed_device_for_dhcp_lease<'a>(
     devices: &'a mut BTreeMap<IpAddr, Device>,
     lease: &dhcp::DhcpLease,
@@ -1279,6 +1353,39 @@ fn observed_device_for_dhcp_lease<'a>(
         })
         .map(|(ip, _)| *ip)?;
     devices.get_mut(&matching_ip)
+}
+
+fn arp_refine_targets(
+    target: ipnet::Ipv4Net,
+    observed_ips: impl IntoIterator<Item = Ipv4Addr>,
+) -> Vec<ipnet::Ipv4Net> {
+    if target.prefix_len() >= ARP_REFINE_PREFIX {
+        return Vec::new();
+    }
+
+    let mut refine_targets = BTreeSet::new();
+    for ip in observed_ips {
+        if !target.contains(&ip) {
+            continue;
+        }
+        let Ok(refine_target) = ipnet::Ipv4Net::new(ip, ARP_REFINE_PREFIX) else {
+            continue;
+        };
+        let Ok(refine_target) =
+            ipnet::Ipv4Net::new(refine_target.network(), refine_target.prefix_len())
+        else {
+            continue;
+        };
+        if refine_target == target {
+            continue;
+        }
+        if target.contains(&refine_target.network()) && target.contains(&refine_target.broadcast())
+        {
+            refine_targets.insert(refine_target);
+        }
+    }
+
+    refine_targets.into_iter().collect()
 }
 
 async fn await_with_lldp<F, T>(
@@ -1899,6 +2006,35 @@ mod tests {
                 .pending_observations
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn arp_refine_targets_are_scoped_to_observed_windows() {
+        let target = "172.20.14.0/23".parse().unwrap();
+        let refine = arp_refine_targets(
+            target,
+            [
+                "172.20.14.111".parse().unwrap(),
+                "172.20.14.124".parse().unwrap(),
+                "172.20.15.244".parse().unwrap(),
+            ],
+        );
+
+        assert_eq!(
+            refine,
+            vec![
+                "172.20.14.96/27".parse().unwrap(),
+                "172.20.15.224/27".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn arp_refine_targets_skip_ranges_that_are_already_small() {
+        let target = "172.20.14.96/27".parse().unwrap();
+        let refine = arp_refine_targets(target, ["172.20.14.111".parse().unwrap()]);
+
+        assert!(refine.is_empty());
     }
 
     fn passive_update_at(
