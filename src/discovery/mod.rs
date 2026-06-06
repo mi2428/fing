@@ -49,14 +49,16 @@ pub struct ArpHit {
     pub interface: Option<String>,
 }
 
-pub fn arp_sweep_with_callback<F>(
+pub fn arp_sweep_with_callback<F, ShouldStop>(
     iface: &InterfaceInfo,
     target: Ipv4Net,
     timeout: Duration,
+    mut should_stop: ShouldStop,
     mut on_hit: F,
 ) -> Result<Vec<ArpHit>>
 where
     F: FnMut(&ArpHit),
+    ShouldStop: FnMut() -> bool,
 {
     // Open the datalink channel on the exact interface selected by the scanner.
     // ARP is link-local, so using a default interface here would silently scan
@@ -92,16 +94,28 @@ where
     let mut batch_size = arp_batch_size(targets.len());
 
     for pass in 0..pass_count {
+        if should_stop() {
+            break;
+        }
+
         let unresolved = unresolved_targets(&targets, &hits);
         if unresolved.is_empty() {
             break;
         }
 
         for chunk in unresolved.chunks(batch_size) {
+            if should_stop() {
+                break;
+            }
+
             // Wide ranges used to be sent as one large microburst, which could
             // make some devices skip replying at all. Smaller bursts with a
             // quick read phase in between are measurably more reliable.
             for target_ip in chunk {
+                if should_stop() {
+                    break;
+                }
+
                 let packet = build_arp_request(source_mac, iface.ip, *target_ip)?;
                 match tx.send_to(&packet, None) {
                     Some(Ok(())) => {}
@@ -113,9 +127,14 @@ where
                 &mut *rx,
                 target,
                 inter_batch_receive_window,
+                &mut should_stop,
                 &mut hits,
                 &mut on_hit,
             )?;
+        }
+
+        if should_stop() {
+            break;
         }
 
         let receive_window = if pass + 1 == pass_count {
@@ -123,7 +142,14 @@ where
         } else {
             inter_pass_receive_window
         };
-        drain_arp_replies_for(&mut *rx, target, receive_window, &mut hits, &mut on_hit)?;
+        drain_arp_replies_for(
+            &mut *rx,
+            target,
+            receive_window,
+            &mut should_stop,
+            &mut hits,
+            &mut on_hit,
+        )?;
         batch_size = (batch_size / 2).max(ARP_MIN_BATCH_SIZE);
     }
 
@@ -164,22 +190,24 @@ fn arp_retry_passes(host_count: usize, timeout: Duration) -> usize {
     }
 }
 
-fn drain_arp_replies_for<F>(
+fn drain_arp_replies_for<F, ShouldStop>(
     rx: &mut dyn datalink::DataLinkReceiver,
     target: Ipv4Net,
     duration: Duration,
+    should_stop: &mut ShouldStop,
     hits: &mut BTreeMap<Ipv4Addr, ArpHit>,
     on_hit: &mut F,
 ) -> Result<()>
 where
     F: FnMut(&ArpHit),
+    ShouldStop: FnMut() -> bool,
 {
-    if duration.is_zero() {
+    if duration.is_zero() || should_stop() {
         return Ok(());
     }
 
     let deadline = Instant::now() + duration;
-    while Instant::now() < deadline {
+    while !should_stop() && Instant::now() < deadline {
         match rx.next() {
             Ok(packet) => record_arp_reply(packet, target, hits, on_hit),
             Err(err) if retryable_datalink_read_error(&err) => continue,

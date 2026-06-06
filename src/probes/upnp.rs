@@ -46,16 +46,18 @@ pub struct UpnpDescription {
     pub services: Vec<String>,
 }
 
-pub fn ssdp_probe_with_callback<F, AllowSource>(
+pub fn ssdp_probe_with_callback<F, AllowSource, ShouldStop>(
     interface_ip: Ipv4Addr,
     timeout: Duration,
     fetch_descriptions: bool,
+    mut should_stop: ShouldStop,
     mut allow_source: AllowSource,
     mut on_result: F,
 ) -> Result<HashMap<IpAddr, UpnpInfo>>
 where
     F: FnMut(IpAddr, UpnpInfo),
     AllowSource: FnMut(IpAddr) -> bool,
+    ShouldStop: FnMut() -> bool,
 {
     let socket = ssdp_socket(interface_ip)?;
     let request = ssdp_request();
@@ -78,7 +80,7 @@ where
     let mut fetched_locations = HashSet::<String>::new();
     let mut buffer = [0_u8; 8192];
 
-    while Instant::now() < deadline {
+    while !should_stop() && Instant::now() < deadline {
         match socket.recv_from(&mut buffer) {
             Ok((len, source)) => {
                 let source_ip = source.ip();
@@ -88,6 +90,7 @@ where
                 let mut fetcher = |location: &str| fetch_description(&client, location);
                 let mut context = SsdpResponseContext {
                     fetch_descriptions,
+                    should_stop: &mut should_stop,
                     allow_source: &mut allow_source,
                     fetched_locations: &mut fetched_locations,
                     responses: &mut responses,
@@ -106,8 +109,9 @@ where
     Ok(responses)
 }
 
-struct SsdpResponseContext<'a, F, AllowSource, FetchDescription> {
+struct SsdpResponseContext<'a, F, AllowSource, FetchDescription, ShouldStop> {
     fetch_descriptions: bool,
+    should_stop: &'a mut ShouldStop,
     allow_source: &'a mut AllowSource,
     fetched_locations: &'a mut HashSet<String>,
     responses: &'a mut HashMap<IpAddr, UpnpInfo>,
@@ -115,14 +119,15 @@ struct SsdpResponseContext<'a, F, AllowSource, FetchDescription> {
     on_result: &'a mut F,
 }
 
-fn apply_ssdp_response<F, AllowSource, FetchDescription>(
+fn apply_ssdp_response<F, AllowSource, FetchDescription, ShouldStop>(
     source_ip: IpAddr,
     response: SsdpResponse,
-    context: &mut SsdpResponseContext<'_, F, AllowSource, FetchDescription>,
+    context: &mut SsdpResponseContext<'_, F, AllowSource, FetchDescription, ShouldStop>,
 ) where
     F: FnMut(IpAddr, UpnpInfo),
     AllowSource: FnMut(IpAddr) -> bool,
     FetchDescription: FnMut(&str) -> Result<UpnpDescription>,
+    ShouldStop: FnMut() -> bool,
 {
     if !(context.allow_source)(source_ip) {
         return;
@@ -135,6 +140,7 @@ fn apply_ssdp_response<F, AllowSource, FetchDescription>(
     // Fetch each LOCATION once per scan. Several SSDP responses from the same
     // device often point at the same XML description.
     if context.fetch_descriptions
+        && !(context.should_stop)()
         && let Some(location) = info.location.clone()
         && description_location_allowed(&location, source_ip)
         && context.fetched_locations.insert(location.clone())
@@ -385,6 +391,7 @@ mod tests {
         let mut fetched_locations = HashSet::new();
         let mut responses = HashMap::new();
         let mut allow_source = |_| false;
+        let mut should_stop = || false;
         let mut fetch_description = |_: &str| -> Result<UpnpDescription> {
             panic!("disallowed SSDP source must not fetch descriptions")
         };
@@ -393,6 +400,7 @@ mod tests {
 
         let mut context = SsdpResponseContext {
             fetch_descriptions: true,
+            should_stop: &mut should_stop,
             allow_source: &mut allow_source,
             fetched_locations: &mut fetched_locations,
             responses: &mut responses,

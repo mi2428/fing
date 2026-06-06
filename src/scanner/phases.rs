@@ -18,7 +18,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     net::{IpAddr, Ipv4Addr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::{
     Semaphore,
@@ -148,9 +148,16 @@ pub(super) fn start_l2_discovery(
 
     let (tx, updates) = tokio::sync::mpsc::unbounded_channel();
     let listener = tokio::task::spawn_blocking(move || {
-        l2::listen_with_callback(&iface, protocols, timeout, move |advertisement| {
-            let _ = tx.send(advertisement.clone());
-        })
+        let deadline = Instant::now() + timeout;
+        let stop_tx = tx.clone();
+        l2::listen_until(
+            &iface,
+            protocols,
+            || stop_tx.is_closed() || Instant::now() >= deadline,
+            move |advertisement| {
+                let _ = tx.send(advertisement.clone());
+            },
+        )
     });
 
     Some(L2Discovery { updates, listener })
@@ -398,11 +405,17 @@ async fn run_mdns(
     // Run it on the blocking pool and filter both callback and final maps back
     // to the selected IPv4 target.
     let mdns = tokio::task::spawn_blocking(move || {
-        enrich::mdns_probe_with_callback(interface_ip, timeout, move |ip, info| {
-            if target_contains_ip(callback_target, ip) {
-                let _ = updates.send(MulticastUpdate::Mdns(ip, info));
-            }
-        })
+        let stop_updates = updates.clone();
+        enrich::mdns_probe_with_callback(
+            interface_ip,
+            timeout,
+            || stop_updates.is_closed(),
+            move |ip, info| {
+                if target_contains_ip(callback_target, ip) {
+                    let _ = updates.send(MulticastUpdate::Mdns(ip, info));
+                }
+            },
+        )
     })
     .await
     .context("mDNS worker failed")??;
@@ -427,10 +440,12 @@ async fn run_upnp(
     // UPnP discovery can optionally fetch HTTP description XML, so it also runs
     // off the async executor. The callback still preserves progressive updates.
     let upnp = tokio::task::spawn_blocking(move || {
+        let stop_updates = updates.clone();
         upnp::ssdp_probe_with_callback(
             interface_ip,
             timeout,
             true,
+            || stop_updates.is_closed(),
             move |ip| target_contains_ip(allowed_target, ip),
             move |ip, info| {
                 if target_contains_ip(callback_target, ip) {

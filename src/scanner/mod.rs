@@ -927,15 +927,21 @@ async fn scan_inner(
     let arp_rules = identity_rules.clone();
     let arp_oui_enabled = config.oui;
     let arp_result = tokio::task::spawn_blocking(move || {
-        discovery::arp_sweep_with_callback(&arp_iface, arp_target, arp_timeout, |hit| {
-            let mut device = Device::new(IpAddr::V4(hit.ip), scanned_at);
-            device.interface = Some(arp_iface.name.clone());
-            apply_arp_mac(&mut device, &hit.mac);
-            if arp_oui_enabled {
-                device.vendor = crate::enrich::lookup_vendor(&hit.mac, &arp_oui_db);
-            }
-            finish_observed_device_update(&arp_events, &mut device, &arp_rules);
-        })
+        discovery::arp_sweep_with_callback(
+            &arp_iface,
+            arp_target,
+            arp_timeout,
+            || events_closed(&arp_events),
+            |hit| {
+                let mut device = Device::new(IpAddr::V4(hit.ip), scanned_at);
+                device.interface = Some(arp_iface.name.clone());
+                apply_arp_mac(&mut device, &hit.mac);
+                if arp_oui_enabled {
+                    device.vendor = crate::enrich::lookup_vendor(&hit.mac, &arp_oui_db);
+                }
+                finish_observed_device_update(&arp_events, &mut device, &arp_rules);
+            },
+        )
     })
     .await
     .context("ARP worker failed")?;
@@ -978,6 +984,7 @@ async fn scan_inner(
                 emit(&events, ScanEvent::Phase("ARP refinement".to_string()));
                 let refine_iface = iface.clone();
                 let refine_timeout = config.timeout;
+                let refine_events = events.clone();
                 let refine_result = tokio::task::spawn_blocking(move || {
                     let mut refined_hits = Vec::new();
                     for refine_target in refine_targets {
@@ -985,6 +992,7 @@ async fn scan_inner(
                             &refine_iface,
                             refine_target,
                             refine_timeout,
+                            || events_closed(&refine_events),
                             |_| {},
                         )?);
                     }
@@ -1682,6 +1690,10 @@ fn local_hostname() -> Option<String> {
                 .filter(|output| output.status.success())
                 .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         })
+}
+
+fn events_closed(events: &Option<UnboundedSender<ScanEvent>>) -> bool {
+    events.as_ref().is_some_and(|sender| sender.is_closed())
 }
 
 fn ip_sort_key(ip: IpAddr) -> (u8, u128) {

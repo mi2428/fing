@@ -8,10 +8,7 @@ use super::{cdp, lldp};
 use crate::net::InterfaceInfo;
 use anyhow::{Context, Result, anyhow};
 use pnet::datalink::{self, Channel, Config};
-use std::{
-    collections::BTreeSet,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeSet, time::Duration};
 
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -46,24 +43,6 @@ pub enum L2Advertisement {
 pub struct L2Advertisements {
     pub lldp: Vec<lldp::LldpInfo>,
     pub cdp: Vec<cdp::CdpInfo>,
-}
-
-pub fn listen_with_callback<F>(
-    iface: &InterfaceInfo,
-    protocols: L2Protocols,
-    timeout: Duration,
-    on_advertisement: F,
-) -> Result<L2Advertisements>
-where
-    F: FnMut(&L2Advertisement),
-{
-    let deadline = Instant::now() + timeout;
-    listen_until(
-        iface,
-        protocols,
-        || Instant::now() >= deadline,
-        on_advertisement,
-    )
 }
 
 pub fn listen_until<F, ShouldStop>(

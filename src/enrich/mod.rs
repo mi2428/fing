@@ -312,13 +312,15 @@ fn ptr_hostname(lookup: &Lookup) -> Option<String> {
         })
 }
 
-pub fn mdns_probe_with_callback<F>(
+pub fn mdns_probe_with_callback<F, ShouldStop>(
     interface_ip: Ipv4Addr,
     timeout: Duration,
+    mut should_stop: ShouldStop,
     mut on_result: F,
 ) -> Result<HashMap<IpAddr, MdnsInfo>>
 where
     F: FnMut(IpAddr, MdnsInfo),
+    ShouldStop: FnMut() -> bool,
 {
     let socket = mdns_socket(interface_ip)?;
     // Query a small set of service types that commonly expose device identity.
@@ -341,7 +343,7 @@ where
     let deadline = Instant::now() + timeout;
     let mut buffer = [0_u8; 9000];
 
-    while Instant::now() < deadline {
+    while !should_stop() && Instant::now() < deadline {
         match socket.recv_from(&mut buffer) {
             Ok((len, _)) => {
                 records.extend(parse_mdns_packet(&buffer[..len]));
