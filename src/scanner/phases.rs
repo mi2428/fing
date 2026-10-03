@@ -173,7 +173,7 @@ pub(super) fn start_l2_discovery(
 
 pub(super) async fn run_multicast_enrichment(
     config: &ScanConfig,
-    interface_ip: Ipv4Addr,
+    iface: &InterfaceInfo,
     target: Ipv4Net,
     events: &Option<UnboundedSender<ScanEvent>>,
     mut on_update: impl FnMut(MulticastUpdate),
@@ -198,14 +198,14 @@ pub(super) async fn run_multicast_enrichment(
     // are still running, giving the live UI progressive enrichment.
     let mdns = async {
         if config.mdns {
-            Some(run_mdns(interface_ip, target, config.timeout, mdns_tx).await)
+            Some(run_mdns(iface.ip, target, config.timeout, mdns_tx).await)
         } else {
             None
         }
     };
     let upnp = async {
         if config.upnp {
-            Some(run_upnp(interface_ip, target, config.timeout, upnp_tx).await)
+            Some(run_upnp(iface.clone(), target, config.timeout, upnp_tx).await)
         } else {
             None
         }
@@ -438,7 +438,7 @@ async fn run_mdns(
 }
 
 async fn run_upnp(
-    interface_ip: Ipv4Addr,
+    iface: InterfaceInfo,
     target: Ipv4Net,
     timeout: Duration,
     updates: tokio::sync::mpsc::UnboundedSender<MulticastUpdate>,
@@ -450,7 +450,7 @@ async fn run_upnp(
     let upnp = tokio::task::spawn_blocking(move || {
         let stop_updates = updates.clone();
         upnp::ssdp_probe_with_callback(
-            interface_ip,
+            &iface,
             timeout,
             true,
             || stop_updates.is_closed(),

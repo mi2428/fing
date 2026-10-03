@@ -1178,7 +1178,7 @@ async fn scan_inner_running(
 
     let (multicast_tx, mut multicast_rx) = tokio::sync::mpsc::unbounded_channel();
     let multicast_future =
-        run_multicast_enrichment(&config, iface.ip, target, &events, move |update| {
+        run_multicast_enrichment(&config, &iface, target, &events, move |update| {
             let _ = multicast_tx.send(update);
         });
     let (mdns_result, upnp_result) = await_with_lldp_and_phase_updates(

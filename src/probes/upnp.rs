@@ -4,6 +4,7 @@
 //! description XML adds friendly names, manufacturer, model, and device type.
 //! The scanner later decides how strongly to trust those facts.
 
+use crate::net::{self, InterfaceInfo};
 use anyhow::{Context, Result, bail};
 use quick_xml::{Reader, events::Event};
 use serde::{Deserialize, Serialize};
@@ -47,7 +48,7 @@ pub struct UpnpDescription {
 }
 
 pub fn ssdp_probe_with_callback<F, AllowSource, ShouldStop>(
-    interface_ip: Ipv4Addr,
+    iface: &InterfaceInfo,
     timeout: Duration,
     fetch_descriptions: bool,
     mut should_stop: ShouldStop,
@@ -62,7 +63,7 @@ where
     if should_stop() {
         return Ok(HashMap::new());
     }
-    let socket = ssdp_socket(interface_ip)?;
+    let socket = ssdp_socket(iface)?;
     let request = ssdp_request();
     // Send twice because SSDP is UDP multicast and home devices commonly drop
     // one request while waking radios or low-power network stacks.
@@ -76,11 +77,7 @@ where
     }
 
     let deadline = Instant::now() + timeout;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("failed to build UPnP HTTP client")?;
+    let client = description_client(iface, timeout)?;
 
     let mut responses = HashMap::<IpAddr, UpnpInfo>::new();
     let mut fetched_locations = HashSet::<String>::new();
@@ -165,14 +162,30 @@ fn apply_ssdp_response<F, AllowSource, FetchDescription, ShouldStop>(
     }
 }
 
-fn ssdp_socket(interface_ip: Ipv4Addr) -> Result<UdpSocket> {
+fn ssdp_socket(iface: &InterfaceInfo) -> Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    net::bind_interface_v4(&socket, &iface.name)?;
     socket.set_reuse_address(true)?;
     socket.set_read_timeout(Some(Duration::from_millis(100)))?;
-    socket.bind(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))?;
-    socket.set_multicast_if_v4(&interface_ip)?;
+    socket.bind(&SockAddr::from(SocketAddrV4::new(iface.ip, 0)))?;
     socket.set_multicast_ttl_v4(2)?;
     Ok(socket.into())
+}
+
+fn description_client(
+    iface: &InterfaceInfo,
+    timeout: Duration,
+) -> Result<reqwest::blocking::Client> {
+    let builder = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .local_address(IpAddr::V4(iface.ip))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let builder = builder.interface(&iface.name);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    bail!("interface-bound UPnP HTTP requires Linux or macOS");
+    builder.build().context("failed to build UPnP HTTP client")
 }
 
 fn ssdp_request() -> &'static str {
@@ -418,6 +431,77 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn loopback_interface() -> InterfaceInfo {
+        let iface = if_addrs::get_if_addrs()
+            .unwrap()
+            .into_iter()
+            .find(|iface| iface.is_loopback() && matches!(iface.addr, if_addrs::IfAddr::V4(_)))
+            .unwrap();
+        let if_addrs::IfAddr::V4(v4) = iface.addr else {
+            unreachable!()
+        };
+        InterfaceInfo {
+            name: iface.name,
+            ip: v4.ip,
+            netmask: v4.netmask,
+            prefix: 8,
+            network: "127.0.0.0/8".parse().unwrap(),
+            mac: None,
+        }
+    }
+
+    #[test]
+    fn ssdp_socket_and_description_client_keep_selected_context() {
+        let iface = loopback_interface();
+        let socket = ssdp_socket(&iface).unwrap();
+        assert_eq!(socket.local_addr().unwrap().ip(), IpAddr::V4(iface.ip));
+        let bound = socket2::SockRef::from(&socket);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            bound.device().unwrap().as_deref(),
+            Some(iface.name.as_bytes())
+        );
+        #[cfg(target_os = "macos")]
+        assert!(bound.device_index_v4().unwrap().is_some());
+
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let location = format!("http://{}/root.xml", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, peer) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0_u8];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            use std::io::Write;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n<root><device><modelName>Fixture</modelName></device></root>").unwrap();
+            peer.ip()
+        });
+        let client = description_client(&iface, Duration::from_secs(5)).unwrap();
+        let description = fetch_description(
+            &client,
+            &location,
+            Instant::now() + Duration::from_secs(5),
+            &mut || false,
+        )
+        .unwrap();
+        assert_eq!(description.model_name.as_deref(), Some("Fixture"));
+        assert_eq!(server.join().unwrap(), IpAddr::V4(iface.ip));
+
+        let invalid = InterfaceInfo {
+            name: "fing-no-such-interface".into(),
+            ..iface
+        };
+        assert!(ssdp_socket(&invalid).is_err());
+        let client = description_client(&invalid, Duration::from_millis(100)).unwrap();
+        let err = client.get(&location).send().unwrap_err();
+        assert!(format!("{err:?}").contains("interface"));
+    }
+
     #[test]
     fn parses_ssdp_headers_case_insensitively() {
         let response = b"HTTP/1.1 200 OK\r\nLOCATION: http://192.168.1.1/root.xml\r\nSERVER: Linux UPnP/1.0\r\nST: urn:schemas-upnp-org:device:MediaServer:1\r\n\r\n";
@@ -437,12 +521,20 @@ mod tests {
     fn ssdp_stops_before_socket_creation_or_first_send() {
         for stop_on_check in [1, 2] {
             let mut checks = 0;
+            let iface = if stop_on_check == 1 {
+                InterfaceInfo {
+                    name: "fing-no-such-interface".into(),
+                    ip: Ipv4Addr::new(192, 0, 2, 20),
+                    netmask: Ipv4Addr::new(255, 255, 255, 0),
+                    prefix: 24,
+                    network: "192.0.2.0/24".parse().unwrap(),
+                    mac: None,
+                }
+            } else {
+                loopback_interface()
+            };
             let result = ssdp_probe_with_callback(
-                if stop_on_check == 1 {
-                    Ipv4Addr::new(192, 0, 2, 20)
-                } else {
-                    Ipv4Addr::LOCALHOST
-                },
+                &iface,
                 Duration::from_secs(1),
                 true,
                 || {

@@ -7,7 +7,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use if_addrs::{IfAddr, get_if_addrs};
 use ipnet::Ipv4Net;
-use std::{net::Ipv4Addr, process::Command};
+use std::{net::Ipv4Addr, num::NonZeroU32, process::Command};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceInfo {
@@ -17,6 +17,35 @@ pub struct InterfaceInfo {
     pub prefix: u8,
     pub network: Ipv4Net,
     pub mac: Option<String>,
+}
+
+/// Restrict ingress and egress to the selected interface, not an IP-based route.
+pub(crate) fn bind_interface_v4(
+    socket: &socket2::Socket,
+    interface_name: &str,
+) -> Result<NonZeroU32> {
+    if interface_name.is_empty() || interface_name.as_bytes().contains(&0) {
+        bail!("invalid interface name for socket binding");
+    }
+    let index = pnet::datalink::interfaces()
+        .into_iter()
+        .find(|iface| iface.name == interface_name)
+        .and_then(|iface| NonZeroU32::new(iface.index))
+        .context("selected interface was not found or has an invalid index")?;
+    #[cfg(target_os = "linux")]
+    let binding = socket.bind_device(Some(interface_name.as_bytes()));
+    #[cfg(target_os = "macos")]
+    let binding = socket.bind_device_by_index_v4(Some(index));
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let binding = {
+        let _ = socket;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "interface-bound IPv4 sockets require Linux or macOS",
+        ))
+    };
+    binding.context("failed to bind socket to selected interface")?;
+    Ok(index)
 }
 
 pub fn list_interfaces() -> Result<Vec<InterfaceInfo>> {
@@ -190,6 +219,28 @@ pub fn parse_ip_route_default_interface(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interface_binding_is_explicit_and_fails_closed() {
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
+        for name in ["", "invalid\0name", "fing-no-such-interface"] {
+            assert!(bind_interface_v4(&socket, name).is_err());
+        }
+        let iface = pnet::datalink::interfaces()
+            .into_iter()
+            .find(|iface| iface.is_loopback())
+            .unwrap();
+        let index = bind_interface_v4(&socket, &iface.name).unwrap();
+        assert_eq!(index.get(), iface.index);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            socket.device().unwrap().as_deref(),
+            Some(iface.name.as_bytes())
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(socket.device_index_v4().unwrap(), Some(index));
+    }
 
     #[test]
     fn parses_macos_default_interface() {
