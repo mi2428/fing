@@ -17,7 +17,10 @@ $ brew install --formula mi2428/fing/fing
 
 ### Build from source
 
-Install Rust and Cargo first, then build and install the binary with `make install`.
+Install Rust 1.95.0 with the `rustfmt` and `clippy` components first, then build and install the binary with `make install`.
+`rust-toolchain.toml` selects this toolchain for rustup; `make` fails if it is missing rather than silently using another Rust installation.
+Native toolchains without rustup (including Nix) use their tools on `PATH`; explicit `CARGO`, `RUSTC`, and `RUSTDOC` overrides are also supported.
+See [the compiler policy](docs/maintenance-dependencies.md) for alternative toolchains and validation limits.
 By default, the binary is installed to `~/.local/bin/fing`.
 Set `INSTALL_BINDIR` if you want to install it somewhere else.
 

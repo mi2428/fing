@@ -14,11 +14,13 @@ VHSDIR  := .vhs
 # Toolchain
 RUSTUP           ?= rustup
 RUSTUP_TOOLCHAIN ?= 1.95.0
-CARGO            ?= $(shell if command -v $(RUSTUP) >/dev/null 2>&1 && $(RUSTUP) which cargo --toolchain $(RUSTUP_TOOLCHAIN) >/dev/null 2>&1; then $(RUSTUP) which cargo --toolchain $(RUSTUP_TOOLCHAIN); else command -v cargo; fi)
-RUSTC            ?= $(shell if command -v $(RUSTUP) >/dev/null 2>&1 && $(RUSTUP) which rustc --toolchain $(RUSTUP_TOOLCHAIN) >/dev/null 2>&1; then $(RUSTUP) which rustc --toolchain $(RUSTUP_TOOLCHAIN); else command -v rustc; fi)
-RUSTDOC          ?= $(shell if command -v $(RUSTUP) >/dev/null 2>&1 && $(RUSTUP) which rustdoc --toolchain $(RUSTUP_TOOLCHAIN) >/dev/null 2>&1; then $(RUSTUP) which rustdoc --toolchain $(RUSTUP_TOOLCHAIN); else command -v rustdoc; fi)
+# Native toolchains (for example Nix) remain usable without rustup. Never
+# fall back to PATH when rustup is present but the selected toolchain is missing.
+CARGO            ?= $(shell if command -v $(RUSTUP) >/dev/null 2>&1; then $(RUSTUP) which cargo --toolchain $(RUSTUP_TOOLCHAIN) 2>/dev/null; else command -v cargo; fi)
+RUSTC            ?= $(shell if command -v $(RUSTUP) >/dev/null 2>&1; then $(RUSTUP) which rustc --toolchain $(RUSTUP_TOOLCHAIN) 2>/dev/null; else command -v rustc; fi)
+RUSTDOC          ?= $(shell if command -v $(RUSTUP) >/dev/null 2>&1; then $(RUSTUP) which rustdoc --toolchain $(RUSTUP_TOOLCHAIN) 2>/dev/null; else command -v rustdoc; fi)
 RUST_BINDIR      := $(patsubst %/,%,$(dir $(CARGO)))
-CARGO_ENV        := PATH="$(RUST_BINDIR):$(PATH)" RUSTC="$(RUSTC)" RUSTDOC="$(RUSTDOC)"
+CARGO_ENV        = $(if $(and $(CARGO),$(RUSTC),$(RUSTDOC)),PATH="$(RUST_BINDIR):$(PATH)" RUSTC="$(RUSTC)" RUSTDOC="$(RUSTDOC)",$(error Rust tools unavailable: install toolchain $(RUSTUP_TOOLCHAIN) with rustup, select an installed RUSTUP_TOOLCHAIN, or set CARGO/RUSTC/RUSTDOC explicitly))
 
 # Commands
 INSTALL ?= install
@@ -520,7 +522,7 @@ _dist.darwin.$(1): _target.$$(DARWIN_$(1)_TARGET)
 	fi
 	@printf 'Building %s for %s\n' "$(APP)" "$$(DARWIN_$(1)_TARGET)"
 	@mkdir -p $(DISTDIR)
-	@$(CARGO_ENV) $(CARGO) build --locked --release --target $$(DARWIN_$(1)_TARGET)
+	@$$(CARGO_ENV) $$(CARGO) build --locked --release --target $$(DARWIN_$(1)_TARGET)
 	@cp target/$$(DARWIN_$(1)_TARGET)/release/$(APP) $(DISTDIR)/$(DIST_APP)-$$(DARWIN_$(1)_SUFFIX)
 	@chmod +x $(DISTDIR)/$(DIST_APP)-$$(DARWIN_$(1)_SUFFIX)
 	@printf 'Wrote %s/%s-%s\n' "$(DISTDIR)" "$(DIST_APP)" "$$(DARWIN_$(1)_SUFFIX)"
