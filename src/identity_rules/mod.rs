@@ -299,10 +299,17 @@ const BUILTIN_RULES: &str = r#"
       "set": {"make": "Amazon", "device_type": "smart-home"}
     },
     {
-      "id": "printer-ipp-or-raw",
+      "id": "printer-ipp",
       "priority": 85,
       "confidence": 0.78,
-      "matches": [{"key": "port", "any_of": ["631", "9100"]}],
+      "matches": [{"key": "port", "equals": "631"}],
+      "set": {"device_type": "printer"}
+    },
+    {
+      "id": "printer-raw",
+      "priority": 85,
+      "confidence": 0.78,
+      "matches": [{"key": "port", "equals": "9100"}],
       "set": {"device_type": "printer"}
     },
     {
@@ -433,6 +440,26 @@ mod tests {
                 .map(|guess| guess.value.as_str()),
             Some("game-console")
         );
+    }
+
+    #[test]
+    fn printer_rule_matches_exact_ports_from_mdns_and_deep_services() {
+        let db = builtin_rule_db().unwrap();
+        for source in ["mdns", "deep"] {
+            for port in [631, 9100, 1631, 19100, 63, 80, 910] {
+                let mut device = Device::new("192.0.2.20".parse().unwrap(), Utc::now());
+                device.add_service("unrelated", source, Some(port), 0.7);
+                apply_identity_rules(&mut device, &db);
+                assert_eq!(
+                    device
+                        .device_type
+                        .as_ref()
+                        .map(|guess| guess.value.as_str()),
+                    matches!(port, 631 | 9100).then_some("printer"),
+                    "source={source}, port={port}",
+                );
+            }
+        }
     }
 
     #[test]
