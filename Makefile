@@ -269,6 +269,7 @@ tap_readme_title="$${HOMEBREW_TAP_README_TITLE:-homebrew-$$APP}"
 remote_line="$$(git ls-remote --tags "$$GIT_REMOTE" "refs/tags/$$TAG" | sed -n '1p')"
 remote_oid="$${remote_line%%[[:space:]]*}"
 trap cleanup EXIT
+release_ref="refs/tags/$$TAG"
 
 if git rev-parse -q --verify "refs/tags/$$TAG" >/dev/null; then
   local_oid="$$(git rev-parse "refs/tags/$$TAG")"
@@ -279,18 +280,25 @@ elif [[ -n "$$remote_oid" ]]; then
   run git fetch "$$GIT_REMOTE" "refs/tags/$$TAG:refs/tags/$$TAG"
   printf 'Using fetched tag %s at %s\n' "$$TAG" "$$(git rev-list -n 1 "$$TAG")"
 else
-  run git tag "$$TAG"
-  created_tag=1
-  printf 'Created tag %s at %s\n' "$$TAG" "$$(git rev-parse HEAD)"
+  release_ref=HEAD
 fi
 
-release_commit="$$(git rev-list -n 1 "$$TAG")"
+release_commit="$$(git rev-list -n 1 "$$release_ref")"
 head_commit="$$(git rev-parse HEAD)"
 [[ "$$release_commit" == "$$head_commit" ]] || \
   fail "$$TAG points to $$release_commit, but HEAD is $$head_commit; checkout the release commit first"
 
-[[ "$$(value_at_ref "refs/tags/$$TAG" name)" == "$$APP" ]] || fail "Cargo.toml package name does not match $$APP"
-[[ "$$(value_at_ref "refs/tags/$$TAG" version)" == "$$version" ]] || fail "Cargo.toml version does not match $$TAG"
+[[ "$$(value_at_ref "$$release_ref" name)" == "$$APP" ]] || fail "Cargo.toml package name does not match $$APP"
+[[ "$$(value_at_ref "$$release_ref" version)" == "$$version" ]] || fail "Cargo.toml version does not match $$TAG"
+
+run "$$RELEASE_MAKE" check
+clean_git_dir . "working tree"
+
+if [[ "$$release_ref" == HEAD ]]; then
+  run git tag "$$TAG"
+  created_tag=1
+  printf 'Created tag %s at %s\n' "$$TAG" "$$release_commit"
+fi
 
 run "$$RELEASE_MAKE" dist TAG="$$TAG" OS="$$OS" ARCH="$$ARCH"
 run git push "$$GIT_REMOTE" "refs/tags/$$TAG"
@@ -312,7 +320,7 @@ else
     --target "$$release_commit" \
     --title "$$TAG" \
     --generate-notes \
-    "$${release_flags[@]}" \
+    $${release_flags[@]+"$${release_flags[@]}"} \
     "$${assets[@]}"
 fi
 

@@ -23,5 +23,7 @@ jobs:
         run: rustup toolchain install --no-self-update
       - name: Check CI contracts
         run: ruby .github/tests/ci_contract.rb
+      - name: Check release gating with synthetic command stubs
+        run: python3 .github/tests/release_gate.py
       - name: Run quality gates with locked dependencies
         run: make check

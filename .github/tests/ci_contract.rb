@@ -11,7 +11,8 @@ raise 'wrong runner' unless job.fetch('runs-on') == '${{ matrix.os }}'
 steps = job.fetch('steps')
 raise 'persisted credentials' unless steps.first.fetch('with').fetch('persist-credentials') == false
 raise 'wrong quality gates' unless steps.drop(1).map { |step| step.fetch('run') } == [
-  'rustup toolchain install --no-self-update', 'ruby .github/tests/ci_contract.rb', 'make check'
+  'rustup toolchain install --no-self-update', 'ruby .github/tests/ci_contract.rb',
+  'python3 .github/tests/release_gate.py', 'make check'
 ]
 raise 'checks can be skipped' if ([job] + steps).any? { |entry| entry.key?('if') || entry.key?('continue-on-error') }
 makefile = File.read('Makefile')

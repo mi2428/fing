@@ -126,10 +126,11 @@ Any future exception must identify the advisory, affected versions, reachability
 
 ### Release
 
-`make release TAG=vX.Y.Z` builds four local release binaries, pushes the Git tag, creates or updates the GitHub Release with generated release notes, uploads the release artifacts, and updates the Homebrew formula in `../homebrew-fing`.
+`make release TAG=vX.Y.Z` validates the selected release revision and runs `make check` before creating a new tag, then builds four local release binaries, pushes the Git tag, creates or updates the GitHub Release with generated release notes, uploads the release artifacts, and updates the Homebrew formula in `../homebrew-fing`.
 The default release matrix is macOS/Linux for amd64/arm64.
 Set `HOMEBREW_TAP=0` to skip the Homebrew tap update, or `HOMEBREW_TAP_DIR=/path/to/tap` to use another checkout.
-Before releasing, this repository must have a clean working tree.
+Before releasing, this repository must have a clean working tree; it is checked again after the quality gate. Existing local/remote tags must still match HEAD and the package version, and retries run the quality gate again.
+Run `python3 .github/tests/release_gate.py` for the synthetic, fully stubbed release regression (no real git/gh, builds, tags, pushes, releases or tap updates).
 
 ```console
 $ make
