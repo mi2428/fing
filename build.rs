@@ -65,6 +65,14 @@ fn emit_git_rerun_instructions(manifest_dir: &Path) {
 
 fn emit_git_dir_rerun_instructions(git_dir: &Path) {
     println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        git_dir.join("refs/tags").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        git_dir.join("packed-refs").display()
+    );
     let Ok(head) = fs::read_to_string(git_dir.join("HEAD")) else {
         return;
     };
