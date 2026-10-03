@@ -98,6 +98,10 @@ $ fing oui update --output.path ./oui.json
 
 ## Development
 
+The Quality workflow runs `make check` on macOS and Linux for every pull request and pushes to `main`/`develop`, using `rust-toolchain.toml` and locked dependencies.
+The default tests use synthetic data and loopback services; CI does not perform privileged LAN scans or publish artifacts.
+Run `ruby .github/tests/ci_contract.rb` to check the CI configuration contract locally.
+
 `make release TAG=vX.Y.Z` builds four local release binaries, pushes the Git tag, creates or updates the GitHub Release with generated release notes, uploads the release artifacts, and updates the Homebrew formula in `../homebrew-fing`.
 The default release matrix is macOS/Linux for amd64/arm64.
 Set `HOMEBREW_TAP=0` to skip the Homebrew tap update, or `HOMEBREW_TAP_DIR=/path/to/tap` to use another checkout.

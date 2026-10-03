@@ -1,0 +1,27 @@
+name: Quality
+
+"on":
+  pull_request:
+  push:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install the declared Rust toolchain and components
+        run: rustup toolchain install --no-self-update
+      - name: Check CI contracts
+        run: ruby .github/tests/ci_contract.rb
+      - name: Run quality gates with locked dependencies
+        run: make check

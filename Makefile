@@ -111,15 +111,15 @@ fmt: ## Format Rust sources. Use CHECK_ONLY=1 to check without writing
 
 .PHONY: lint
 lint: ## Run clippy with warnings treated as errors
-	@$(CARGO_ENV) $(CARGO) clippy --all-targets --all-features -- -D warnings
+	@$(CARGO_ENV) $(CARGO) clippy --locked --all-targets --all-features -- -D warnings
 
 .PHONY: doc
 doc: ## Build rustdoc with warnings treated as errors
-	@RUSTDOCFLAGS="-D warnings" $(CARGO_ENV) $(CARGO) doc --no-deps
+	@RUSTDOCFLAGS="-D warnings" $(CARGO_ENV) $(CARGO) doc --locked --no-deps
 
 .PHONY: test
 test: ## Run unit tests
-	@$(CARGO_ENV) $(CARGO) test
+	@$(CARGO_ENV) $(CARGO) test --locked
 
 .PHONY: check
 check: ## Run formatting, lint, rustdoc, and tests
