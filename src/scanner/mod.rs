@@ -1505,7 +1505,9 @@ struct PassiveDiscovery {
 
 impl PassiveDiscovery {
     fn has_open_updates(&self) -> bool {
-        self.l2.is_some()
+        self.l2
+            .as_ref()
+            .is_some_and(|l2| !l2.updates.is_closed() || !l2.updates.is_empty())
     }
 }
 
@@ -1513,13 +1515,12 @@ type PassiveUpdate = PassiveObservation;
 
 async fn recv_passive_update(passive: &mut PassiveDiscovery) -> Option<PassiveUpdate> {
     match &mut passive.l2 {
-        Some(l2) => match l2.updates.recv().await {
-            Some(advertisement) => Some(PassiveObservation::from_advertisement(advertisement)),
-            None => {
-                passive.l2 = None;
-                None
-            }
-        },
+        // EOF closes only the update stream, not ownership of the listener result.
+        Some(l2) => l2
+            .updates
+            .recv()
+            .await
+            .map(PassiveObservation::from_advertisement),
         None => None,
     }
 }
@@ -1571,9 +1572,16 @@ async fn finish_l2_discovery(
 ) -> Option<L2Run> {
     let mut discovery = l2?;
     let mut updates_open = true;
+    let mut cancelled = false;
 
     Some(loop {
         tokio::select! {
+            _ = wait_for_events_closed(context.events), if !cancelled => {
+                // Closing the receiver is the listener's cooperative stop signal.
+                // The raw L2 receive loop checks it at its 100ms read timeout.
+                discovery.updates.close();
+                cancelled = true;
+            }
             result = &mut discovery.listener => {
                 drain_l2_receiver(&mut discovery.updates, devices, context);
                 break result
@@ -1696,6 +1704,13 @@ fn events_closed(events: &Option<UnboundedSender<ScanEvent>>) -> bool {
     events.as_ref().is_some_and(|sender| sender.is_closed())
 }
 
+async fn wait_for_events_closed(events: &Option<UnboundedSender<ScanEvent>>) {
+    match events {
+        Some(sender) => sender.closed().await,
+        None => std::future::pending().await,
+    }
+}
+
 fn ip_sort_key(ip: IpAddr) -> (u8, u128) {
     match ip {
         IpAddr::V4(ipv4) => (4, u32::from(ipv4) as u128),
@@ -1707,6 +1722,120 @@ fn ip_sort_key(ip: IpAddr) -> (u8, u128) {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[tokio::test]
+    async fn l2_completion_preserves_results_after_stream_eof() {
+        let rules = identity_rules::RuleDb::default();
+        let events = None;
+        let context = LldpApplyContext {
+            now: Utc::now(),
+            interface: "test0",
+            target: "192.0.2.0/24".parse().unwrap(),
+            oui_db: None,
+            events: &events,
+            rules: &rules,
+        };
+        for outcome in 0..3 {
+            let (tx, updates) = tokio::sync::mpsc::unbounded_channel();
+            let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+            let listener = tokio::spawn(async move {
+                drop(tx);
+                finish_rx.await.unwrap();
+                match outcome {
+                    0 => Ok(discovery::l2::L2Advertisements::default()),
+                    1 => Err(anyhow::anyhow!("synthetic listener error")),
+                    _ => panic!("synthetic listener panic"),
+                }
+            });
+            let mut passive = PassiveDiscovery {
+                l2: Some(L2Discovery { updates, listener }),
+            };
+            assert!(recv_passive_update(&mut passive).await.is_none());
+            assert!(!passive.has_open_updates());
+            assert!(passive.l2.is_some());
+            finish_tx.send(()).unwrap();
+            let mut devices = BTreeMap::new();
+            let result = finish_l2_discovery(passive.l2.take(), &mut devices, &context)
+                .await
+                .unwrap();
+            match outcome {
+                0 => assert!(result.is_ok()),
+                1 => assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("synthetic listener error")
+                ),
+                _ => assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("L2 passive worker failed")
+                ),
+            }
+            assert!(
+                finish_l2_discovery(passive.l2.take(), &mut devices, &context)
+                    .await
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn l2_completion_drains_pending_updates_and_stops_on_cancellation() {
+        let rules = identity_rules::RuleDb::default();
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let events = Some(events_tx);
+        let context = LldpApplyContext {
+            now: Utc::now(),
+            interface: "test0",
+            target: "192.0.2.0/24".parse().unwrap(),
+            oui_db: None,
+            events: &events,
+            rules: &rules,
+        };
+        let (tx, updates) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(discovery::l2::L2Advertisement::Cdp(
+            discovery::cdp::CdpInfo {
+                source_mac: "02:00:00:00:00:01".into(),
+                version: 2,
+                ttl: 120,
+                device_id: Some("synthetic-switch".into()),
+                addresses: vec!["192.0.2.10".parse().unwrap()],
+                port_id: None,
+                capabilities: Vec::new(),
+                software_version: None,
+                platform: None,
+                native_vlan: None,
+                duplex: None,
+                management_addresses: Vec::new(),
+            },
+        ))
+        .unwrap();
+        let listener = tokio::spawn(async move {
+            tx.closed().await;
+            Ok(discovery::l2::L2Advertisements::default())
+        });
+        drop(events_rx);
+        let mut devices = BTreeMap::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            finish_l2_discovery(
+                Some(L2Discovery { updates, listener }),
+                &mut devices,
+                &context,
+            ),
+        )
+        .await
+        .expect("cancelled listener should stop")
+        .unwrap();
+        assert!(result.is_ok());
+        assert_eq!(devices.len(), 1);
+        assert_eq!(
+            devices.values().next().unwrap().hostname.as_deref(),
+            Some("synthetic-switch")
+        );
+    }
 
     #[test]
     fn profile_timeouts_are_ordered_by_depth() {
