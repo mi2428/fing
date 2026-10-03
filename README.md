@@ -102,6 +102,30 @@ The Quality workflow runs `make check` on macOS and Linux for every pull request
 The default tests use synthetic data and loopback services; CI does not perform privileged LAN scans or publish artifacts.
 Run `ruby .github/tests/ci_contract.rb` to check the CI configuration contract locally.
 
+### Dependency maintenance
+
+The separate Dependency advisories workflow checks the entire `Cargo.lock` against OSV (RustSec and GitHub advisories) on PRs, pushes to `main`/`develop`, and weekly, including inactive and platform-specific packages.
+It fails on findings or scanner errors without exceptions, OS/architecture filters, or call-analysis suppression; a version match is not proof of application-level exploitability.
+With [OSV-Scanner v2.6.0](https://github.com/google/osv-scanner/releases/tag/v2.6.0), reproduce it using `osv-scanner scan source --lockfile=./Cargo.lock`.
+Dependabot proposes weekly individual Cargo updates (including transitives), with at most five open version-update PRs; updates run the same Quality checks and are not automatically merged or released.
+
+Baseline triage (`830239d`; no advisory exceptions are configured):
+
+| Package | Advisory | Reachability and disposition |
+| --- | --- | --- |
+| rustls 0.23.40 | RUSTSEC-2026-0285 | Active through reqwest TLS; update to >=0.23.45 in [#26](https://github.com/mi2428/fing/issues/26). |
+| quinn-proto 0.11.14 | RUSTSEC-2026-0185 / GHSA-4w2j-m93h-cj5j | Locked but no active host dependency path; reqwest HTTP/3 is disabled. Update to >=0.11.15 in #26. |
+| anyhow 1.0.102 | RUSTSEC-2026-0190 | No application `downcast_mut` calls; update to >=1.0.103 in [#27](https://github.com/mi2428/fing/issues/27). |
+| crossbeam-epoch 0.9.18 | RUSTSEC-2026-0204 | hickory-resolver -> moka; affected pointer-formatting reachability is unproven. Update to >=0.9.20 in [#28](https://github.com/mi2428/fing/issues/28). |
+| lru 0.16.4 | RUSTSEC-2026-0253 | ratatui-core cache; affected panic/unwind/key-Drop behavior is not demonstrated. Update the parent graph to lru >=0.18.2 in [#29](https://github.com/mi2428/fing/issues/29). |
+| openssl 0.10.79 | GHSA-phqj-4mhp-q6mq | Linux native-tls certificate probes; no application `cipher_update_inplace` calls. Update to >=0.10.80 in [#30](https://github.com/mi2428/fing/issues/30). |
+| quick-xml 0.39.4 | RUSTSEC-2026-0194 / RUSTSEC-2026-0195 | UPnP uses plain `Reader`, not attribute iteration or `NsReader`; update to >=0.41.0 in [#31](https://github.com/mi2428/fing/issues/31). |
+
+The advisory job stays red for affected lockfiles until the scoped dependency fixes land; do not suppress findings to make it green.
+Any future exception must identify the advisory, affected versions, reachability evidence, owner and review/removal condition in a reviewed change.
+
+### Release
+
 `make release TAG=vX.Y.Z` builds four local release binaries, pushes the Git tag, creates or updates the GitHub Release with generated release notes, uploads the release artifacts, and updates the Homebrew formula in `../homebrew-fing`.
 The default release matrix is macOS/Linux for amd64/arm64.
 Set `HOMEBREW_TAP=0` to skip the Homebrew tap update, or `HOMEBREW_TAP_DIR=/path/to/tap` to use another checkout.
