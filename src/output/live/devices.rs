@@ -533,14 +533,8 @@ pub(super) fn merge_live_device(existing: &mut Device, mut incoming: Device) {
             service.confidence,
         );
     }
-    for evidence in incoming.evidence {
-        existing.add_evidence(
-            &evidence.source,
-            &evidence.key,
-            evidence.value,
-            evidence.confidence,
-        );
-    }
+    existing.merge_evidence_snapshot(incoming.evidence);
+    existing.observation_round = existing.observation_round.max(incoming.observation_round);
     existing.first_seen = existing.first_seen.min(incoming.first_seen);
     existing.last_seen = existing.last_seen.max(incoming.last_seen);
 }

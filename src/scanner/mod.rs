@@ -77,7 +77,8 @@ pub async fn scan_continuously_with_events(
             &mut passive_manager,
         )
         .await;
-        emit(&Some(events.clone()), ScanEvent::RoundStarted { round });
+        let started = passive_manager.observe_scan_event(ScanEvent::RoundStarted { round });
+        emit(&Some(events.clone()), started);
         emit(
             &Some(events.clone()),
             ScanEvent::Phase(format!("scan round {round}")),
@@ -161,6 +162,7 @@ struct ContinuousPassiveManager {
     rules: identity_rules::RuleDb,
     oui_db: HashMap<String, String>,
     startup_warnings: Vec<String>,
+    observation_round: u64,
 }
 
 struct ContinuousPassiveInterfaceState {
@@ -181,6 +183,7 @@ struct PassiveObservation {
     candidate_ips: Vec<IpAddr>,
     candidate_macs: Vec<String>,
     advertisement: discovery::l2::L2Advertisement,
+    observation_round: u64,
 }
 
 impl PassiveObservation {
@@ -203,6 +206,7 @@ impl PassiveObservation {
                 candidate_ips: info.management_addresses.clone(),
                 candidate_macs: lldp_candidate_macs(info),
                 advertisement,
+                observation_round: 0,
             },
             discovery::l2::L2Advertisement::Cdp(info) => Self {
                 key: format!("cdp|{}", info.identity_key()),
@@ -216,6 +220,7 @@ impl PassiveObservation {
                     .collect(),
                 candidate_macs: vec![info.source_mac.clone()],
                 advertisement,
+                observation_round: 0,
             },
         }
     }
@@ -265,6 +270,8 @@ impl PassiveObservation {
     }
 
     fn apply_to_device(&self, device: &mut Device, oui_db: Option<&HashMap<String, String>>) {
+        let scan_round = device.observation_round;
+        device.observation_round = self.observation_round;
         match &self.advertisement {
             discovery::l2::L2Advertisement::Lldp(info) => {
                 apply_lldp_info(device, info.clone(), oui_db);
@@ -273,6 +280,7 @@ impl PassiveObservation {
                 apply_cdp_info(device, info.clone(), oui_db);
             }
         }
+        device.observation_round = scan_round;
     }
 }
 
@@ -308,6 +316,7 @@ impl ContinuousPassiveManager {
             rules: identity_rules::load_rule_db()?,
             oui_db,
             startup_warnings: oui_warning.into_iter().collect(),
+            observation_round: 1,
         };
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -334,6 +343,10 @@ impl ContinuousPassiveManager {
 
     fn observe_scan_event(&mut self, event: ScanEvent) -> ScanEvent {
         match event {
+            ScanEvent::RoundStarted { round } => {
+                self.observation_round = round;
+                ScanEvent::RoundStarted { round }
+            }
             ScanEvent::DeviceUpdated(mut device) => {
                 self.observe_device(&mut device);
                 ScanEvent::DeviceUpdated(device)
@@ -356,6 +369,7 @@ impl ContinuousPassiveManager {
     }
 
     fn observe_device(&mut self, device: &mut Device) {
+        device.mark_observation_round(self.observation_round);
         let Some(interface) = device.interface.clone() else {
             return;
         };
@@ -387,7 +401,7 @@ impl ContinuousPassiveManager {
     fn apply_observation(
         &mut self,
         interface: &str,
-        observation: PassiveObservation,
+        mut observation: PassiveObservation,
     ) -> Vec<ScanEvent> {
         let Some(state) = self.states.get_mut(interface) else {
             return Vec::new();
@@ -397,6 +411,7 @@ impl ContinuousPassiveManager {
         if observation.is_expired(now) {
             return Vec::new();
         }
+        observation.observation_round = self.observation_round;
         state
             .pending_observations
             .insert(observation.key.clone(), observation.clone());
@@ -722,14 +737,8 @@ fn merge_device_snapshot(existing: &mut Device, mut incoming: Device) {
             service.confidence,
         );
     }
-    for evidence in incoming.evidence {
-        existing.add_evidence(
-            &evidence.source,
-            &evidence.key,
-            evidence.value,
-            evidence.confidence,
-        );
-    }
+    existing.merge_evidence_snapshot(incoming.evidence);
+    existing.observation_round = existing.observation_round.max(incoming.observation_round);
     existing.first_seen = existing.first_seen.min(incoming.first_seen);
     existing.last_seen = existing.last_seen.max(incoming.last_seen);
 }
@@ -1723,6 +1732,52 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    #[test]
+    fn evidence_snapshots_stay_bounded_in_continuous_passive_state() {
+        let mut manager = passive_manager();
+        let ip = "192.0.2.10".parse().unwrap();
+        for round in 1..=1_000 {
+            manager.observe_scan_event(ScanEvent::RoundStarted { round });
+            let mut device = Device::new(ip, Utc::now());
+            device.interface = Some("en0".into());
+            device.add_evidence(
+                "http",
+                "http_header_x_request_id",
+                format!("{round}-80"),
+                0.75,
+            );
+            device.add_evidence(
+                "http",
+                "http_header_x_request_id",
+                format!("{round}-443"),
+                0.75,
+            );
+            manager.observe_scan_event(ScanEvent::DeviceUpdated(Box::new(device)));
+            let stored = &manager.states["en0"].devices[&ip];
+            assert_eq!(stored.evidence.len(), 2);
+            assert!(
+                stored
+                    .evidence
+                    .iter()
+                    .all(|item| item.value.starts_with(&format!("{round}-")))
+            );
+        }
+        manager.observe_scan_event(ScanEvent::RoundStarted { round: 1_001 });
+        let mut arp_only = Device::new(ip, Utc::now());
+        arp_only.interface = Some("en0".into());
+        let event = manager.observe_scan_event(ScanEvent::DeviceUpdated(Box::new(arp_only)));
+        let ScanEvent::DeviceUpdated(device) = event else {
+            panic!("expected snapshot")
+        };
+        assert_eq!(device.evidence.len(), 2);
+        assert!(
+            device
+                .evidence
+                .iter()
+                .all(|item| item.observation_round == 1_000)
+        );
+    }
+
     #[tokio::test]
     async fn l2_completion_preserves_results_after_stream_eof() {
         let rules = identity_rules::RuleDb::default();
@@ -2260,6 +2315,7 @@ mod tests {
             rules: identity_rules::RuleDb::default(),
             oui_db: HashMap::new(),
             startup_warnings: Vec::new(),
+            observation_round: 1,
         }
     }
 }

@@ -37,6 +37,9 @@ pub struct Device {
     pub evidence: Vec<Evidence>,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
+    // Internal scan-round provenance; never changes the export/cache schema.
+    #[serde(skip)]
+    pub(crate) observation_round: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -67,6 +70,8 @@ pub struct Evidence {
     pub key: String,
     pub value: String,
     pub confidence: f32,
+    #[serde(skip)]
+    pub(crate) observation_round: u64,
 }
 
 impl Device {
@@ -86,6 +91,7 @@ impl Device {
             evidence: Vec::new(),
             first_seen: now,
             last_seen: now,
+            observation_round: 0,
         }
     }
 
@@ -119,10 +125,38 @@ impl Device {
         value: impl Into<String>,
         confidence: f32,
     ) {
-        let value = value.into();
+        self.add_evidence_in_round(
+            source,
+            key,
+            value.into(),
+            confidence,
+            self.observation_round,
+        );
+    }
+
+    fn add_evidence_in_round(
+        &mut self,
+        source: &str,
+        key: &str,
+        value: String,
+        confidence: f32,
+        round: u64,
+    ) {
         if value.trim().is_empty() {
             return;
         }
+        // Replace only older rounds of this key, not independent keys or the
+        // legitimate multiple values collected in the current round.
+        if self
+            .evidence
+            .iter()
+            .any(|item| item.source == source && item.key == key && item.observation_round > round)
+        {
+            return;
+        }
+        self.evidence.retain(|item| {
+            item.source != source || item.key != key || item.observation_round >= round
+        });
         if !self
             .evidence
             .iter()
@@ -133,7 +167,29 @@ impl Device {
                 key: key.to_string(),
                 value,
                 confidence,
+                observation_round: round,
             });
+        }
+    }
+
+    pub(crate) fn mark_observation_round(&mut self, round: u64) {
+        self.observation_round = round;
+        for item in &mut self.evidence {
+            if item.observation_round == 0 {
+                item.observation_round = round;
+            }
+        }
+    }
+
+    pub(crate) fn merge_evidence_snapshot(&mut self, incoming: Vec<Evidence>) {
+        for item in incoming {
+            self.add_evidence_in_round(
+                &item.source,
+                &item.key,
+                item.value,
+                item.confidence,
+                item.observation_round,
+            );
         }
     }
 
@@ -256,6 +312,55 @@ pub fn normalize_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_snapshots_replace_older_rounds_without_collapsing_current_values() {
+        let mut device = Device::new("192.0.2.10".parse().unwrap(), Utc::now());
+        device.add_evidence("snmp", "sysObjectID", "1.3.6.1.4.1.8072", 0.85);
+        for round in 1..=1_000 {
+            let mut snapshot = Device::new(device.ip, Utc::now());
+            for port in [80, 443] {
+                snapshot.add_evidence(
+                    "http",
+                    "http_header_x_request_id",
+                    format!("{round}-{port}"),
+                    0.75,
+                );
+            }
+            for ip in ["192.0.2.10", "192.0.2.11"] {
+                snapshot.add_evidence("lldp", "management_address", ip, 0.84);
+            }
+            snapshot.mark_observation_round(round);
+            device.merge_evidence_snapshot(snapshot.evidence);
+            assert_eq!(device.evidence.len(), 5);
+            assert!(
+                device
+                    .evidence
+                    .iter()
+                    .any(|item| item.value == format!("{round}-80"))
+            );
+            assert!(
+                device
+                    .evidence
+                    .iter()
+                    .any(|item| item.value == format!("{round}-443"))
+            );
+        }
+        let mut delayed = Device::new(device.ip, Utc::now());
+        delayed.add_evidence("http", "http_header_x_request_id", "obsolete", 0.75);
+        delayed.mark_observation_round(999);
+        device.merge_evidence_snapshot(delayed.evidence);
+        assert_eq!(device.evidence.len(), 5);
+        let json = serde_json::to_value(&device).unwrap();
+        assert!(json.get("observation_round").is_none());
+        assert!(
+            json["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item.get("observation_round").is_none())
+        );
+    }
 
     #[test]
     fn device_picks_highest_confidence_hostname() {

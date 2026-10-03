@@ -247,7 +247,10 @@ impl LiveTable {
             ScanEvent::Phase(phase) => {
                 self.phase = phase;
             }
-            ScanEvent::DeviceUpdated(device) => {
+            ScanEvent::DeviceUpdated(mut device) => {
+                if let Some(round) = self.current_round {
+                    device.mark_observation_round(round);
+                }
                 let key = DeviceKey::from_device(&device);
                 if let Some(message) = self.upsert_device_update(*device) {
                     self.push_log(LiveLogLevel::Device, message);
@@ -757,6 +760,42 @@ mod tests {
         style::{Color, Modifier},
         text::Line,
     };
+
+    #[test]
+    fn evidence_snapshots_keep_current_round_values_and_ignore_replayed_history() {
+        let mut app = LiveTable::new(OutputOptions::default(), LiveInterfacePanel::default());
+        let ip = "192.0.2.10".parse().unwrap();
+        for round in 1..=1_000 {
+            app.apply(ScanEvent::RoundStarted { round });
+            for port in [80, 443] {
+                let mut device = Device::new(ip, Utc::now());
+                device.add_evidence(
+                    "http",
+                    "http_header_x_request_id",
+                    format!("{round}-{port}"),
+                    0.75,
+                );
+                app.apply(ScanEvent::DeviceUpdated(Box::new(device)));
+            }
+            let stored = app.devices.values().next().unwrap();
+            assert_eq!(stored.evidence.len(), 2);
+            assert!(
+                stored
+                    .evidence
+                    .iter()
+                    .all(|item| item.value.starts_with(&format!("{round}-")))
+            );
+        }
+        app.apply(ScanEvent::RoundStarted { round: 1_001 });
+        let retained = app.devices.values().next().unwrap().clone();
+        app.apply(ScanEvent::DeviceUpdated(Box::new(retained)));
+        let mut fresh = Device::new(ip, Utc::now());
+        fresh.add_evidence("http", "http_header_x_request_id", "fresh", 0.75);
+        app.apply(ScanEvent::DeviceUpdated(Box::new(fresh)));
+        let stored = app.devices.values().next().unwrap();
+        assert_eq!(stored.evidence.len(), 1);
+        assert_eq!(stored.evidence[0].value, "fresh");
+    }
 
     #[test]
     fn table_offset_keeps_cursor_moving_inside_viewport() {
