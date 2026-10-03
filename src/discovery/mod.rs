@@ -86,43 +86,46 @@ where
         _ => return Err(anyhow!("unsupported datalink channel type")),
     };
 
-    let targets = arp_target_hosts(target, iface.ip);
-    let pass_count = arp_retry_passes(targets.len(), timeout);
+    let host_count = arp_target_host_count(target, iface.ip);
+    let pass_count = arp_retry_passes(host_count, timeout);
     let inter_batch_receive_window = timeout.min(ARP_INTER_BATCH_RECEIVE_WINDOW);
     let inter_pass_receive_window = timeout.min(ARP_INTER_PASS_RECEIVE_WINDOW);
     let mut hits = BTreeMap::new();
-    let mut batch_size = arp_batch_size(targets.len());
+    let mut batch_size = arp_batch_size(host_count);
 
     for pass in 0..pass_count {
         if should_stop() {
             break;
         }
 
-        let unresolved = unresolved_targets(&targets, &hits);
-        if unresolved.is_empty() {
-            break;
-        }
-
-        for chunk in unresolved.chunks(batch_size) {
+        let mut sent = 0;
+        // Walk the CIDR lazily on each pass; even /0 needs no target-sized Vec.
+        for target_ip in arp_target_hosts(target, iface.ip) {
             if should_stop() {
                 break;
             }
-
-            // Wide ranges used to be sent as one large microburst, which could
-            // make some devices skip replying at all. Smaller bursts with a
-            // quick read phase in between are measurably more reliable.
-            for target_ip in chunk {
-                if should_stop() {
-                    break;
-                }
-
-                let packet = build_arp_request(source_mac, iface.ip, *target_ip)?;
-                match tx.send_to(&packet, None) {
-                    Some(Ok(())) => {}
-                    Some(Err(err)) => return Err(err).context("failed to send ARP request"),
-                    None => return Err(anyhow!("datalink sender refused ARP packet")),
-                }
+            if hits.contains_key(&target_ip) {
+                continue;
             }
+            let packet = build_arp_request(source_mac, iface.ip, target_ip)?;
+            match tx.send_to(&packet, None) {
+                Some(Ok(())) => {}
+                Some(Err(err)) => return Err(err).context("failed to send ARP request"),
+                None => return Err(anyhow!("datalink sender refused ARP packet")),
+            }
+            sent += 1;
+            if sent % batch_size == 0 {
+                drain_arp_replies_for(
+                    &mut *rx,
+                    target,
+                    inter_batch_receive_window,
+                    &mut should_stop,
+                    &mut hits,
+                    &mut on_hit,
+                )?;
+            }
+        }
+        if sent % batch_size != 0 {
             drain_arp_replies_for(
                 &mut *rx,
                 target,
@@ -133,7 +136,7 @@ where
             )?;
         }
 
-        if should_stop() {
+        if sent == 0 || should_stop() {
             break;
         }
 
@@ -156,19 +159,18 @@ where
     Ok(hits.into_values().collect())
 }
 
-fn arp_target_hosts(target: Ipv4Net, source_ip: Ipv4Addr) -> Vec<Ipv4Addr> {
+fn arp_target_hosts(target: Ipv4Net, source_ip: Ipv4Addr) -> impl Iterator<Item = Ipv4Addr> {
     target
         .hosts()
-        .filter(|target_ip| *target_ip != source_ip)
-        .collect()
+        .filter(move |target_ip| *target_ip != source_ip)
 }
 
-fn unresolved_targets(targets: &[Ipv4Addr], hits: &BTreeMap<Ipv4Addr, ArpHit>) -> Vec<Ipv4Addr> {
-    targets
-        .iter()
-        .copied()
-        .filter(|target_ip| !hits.contains_key(target_ip))
-        .collect()
+fn arp_target_host_count(target: Ipv4Net, source_ip: Ipv4Addr) -> usize {
+    let point_to_point = target.prefix_len() >= 31;
+    let hosts = (1_u64 << (32 - target.prefix_len())) - if point_to_point { 0 } else { 2 };
+    let includes_source = target.contains(&source_ip)
+        && (point_to_point || (source_ip != target.network() && source_ip != target.broadcast()));
+    (hosts - u64::from(includes_source)) as usize
 }
 
 fn arp_batch_size(host_count: usize) -> usize {
@@ -482,28 +484,44 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_targets_skip_ips_already_recorded() {
-        let targets = vec![
-            "192.168.1.10".parse().unwrap(),
-            "192.168.1.11".parse().unwrap(),
-            "192.168.1.12".parse().unwrap(),
-        ];
-        let mut hits = BTreeMap::new();
-        hits.insert(
-            "192.168.1.11".parse().unwrap(),
-            ArpHit {
-                ip: "192.168.1.11".parse().unwrap(),
-                mac: "aa:bb:cc:dd:ee:ff".to_string(),
-                interface: None,
-            },
-        );
-
+    fn arp_targets_are_lazy_and_preserve_host_semantics() {
+        let source = "192.0.2.1".parse().unwrap();
+        let broad = "0.0.0.0/0".parse().unwrap();
+        assert_eq!(arp_target_host_count(broad, source), 4_294_967_293);
+        assert_eq!(arp_target_hosts(broad, source).take(3).count(), 3);
+        let mut stopped = true;
         assert_eq!(
-            unresolved_targets(&targets, &hits),
-            vec![
-                "192.168.1.10".parse::<Ipv4Addr>().unwrap(),
-                "192.168.1.12".parse::<Ipv4Addr>().unwrap()
-            ]
+            arp_target_hosts(broad, source)
+                .take_while(|_| !stopped)
+                .count(),
+            0
+        );
+        stopped = false;
+        assert_eq!(
+            arp_target_hosts(broad, source)
+                .take_while(|_| !stopped)
+                .take(1)
+                .count(),
+            1
+        );
+        for cidr in [
+            "192.0.2.0/24",
+            "192.0.2.0/31",
+            "192.0.2.1/32",
+            "198.51.100.1/32",
+        ] {
+            let target = cidr.parse().unwrap();
+            let hosts = arp_target_hosts(target, source).collect::<Vec<_>>();
+            assert_eq!(hosts.len(), arp_target_host_count(target, source));
+            assert!(!hosts.contains(&source));
+        }
+        assert_eq!(
+            arp_target_host_count("192.0.2.0/31".parse().unwrap(), source),
+            1
+        );
+        assert_eq!(
+            arp_target_host_count("192.0.2.1/32".parse().unwrap(), source),
+            0
         );
     }
 
