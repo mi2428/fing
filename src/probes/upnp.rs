@@ -87,9 +87,12 @@ where
                 let Some(response) = parse_ssdp_response(&buffer[..len]) else {
                     continue;
                 };
-                let mut fetcher = |location: &str| fetch_description(&client, location);
+                let mut fetcher = |location: &str, deadline, stop: &mut ShouldStop| {
+                    fetch_description(&client, location, deadline, stop)
+                };
                 let mut context = SsdpResponseContext {
                     fetch_descriptions,
+                    deadline,
                     should_stop: &mut should_stop,
                     allow_source: &mut allow_source,
                     fetched_locations: &mut fetched_locations,
@@ -111,6 +114,7 @@ where
 
 struct SsdpResponseContext<'a, F, AllowSource, FetchDescription, ShouldStop> {
     fetch_descriptions: bool,
+    deadline: Instant,
     should_stop: &'a mut ShouldStop,
     allow_source: &'a mut AllowSource,
     fetched_locations: &'a mut HashSet<String>,
@@ -126,7 +130,7 @@ fn apply_ssdp_response<F, AllowSource, FetchDescription, ShouldStop>(
 ) where
     F: FnMut(IpAddr, UpnpInfo),
     AllowSource: FnMut(IpAddr) -> bool,
-    FetchDescription: FnMut(&str) -> Result<UpnpDescription>,
+    FetchDescription: FnMut(&str, Instant, &mut ShouldStop) -> Result<UpnpDescription>,
     ShouldStop: FnMut() -> bool,
 {
     if !(context.allow_source)(source_ip) {
@@ -141,10 +145,14 @@ fn apply_ssdp_response<F, AllowSource, FetchDescription, ShouldStop>(
     // device often point at the same XML description.
     if context.fetch_descriptions
         && !(context.should_stop)()
+        && Instant::now() < context.deadline
         && let Some(location) = info.location.clone()
         && description_location_allowed(&location, source_ip)
         && context.fetched_locations.insert(location.clone())
-        && let Ok(description) = (context.fetch_description)(&location)
+        && let Ok(description) =
+            (context.fetch_description)(&location, context.deadline, context.should_stop)
+        && !(context.should_stop)()
+        && Instant::now() < context.deadline
     {
         merge_description(info, description);
         (context.on_result)(source_ip, info.clone());
@@ -214,10 +222,12 @@ fn merge_ssdp_headers(info: &mut UpnpInfo, headers: &HashMap<String, String>) {
 fn fetch_description(
     client: &reqwest::blocking::Client,
     location: &str,
+    deadline: Instant,
+    should_stop: &mut impl FnMut() -> bool,
 ) -> Result<UpnpDescription> {
+    let request = description_request(client, location, deadline, Instant::now(), should_stop())?;
     let response = client
-        .get(location)
-        .send()
+        .execute(request)
         .with_context(|| format!("failed to fetch UPnP description from {location}"))?;
     if !response.status().is_success() {
         bail!(
@@ -232,8 +242,32 @@ fn fetch_description(
         bail!("UPnP description from {location} exceeded {MAX_UPNP_DESCRIPTION_BYTES} bytes");
     }
 
-    let text = read_limited_description_body(response, location)?;
+    let text = read_limited_description_body(response, location, || {
+        should_stop() || Instant::now() >= deadline
+    })?;
     parse_upnp_description(&text)
+}
+
+fn description_request(
+    client: &reqwest::blocking::Client,
+    location: &str,
+    deadline: Instant,
+    now: Instant,
+    stopped: bool,
+) -> Result<reqwest::blocking::Request> {
+    if stopped {
+        bail!("UPnP description fetch stopped");
+    }
+    let remaining = deadline
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+        .context("UPnP description phase deadline expired")?;
+    // Request timeout covers response headers AND body, unlike connect_timeout.
+    client
+        .get(location)
+        .timeout(remaining)
+        .build()
+        .context("failed to build UPnP description request")
 }
 
 fn description_location_allowed(location: &str, source_ip: IpAddr) -> bool {
@@ -252,12 +286,29 @@ fn description_location_allowed(location: &str, source_ip: IpAddr) -> bool {
         .is_some_and(|host_ip| host_ip == source_ip)
 }
 
-fn read_limited_description_body(reader: impl Read, location: &str) -> Result<String> {
+fn read_limited_description_body(
+    reader: impl Read,
+    location: &str,
+    mut should_stop: impl FnMut() -> bool,
+) -> Result<String> {
     let mut bytes = Vec::new();
     let mut limited = reader.take(MAX_UPNP_DESCRIPTION_BYTES as u64 + 1);
-    limited
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read UPnP description from {location}"))?;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        if should_stop() {
+            bail!("UPnP description body stopped or phase deadline expired");
+        }
+        let len = limited
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read UPnP description from {location}"))?;
+        if len == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..len]);
+    }
+    if should_stop() {
+        bail!("UPnP description body stopped or phase deadline expired");
+    }
     if bytes.len() > MAX_UPNP_DESCRIPTION_BYTES {
         bail!("UPnP description from {location} exceeded {MAX_UPNP_DESCRIPTION_BYTES} bytes");
     }
@@ -392,7 +443,7 @@ mod tests {
         let mut responses = HashMap::new();
         let mut allow_source = |_| false;
         let mut should_stop = || false;
-        let mut fetch_description = |_: &str| -> Result<UpnpDescription> {
+        let mut fetch_description = |_: &str, _: Instant, _: &mut _| -> Result<UpnpDescription> {
             panic!("disallowed SSDP source must not fetch descriptions")
         };
         let mut callback =
@@ -400,6 +451,7 @@ mod tests {
 
         let mut context = SsdpResponseContext {
             fetch_descriptions: true,
+            deadline: Instant::now() + Duration::from_secs(60),
             should_stop: &mut should_stop,
             allow_source: &mut allow_source,
             fetched_locations: &mut fetched_locations,
@@ -447,12 +499,126 @@ mod tests {
     #[test]
     fn upnp_description_body_has_a_size_limit() {
         let oversized = vec![b'a'; MAX_UPNP_DESCRIPTION_BYTES + 1];
-        let err =
-            read_limited_description_body(Cursor::new(oversized), "http://192.168.1.1/root.xml")
-                .unwrap_err()
-                .to_string();
+        let err = read_limited_description_body(
+            Cursor::new(oversized),
+            "http://192.168.1.1/root.xml",
+            || false,
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(err.contains("exceeded"));
+    }
+
+    #[test]
+    fn description_requests_use_remaining_common_budget() {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        for elapsed_ms in [0, 100, 9999] {
+            let request = description_request(
+                &client,
+                "http://192.0.2.20/root.xml",
+                deadline,
+                start + Duration::from_millis(elapsed_ms),
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                request.timeout().copied(),
+                Some(Duration::from_millis(10_000 - elapsed_ms))
+            );
+        }
+        for (now, stopped) in [
+            (deadline, false),
+            (deadline + Duration::from_secs(1), false),
+            (start, true),
+        ] {
+            assert!(
+                description_request(
+                    &client,
+                    "http://192.0.2.20/root.xml",
+                    deadline,
+                    now,
+                    stopped
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn stopped_or_expired_ssdp_response_does_not_start_fetch() {
+        for stopped in [false, true] {
+            let mut fetched_locations = HashSet::new();
+            let mut responses = HashMap::new();
+            let mut should_stop = || stopped;
+            let mut allow_source = |_| true;
+            let mut fetcher = |_: &str, _: Instant, _: &mut _| -> Result<UpnpDescription> {
+                panic!("stopped/expired phase must not start a fetch")
+            };
+            let mut context = SsdpResponseContext {
+                fetch_descriptions: true,
+                deadline: if stopped {
+                    Instant::now() + Duration::from_secs(60)
+                } else {
+                    Instant::now()
+                },
+                should_stop: &mut should_stop,
+                allow_source: &mut allow_source,
+                fetched_locations: &mut fetched_locations,
+                responses: &mut responses,
+                fetch_description: &mut fetcher,
+                on_result: &mut |_, _| {},
+            };
+            apply_ssdp_response(
+                "192.0.2.20".parse().unwrap(),
+                SsdpResponse {
+                    headers: HashMap::from([(
+                        "location".into(),
+                        "http://192.0.2.20/root.xml".into(),
+                    )]),
+                },
+                &mut context,
+            );
+            assert!(fetched_locations.is_empty());
+        }
+    }
+
+    #[test]
+    fn slow_description_body_observes_common_deadline_between_reads() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(10);
+        let now = std::cell::Cell::new(start);
+        let reads = std::cell::Cell::new(0);
+        struct SlowBody<'a> {
+            now: &'a std::cell::Cell<Instant>,
+            reads: &'a std::cell::Cell<usize>,
+            deadline: Instant,
+        }
+        impl Read for SlowBody<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.set(self.reads.get() + 1);
+                self.now.set(self.deadline);
+                buf[0] = b'<';
+                Ok(1)
+            }
+        }
+        let err = read_limited_description_body(
+            SlowBody {
+                now: &now,
+                reads: &reads,
+                deadline,
+            },
+            "http://192.0.2.20/root.xml",
+            || now.get() >= deadline,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("deadline expired"));
+        assert_eq!(reads.get(), 1);
     }
 
     #[test]
