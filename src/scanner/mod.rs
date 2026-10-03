@@ -49,11 +49,43 @@ use tokio::sync::{
 
 const CONTINUOUS_FAILURE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+struct ScanCancelGuard(Arc<AtomicBool>);
+
+impl Drop for ScanCancelGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+async fn until_events_closed<T>(
+    events: &Option<UnboundedSender<ScanEvent>>,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        biased;
+        _ = wait_for_events_closed(events) => anyhow::bail!("scan cancelled"),
+        result = future => result,
+    }
+}
+
 pub async fn scan_many(configs: Vec<ScanConfig>) -> Result<ScanResult> {
     scan_many_inner(configs, None, true).await
 }
 
 pub async fn scan_continuously_with_events(
+    configs: Vec<ScanConfig>,
+    events: UnboundedSender<ScanEvent>,
+    pause_rx: watch::Receiver<bool>,
+    interval: Duration,
+) -> Result<()> {
+    until_events_closed(
+        &Some(events.clone()),
+        scan_continuously_running(configs, events, pause_rx, interval),
+    )
+    .await
+}
+
+async fn scan_continuously_running(
     configs: Vec<ScanConfig>,
     events: UnboundedSender<ScanEvent>,
     mut pause_rx: watch::Receiver<bool>,
@@ -567,8 +599,9 @@ async fn run_scan_round_with_passive_updates(
     passive_manager: &mut ContinuousPassiveManager,
 ) -> Result<()> {
     let (round_tx, mut round_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut round =
-        tokio::spawn(async move { scan_many_inner(configs, Some(round_tx), false).await });
+    // The parent owns this future; dropping it drops all round receivers/tasks.
+    let round = scan_many_inner(configs, Some(round_tx), false);
+    tokio::pin!(round);
     let mut round_events_open = true;
     let mut passive_open = true;
 
@@ -578,7 +611,7 @@ async fn run_scan_round_with_passive_updates(
                 while let Ok(event) = round_rx.try_recv() {
                     forward_scan_event(&events, passive_manager, event);
                 }
-                result.context("scan task failed")??;
+                result?;
                 return Ok(());
             }
             event = round_rx.recv(), if round_events_open => {
@@ -746,6 +779,18 @@ fn apply_pending_passive(
 }
 
 async fn scan_many_inner(
+    configs: Vec<ScanConfig>,
+    events: Option<UnboundedSender<ScanEvent>>,
+    emit_finished: bool,
+) -> Result<ScanResult> {
+    until_events_closed(
+        &events,
+        scan_many_running(configs, events.clone(), emit_finished),
+    )
+    .await
+}
+
+async fn scan_many_running(
     mut configs: Vec<ScanConfig>,
     events: Option<UnboundedSender<ScanEvent>>,
     emit_finished: bool,
@@ -786,9 +831,9 @@ async fn scan_many_inner(
     let scan_concurrency = configs[0].concurrency.max(1);
     let semaphore = Arc::new(Semaphore::new(scan_concurrency));
     let probe_limiter = Arc::new(Semaphore::new(configs[0].concurrency.max(1)));
-    let mut handles = Vec::new();
+    let mut children = tokio::task::JoinSet::new();
 
-    for mut config in configs {
+    for (index, mut config) in configs.into_iter().enumerate() {
         // Reuse the single-interface scanner for each NIC/VLAN, but suppress
         // child cache writes and child Finished events. The TUI should behave
         // like one combined scan, not briefly complete after every interface.
@@ -796,21 +841,26 @@ async fn scan_many_inner(
         let events = events.clone();
         let semaphore = Arc::clone(&semaphore);
         let probe_limiter = Arc::clone(&probe_limiter);
-        handles.push(tokio::spawn(async move {
+        children.spawn(async move {
             let _permit = semaphore
                 .acquire_owned()
                 .await
                 .context("scan concurrency limiter closed")?;
             let (child_tx, child_rx) = tokio::sync::mpsc::unbounded_channel();
-            let forwarder = tokio::spawn(forward_child_events(child_rx, events));
-            let result = scan_inner(config, Some(child_tx), false, probe_limiter).await;
-            let _ = forwarder.await;
-            result
-        }));
+            let (result, ()) = tokio::join!(
+                scan_inner(config, Some(child_tx), false, probe_limiter),
+                forward_child_events(child_rx, events),
+            );
+            result.map(|result| (index, result))
+        });
     }
 
-    for handle in handles {
-        let child_result = handle.await.context("scan task failed")??;
+    let mut child_results = Vec::new();
+    while let Some(joined) = children.join_next().await {
+        child_results.push(joined.context("scan task failed")??);
+    }
+    child_results.sort_by_key(|(index, _)| *index);
+    for (_, child_result) in child_results {
         targets.push(child_result.target.clone());
         interfaces.push(child_result.interface.clone());
         for warning in child_result.warnings {
@@ -883,6 +933,21 @@ async fn scan_inner(
     emit_finished: bool,
     probe_limiter: Arc<Semaphore>,
 ) -> Result<ScanResult> {
+    until_events_closed(
+        &events,
+        scan_inner_running(config, events.clone(), emit_finished, probe_limiter),
+    )
+    .await
+}
+
+async fn scan_inner_running(
+    config: ScanConfig,
+    events: Option<UnboundedSender<ScanEvent>>,
+    emit_finished: bool,
+    probe_limiter: Arc<Semaphore>,
+) -> Result<ScanResult> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let _cancel_guard = ScanCancelGuard(Arc::clone(&cancel));
     let scanned_at = Utc::now();
     let iface = net::select_interface(config.iface.as_deref())?;
     let target = net::parse_target(config.target.as_deref(), &iface)?;
@@ -913,12 +978,16 @@ async fn scan_inner(
     let arp_oui_db = oui_db.clone();
     let arp_rules = identity_rules.clone();
     let arp_oui_enabled = config.oui;
+    let arp_cancel = Arc::clone(&cancel);
     let arp_result = tokio::task::spawn_blocking(move || {
+        if arp_cancel.load(Ordering::Relaxed) || events_closed(&arp_events) {
+            return Ok(Vec::new());
+        }
         discovery::arp_sweep_with_callback(
             &arp_iface,
             arp_target,
             arp_timeout,
-            || events_closed(&arp_events),
+            || arp_cancel.load(Ordering::Relaxed) || events_closed(&arp_events),
             |hit| {
                 let mut device = Device::new(IpAddr::V4(hit.ip), scanned_at);
                 device.interface = Some(arp_iface.name.clone());
@@ -972,14 +1041,21 @@ async fn scan_inner(
                 let refine_iface = iface.clone();
                 let refine_timeout = config.timeout;
                 let refine_events = events.clone();
+                let refine_cancel = Arc::clone(&cancel);
                 let refine_result = tokio::task::spawn_blocking(move || {
                     let mut refined_hits = Vec::new();
                     for refine_target in refine_targets {
+                        if refine_cancel.load(Ordering::Relaxed) || events_closed(&refine_events) {
+                            break;
+                        }
                         refined_hits.extend(discovery::arp_sweep_with_callback(
                             &refine_iface,
                             refine_target,
                             refine_timeout,
-                            || events_closed(&refine_events),
+                            || {
+                                refine_cancel.load(Ordering::Relaxed)
+                                    || events_closed(&refine_events)
+                            },
                             |_| {},
                         )?);
                     }
@@ -1709,6 +1785,61 @@ fn ip_sort_key(ip: IpAddr) -> (u8, u128) {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[tokio::test]
+    async fn cancellation_drops_owned_children_and_signals_blocking_workers() {
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stopped_tx, mut stopped_rx) = tokio::sync::mpsc::unbounded_channel();
+        let parent = tokio::spawn(async move {
+            let events = Some(events_tx);
+            until_events_closed(&events, async {
+                let mut children = tokio::task::JoinSet::new();
+                for kind in ["ARP", "multicast", "blocking wait"] {
+                    let events = events.clone();
+                    let ready = ready_tx.clone();
+                    let stopped = stopped_tx.clone();
+                    children.spawn(async move {
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        let worker = tokio::task::spawn_blocking(move || {
+                            ready.send(kind).unwrap();
+                            while !tx.is_closed() {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            stopped.send(kind).unwrap();
+                        });
+                        forward_child_events(rx, events).await;
+                        worker.await.unwrap();
+                    });
+                }
+                while children.join_next().await.is_some() {}
+                Ok(())
+            })
+            .await
+        });
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(1), ready_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        drop(events_rx);
+        let result = tokio::time::timeout(Duration::from_secs(1), parent)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(1), stopped_rx.recv())
+                .await
+                .expect("blocking worker should receive stop")
+                .unwrap();
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let guard = ScanCancelGuard(Arc::clone(&cancel));
+        drop(guard);
+        assert!(cancel.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn identity_snapshots_refresh_in_continuous_passive_state() {

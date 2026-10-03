@@ -328,22 +328,40 @@ async fn run_live_scan(
     let interface_panel = live_interface_panel(&configs);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let (pause_tx, pause_rx) = tokio::sync::watch::channel(false);
-    let scan_handle = tokio::spawn(async move {
-        scanner::scan_continuously_with_events(configs, tx, pause_rx, scan_interval).await
-    });
+    run_owned_live_scan(
+        async move {
+            scanner::scan_continuously_with_events(configs, tx, pause_rx, scan_interval).await
+        },
+        async move {
+            output::run_live_table(rx, pause_tx, output_options, interface_panel)
+                .await
+                .context("live TUI failed")
+        },
+    )
+    .await
+}
 
-    let outcome: output::LiveOutcome =
-        output::run_live_table(rx, pause_tx, output_options, interface_panel)
-            .await
-            .context("live TUI failed")?;
+async fn run_owned_live_scan(
+    scan: impl std::future::Future<Output = Result<()>> + Send + 'static,
+    tui: impl std::future::Future<Output = Result<output::LiveOutcome>>,
+) -> Result<()> {
+    // JoinSet owns the scan even when TUI startup/input/drawing returns an error.
+    let mut scans = tokio::task::JoinSet::new();
+    scans.spawn(scan);
+
+    let outcome = tui.await?;
 
     if outcome.is_cancelled() {
-        scan_handle.abort();
-        let _ = scan_handle.await;
+        scans.abort_all();
+        while scans.join_next().await.is_some() {}
         return Ok(());
     }
 
-    scan_handle.await.context("scan task failed")??;
+    scans
+        .join_next()
+        .await
+        .context("scan task missing")?
+        .context("scan task failed")??;
 
     Ok(())
 }
@@ -481,6 +499,43 @@ fn run_oui(command: OuiCommand) -> Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[tokio::test]
+    async fn live_scan_ownership_cleans_up_on_tui_errors_and_cancellation() {
+        struct Stopped(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Stopped {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        for outcome in ["startup", "draw", "cancel"] {
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+            let result = run_owned_live_scan(
+                async move {
+                    let _stopped = Stopped(Some(stopped_tx));
+                    ready_tx.send(()).unwrap();
+                    std::future::pending().await
+                },
+                async move {
+                    ready_rx.await.unwrap();
+                    if outcome == "cancel" {
+                        Ok(output::LiveOutcome::Cancelled)
+                    } else {
+                        Err(anyhow::anyhow!("synthetic TUI {outcome} error"))
+                    }
+                },
+            )
+            .await;
+            assert_eq!(result.is_ok(), outcome == "cancel");
+            tokio::time::timeout(Duration::from_secs(1), stopped_rx)
+                .await
+                .expect("owned scan must stop")
+                .unwrap();
+        }
+    }
 
     fn scan_args() -> ScanArgs {
         ScanArgs {

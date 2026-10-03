@@ -322,6 +322,9 @@ where
     F: FnMut(IpAddr, MdnsInfo),
     ShouldStop: FnMut() -> bool,
 {
+    if should_stop() {
+        return Ok(HashMap::new());
+    }
     let socket = mdns_socket(interface_ip)?;
     // Query a small set of service types that commonly expose device identity.
     // Additional records from responses are still parsed; the query list only
@@ -334,6 +337,9 @@ where
         "_ssh._tcp.local",
         "_http._tcp.local",
     ])?;
+    if should_stop() {
+        return Ok(HashMap::new());
+    }
     socket
         .send_to(&query, SocketAddrV4::new(MDNS_ADDR, MDNS_PORT))
         .context("failed to send mDNS query")?;
@@ -1071,6 +1077,29 @@ mod tests {
                 .iter()
                 .any(|service| { service.name == "ipp" && service.port == Some(631) })
         );
+    }
+
+    #[test]
+    fn mdns_stops_before_socket_creation_or_first_send() {
+        for stop_on_check in [1, 2] {
+            let mut checks = 0;
+            let result = mdns_probe_with_callback(
+                if stop_on_check == 1 {
+                    Ipv4Addr::new(192, 0, 2, 20)
+                } else {
+                    Ipv4Addr::LOCALHOST
+                },
+                Duration::from_secs(1),
+                || {
+                    checks += 1;
+                    checks == stop_on_check
+                },
+                |_, _| panic!("stopped collector must not emit results"),
+            )
+            .unwrap();
+            assert!(result.is_empty());
+            assert_eq!(checks, stop_on_check);
+        }
     }
 
     #[test]

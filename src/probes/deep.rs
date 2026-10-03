@@ -6,11 +6,17 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, io::Read, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    io::Read,
+    net::IpAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::Semaphore,
+    sync::{Semaphore, watch},
     task::JoinSet,
 };
 
@@ -273,12 +279,26 @@ async fn web_probe(
     timeout: Duration,
     fetch_favicon: bool,
 ) -> Option<WebProbe> {
-    tokio::task::spawn_blocking(move || {
-        blocking_web_probe(ip, local_addr, port, https, timeout, fetch_favicon)
+    run_blocking_probe(move |cancel| {
+        blocking_web_probe(ip, local_addr, port, https, timeout, fetch_favicon, || {
+            cancel.has_changed().is_err()
+        })
     })
     .await
-    .ok()
-    .flatten()
+}
+
+async fn run_blocking_probe<T: Send + 'static>(
+    probe: impl FnOnce(watch::Receiver<()>) -> Option<T> + Send + 'static,
+) -> Option<T> {
+    // Dropping the async owner closes this channel even if spawn_blocking was
+    // already running. The queued closure also checks before starting traffic.
+    let (alive, cancel) = watch::channel(());
+    let result = tokio::task::spawn_blocking(move || probe(cancel))
+        .await
+        .ok()
+        .flatten();
+    drop(alive);
+    result
 }
 
 fn blocking_web_probe(
@@ -288,8 +308,9 @@ fn blocking_web_probe(
     https: bool,
     timeout: Duration,
     fetch_favicon: bool,
+    mut should_stop: impl FnMut() -> bool,
 ) -> Option<WebProbe> {
-    if !super::same_ip_family(local_addr, ip) {
+    if should_stop() || !super::same_ip_family(local_addr, ip) {
         return None;
     }
 
@@ -306,11 +327,16 @@ fn blocking_web_probe(
     let scheme = if https { "https" } else { "http" };
     let base_url = format!("{scheme}://{ip}:{port}");
 
+    if should_stop() {
+        return None;
+    }
     let response = client.head(&base_url).send().ok()?;
     let mut headers = interesting_headers(response.headers());
     let banner = http_banner_from_response(response.status().as_u16(), &headers);
 
-    let favicon = if fetch_favicon {
+    // An in-flight request may use its configured timeout, but cancellation must
+    // not start the next request (notably the favicon GET after a slow HEAD).
+    let favicon = if fetch_favicon && !should_stop() {
         let favicon_url = format!("{base_url}/favicon.ico");
         client
             .get(&favicon_url)
@@ -372,12 +398,12 @@ async fn tls_certificate_probe(
     port: u16,
     timeout: Duration,
 ) -> Option<TlsCertificate> {
-    tokio::task::spawn_blocking(move || {
-        blocking_tls_certificate_probe(ip, local_addr, port, timeout)
+    run_blocking_probe(move |cancel| {
+        blocking_tls_certificate_probe(ip, local_addr, port, timeout, || {
+            cancel.has_changed().is_err()
+        })
     })
     .await
-    .ok()
-    .flatten()
 }
 
 fn blocking_tls_certificate_probe(
@@ -385,16 +411,45 @@ fn blocking_tls_certificate_probe(
     local_addr: IpAddr,
     port: u16,
     timeout: Duration,
+    mut should_stop: impl FnMut() -> bool,
 ) -> Option<TlsCertificate> {
-    let stream = super::connect_blocking_tcp_from(local_addr, ip, port, timeout)?;
-    stream.set_read_timeout(Some(timeout)).ok()?;
-    stream.set_write_timeout(Some(timeout)).ok()?;
+    if should_stop() {
+        return None;
+    }
+    let deadline = Instant::now().checked_add(timeout)?;
+    let remaining = deadline.checked_duration_since(Instant::now())?;
+    let stream = super::connect_blocking_tcp_from(local_addr, ip, port, remaining)?;
+    stream.set_nonblocking(true).ok()?;
+    if should_stop() || Instant::now() >= deadline {
+        return None;
+    }
     let connector = native_tls::TlsConnector::builder()
         .danger_accept_invalid_certs(true)
         .danger_accept_invalid_hostnames(true)
         .build()
         .ok()?;
-    let tls = connector.connect(&ip.to_string(), stream).ok()?;
+    let mut handshake = connector.connect(&ip.to_string(), stream);
+    let tls = loop {
+        if should_stop() || Instant::now() >= deadline {
+            return None;
+        }
+        match handshake {
+            Ok(tls) => break tls,
+            Err(native_tls::HandshakeError::WouldBlock(pending)) => {
+                // Nonblocking TLS cannot extend the absolute deadline by slowly
+                // dribbling bytes; cancellation is checked at most every 10ms.
+                std::thread::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+                if should_stop() || Instant::now() >= deadline {
+                    return None;
+                }
+                handshake = pending.handshake();
+            }
+            Err(native_tls::HandshakeError::Failure(_)) => return None,
+        }
+    };
     let cert = tls.peer_certificate().ok()??;
     let der = cert.to_der().ok()?;
     let sha256 = hex::encode(Sha256::digest(&der));
@@ -569,6 +624,127 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_stops_blocking_probes_before_any_socket() {
+        let ip = "192.0.2.10".parse().unwrap();
+        let local = "192.0.2.1".parse().unwrap();
+        assert!(
+            blocking_web_probe(ip, local, 80, false, Duration::from_secs(1), true, || true)
+                .is_none()
+        );
+        assert!(
+            blocking_tls_certificate_probe(ip, local, 443, Duration::from_secs(1), || true)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_http_head_does_not_start_favicon_get() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(StdDuration::from_secs(1)))
+                .unwrap();
+            let mut request = [0; 1024];
+            let len = stream.read(&mut request).unwrap();
+            assert!(request[..len].starts_with(b"HEAD "));
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(StdDuration::from_secs(1)).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nServer: synthetic\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            drop(stream);
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + StdDuration::from_secs(2);
+            while Instant::now() < deadline {
+                if listener.accept().is_ok() {
+                    return false;
+                }
+                if finished_rx.try_recv().is_ok() {
+                    return true;
+                }
+                thread::sleep(StdDuration::from_millis(5));
+            }
+            false
+        });
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let probe = tokio::spawn(run_blocking_probe(move |cancel| {
+            let result =
+                blocking_web_probe(ip, ip, port, false, Duration::from_secs(1), true, || {
+                    cancel.has_changed().is_err()
+                });
+            let _ = finished_tx.send(());
+            result
+        }));
+        tokio::time::timeout(Duration::from_secs(1), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        probe.abort();
+        assert!(matches!(probe.await, Err(err) if err.is_cancelled()));
+        release_tx.send(()).unwrap();
+        assert!(
+            tokio::task::spawn_blocking(move || server.join().unwrap())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_deadline_bound_a_stalled_tls_handshake() {
+        for cancel in [false, true] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(StdDuration::from_secs(1)))
+                    .unwrap();
+                ready_tx.send(()).unwrap();
+                let mut buffer = [0; 4096];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => return true,
+                        Ok(_) => {}
+                        Err(_) => return false,
+                    }
+                }
+            });
+            let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+            let timeout = if cancel {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(100)
+            };
+            let probe = tokio::spawn(tls_certificate_probe(ip, ip, port, timeout));
+            tokio::time::timeout(Duration::from_secs(1), ready_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            if cancel {
+                probe.abort();
+                assert!(probe.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(1), probe)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert!(
+                tokio::task::spawn_blocking(move || server.join().unwrap())
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn web_probe_does_not_follow_redirects() {
         let redirect_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         redirect_listener.set_nonblocking(true).unwrap();
@@ -630,6 +806,7 @@ mod tests {
             false,
             Duration::from_millis(500),
             true,
+            || false,
         )
         .unwrap();
 
@@ -730,8 +907,8 @@ mod tests {
                 }
             });
             let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-            let web = blocking_web_probe(ip, ip, port, true, timeout, true);
-            let tls = blocking_tls_certificate_probe(ip, ip, port, timeout);
+            let web = blocking_web_probe(ip, ip, port, true, timeout, true, || false);
+            let tls = blocking_tls_certificate_probe(ip, ip, port, timeout, || false);
             server.join().unwrap();
 
             let web = web.expect(

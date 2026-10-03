@@ -59,11 +59,17 @@ where
     AllowSource: FnMut(IpAddr) -> bool,
     ShouldStop: FnMut() -> bool,
 {
+    if should_stop() {
+        return Ok(HashMap::new());
+    }
     let socket = ssdp_socket(interface_ip)?;
     let request = ssdp_request();
     // Send twice because SSDP is UDP multicast and home devices commonly drop
     // one request while waking radios or low-power network stacks.
     for _ in 0..2 {
+        if should_stop() {
+            return Ok(HashMap::new());
+        }
         socket
             .send_to(request.as_bytes(), SocketAddrV4::new(SSDP_ADDR, SSDP_PORT))
             .context("failed to send SSDP M-SEARCH")?;
@@ -425,6 +431,31 @@ mod tests {
             parsed.headers.get("server").map(String::as_str),
             Some("Linux UPnP/1.0")
         );
+    }
+
+    #[test]
+    fn ssdp_stops_before_socket_creation_or_first_send() {
+        for stop_on_check in [1, 2] {
+            let mut checks = 0;
+            let result = ssdp_probe_with_callback(
+                if stop_on_check == 1 {
+                    Ipv4Addr::new(192, 0, 2, 20)
+                } else {
+                    Ipv4Addr::LOCALHOST
+                },
+                Duration::from_secs(1),
+                true,
+                || {
+                    checks += 1;
+                    checks == stop_on_check
+                },
+                |_| true,
+                |_, _| panic!("stopped collector must not emit results"),
+            )
+            .unwrap();
+            assert!(result.is_empty());
+            assert_eq!(checks, stop_on_check);
+        }
     }
 
     #[test]

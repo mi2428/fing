@@ -85,7 +85,15 @@ pub(super) async fn forward_child_events(
     // Multi-interface scans run a normal child scanner per interface. Rewrite
     // child phase/warning events with an interface prefix, but forward device
     // updates unchanged so the live table can merge them by interface/IP.
-    while let Some(event) = child_rx.recv().await {
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = super::wait_for_events_closed(&events) => break,
+            event = child_rx.recv() => match event {
+                Some(event) => event,
+                None => break,
+            },
+        };
         match event {
             ScanEvent::Started {
                 target, interface, ..
@@ -581,6 +589,25 @@ mod tests {
         assert!(
             matches!(&events[3], ScanEvent::DeviceUpdated(device) if device.ip.to_string() == "192.168.1.44")
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_closes_idle_and_emitting_child_forwarders() {
+        for emitting in [false, true] {
+            let (child_tx, child_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (parent_tx, parent_rx) = tokio::sync::mpsc::unbounded_channel();
+            if emitting {
+                child_tx.send(ScanEvent::Phase("synthetic".into())).unwrap();
+            }
+            drop(parent_rx);
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                forward_child_events(child_rx, Some(parent_tx)),
+            )
+            .await
+            .expect("closed parent must release the child receiver");
+            assert!(child_tx.is_closed());
+        }
     }
 
     #[test]
