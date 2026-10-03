@@ -707,28 +707,7 @@ fn merge_device_snapshot(existing: &mut Device, mut incoming: Device) {
     if existing.vendor.is_none() {
         existing.vendor = incoming.vendor.take();
     }
-    if existing.hostname.is_none() {
-        existing.hostname = incoming.hostname.take();
-    }
-    for name in incoming.names {
-        existing.add_name(name.name, &name.source, name.confidence);
-    }
-    if let Some(make) = incoming.make {
-        existing.set_make_guess(make.value, &make.source, make.confidence);
-    }
-    if let Some(model) = incoming.model {
-        existing.set_model_guess(model.value, &model.source, model.confidence);
-    }
-    if let Some(os) = incoming.os {
-        existing.set_os_guess(os.value, &os.source, os.confidence);
-    }
-    if let Some(device_type) = incoming.device_type {
-        existing.set_device_type_guess(
-            device_type.value,
-            &device_type.source,
-            device_type.confidence,
-        );
-    }
+    existing.merge_identity_snapshot(&mut incoming);
     for service in incoming.services {
         existing.add_service(
             service.name,
@@ -1731,6 +1710,28 @@ fn ip_sort_key(ip: IpAddr) -> (u8, u128) {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn identity_snapshots_refresh_in_continuous_passive_state() {
+        let mut manager = passive_manager();
+        let ip = "192.0.2.10".parse().unwrap();
+        for (round, name, os) in [(1, "old", "old-os"), (2, "renamed-device", "new-os")] {
+            manager.observe_scan_event(ScanEvent::RoundStarted { round });
+            let mut device = Device::new(ip, Utc::now());
+            device.interface = Some("en0".into());
+            device.add_name(name, "mdns", 0.9);
+            device.set_os_guess(os, "snmp", 0.85);
+            manager.observe_scan_event(ScanEvent::DeviceUpdated(Box::new(device)));
+        }
+        manager.observe_scan_event(ScanEvent::RoundStarted { round: 3 });
+        let mut blank = Device::new(ip, Utc::now());
+        blank.interface = Some("en0".into());
+        manager.observe_scan_event(ScanEvent::DeviceUpdated(Box::new(blank)));
+        let device = &manager.states["en0"].devices[&ip];
+        assert_eq!(device.hostname.as_deref(), Some("renamed-device"));
+        assert_eq!(device.names.len(), 1);
+        assert_eq!(device.os.as_ref().unwrap().value, "new-os");
+    }
 
     #[test]
     fn evidence_snapshots_stay_bounded_in_continuous_passive_state() {

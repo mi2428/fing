@@ -798,6 +798,40 @@ mod tests {
     }
 
     #[test]
+    fn identity_snapshots_refresh_live_names_guesses_and_keep_same_round_aliases() {
+        let mut app = LiveTable::new(OutputOptions::default(), LiveInterfacePanel::default());
+        let ip = "192.0.2.10".parse().unwrap();
+        app.apply(ScanEvent::RoundStarted { round: 1 });
+        let mut old = Device::new(ip, Utc::now());
+        old.add_name("old", "mdns", 0.9);
+        old.set_os_guess("old-os", "snmp", 0.85);
+        old.set_model_guess("old-model", "upnp", 0.85);
+        app.apply(ScanEvent::DeviceUpdated(Box::new(old)));
+        app.apply(ScanEvent::RoundStarted { round: 2 });
+        app.apply(ScanEvent::DeviceUpdated(Box::new(Device::new(
+            ip,
+            Utc::now(),
+        ))));
+        assert_eq!(
+            app.devices.values().next().unwrap().hostname.as_deref(),
+            Some("old")
+        );
+        let mut update = Device::new(ip, Utc::now());
+        update.add_name("renamed-device", "mdns", 0.9);
+        update.set_os_guess("new-os", "snmp", 0.85);
+        update.set_model_guess("new-model", "upnp", 0.85);
+        app.apply(ScanEvent::DeviceUpdated(Box::new(update)));
+        let mut alias = Device::new(ip, Utc::now());
+        alias.add_name("renamed-device-secondary", "mdns", 0.9);
+        app.apply(ScanEvent::DeviceUpdated(Box::new(alias)));
+        let stored = app.devices.values().next().unwrap();
+        assert_eq!(stored.hostname.as_deref(), Some("renamed-device"));
+        assert_eq!(stored.names.len(), 2);
+        assert_eq!(stored.os.as_ref().unwrap().value, "new-os");
+        assert_eq!(stored.model.as_ref().unwrap().value, "new-model");
+    }
+
+    #[test]
     fn table_offset_keeps_cursor_moving_inside_viewport() {
         assert_eq!(corrected_table_offset(0, 0, 5), 0);
         assert_eq!(corrected_table_offset(1, 0, 5), 0);

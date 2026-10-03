@@ -421,7 +421,11 @@ pub(super) fn merge_devices_by_interface_ip(devices: Vec<Device>) -> Vec<Device>
     for device in devices {
         let key = (device.interface.clone().unwrap_or_default(), device.ip);
         if let Some(existing) = merged.get_mut(&key) {
-            merge_device(existing, device);
+            if super::device_mac_changed(existing, &device) {
+                *existing = device;
+            } else {
+                merge_device(existing, device);
+            }
         } else {
             merged.insert(key, device);
         }
@@ -439,25 +443,7 @@ fn merge_device(existing: &mut Device, mut incoming: Device) {
     if existing.vendor.is_none() {
         existing.vendor = incoming.vendor.take();
     }
-    for name in incoming.names {
-        existing.add_name(name.name, &name.source, name.confidence);
-    }
-    if let Some(make) = incoming.make {
-        existing.set_make_guess(make.value, &make.source, make.confidence);
-    }
-    if let Some(model) = incoming.model {
-        existing.set_model_guess(model.value, &model.source, model.confidence);
-    }
-    if let Some(os) = incoming.os {
-        existing.set_os_guess(os.value, &os.source, os.confidence);
-    }
-    if let Some(device_type) = incoming.device_type {
-        existing.set_device_type_guess(
-            device_type.value,
-            &device_type.source,
-            device_type.confidence,
-        );
-    }
+    existing.merge_identity_snapshot(&mut incoming);
     for service in incoming.services {
         existing.add_service(
             service.name,
@@ -477,6 +463,30 @@ mod tests {
     use super::*;
     use crate::enrich::MdnsService;
     use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn identity_snapshots_refresh_in_final_merge_and_replace_reused_mac() {
+        let ip = "192.0.2.10".parse().unwrap();
+        let mut old = Device::new(ip, Utc::now());
+        old.mac = Some("02:00:00:00:00:01".into());
+        old.add_name("old", "mdns", 0.9);
+        old.set_os_guess("old-os", "snmp", 0.85);
+        old.mark_observation_round(1);
+        let mut update = Device::new(ip, Utc::now());
+        update.mac = old.mac.clone();
+        update.add_name("renamed-device", "mdns", 0.9);
+        update.set_os_guess("new-os", "snmp", 0.85);
+        update.mark_observation_round(2);
+        let merged = merge_devices_by_interface_ip(vec![old, update]);
+        assert_eq!(merged[0].hostname.as_deref(), Some("renamed-device"));
+        assert_eq!(merged[0].os.as_ref().unwrap().value, "new-os");
+        let mut replacement = Device::new(ip, Utc::now());
+        replacement.mac = Some("02:00:00:00:00:02".into());
+        let merged = merge_devices_by_interface_ip(vec![merged[0].clone(), replacement]);
+        assert_eq!(merged[0].mac.as_deref(), Some("02:00:00:00:00:02"));
+        assert!(merged[0].names.is_empty());
+        assert!(merged[0].os.is_none());
+    }
 
     fn device() -> Device {
         Device::new(

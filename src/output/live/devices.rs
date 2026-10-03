@@ -503,28 +503,7 @@ pub(super) fn merge_live_device(existing: &mut Device, mut incoming: Device) {
     if existing.vendor.is_none() {
         existing.vendor = incoming.vendor.take();
     }
-    if existing.hostname.is_none() {
-        existing.hostname = incoming.hostname.take();
-    }
-    for name in incoming.names {
-        existing.add_name(name.name, &name.source, name.confidence);
-    }
-    if let Some(make) = incoming.make {
-        existing.set_make_guess(make.value, &make.source, make.confidence);
-    }
-    if let Some(model) = incoming.model {
-        existing.set_model_guess(model.value, &model.source, model.confidence);
-    }
-    if let Some(os) = incoming.os {
-        existing.set_os_guess(os.value, &os.source, os.confidence);
-    }
-    if let Some(device_type) = incoming.device_type {
-        existing.set_device_type_guess(
-            device_type.value,
-            &device_type.source,
-            device_type.confidence,
-        );
-    }
+    existing.merge_identity_snapshot(&mut incoming);
     for service in incoming.services {
         existing.add_service(
             service.name,
