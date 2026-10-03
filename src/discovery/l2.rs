@@ -64,6 +64,7 @@ where
     )
 }
 
+/// Emit every advertisement through the callback without retaining a history.
 pub fn listen_until_repeating<F, ShouldStop>(
     iface: &InterfaceInfo,
     protocols: L2Protocols,
@@ -148,15 +149,31 @@ where
         };
 
         if let Some(advertisement) = advertisement {
-            on_advertisement(&advertisement);
-            match advertisement {
-                L2Advertisement::Lldp(info) => result.lldp.push(info),
-                L2Advertisement::Cdp(info) => result.cdp.push(info),
-            }
+            record_advertisement(
+                advertisement,
+                duplicate_policy,
+                &mut result,
+                on_advertisement,
+            );
         }
     }
 
     Ok(result)
+}
+
+fn record_advertisement(
+    advertisement: L2Advertisement,
+    policy: DuplicatePolicy,
+    result: &mut L2Advertisements,
+    on_advertisement: &mut impl FnMut(&L2Advertisement),
+) {
+    on_advertisement(&advertisement);
+    if policy == DuplicatePolicy::FirstOnly {
+        match advertisement {
+            L2Advertisement::Lldp(info) => result.lldp.push(info),
+            L2Advertisement::Cdp(info) => result.cdp.push(info),
+        }
+    }
 }
 
 fn demux_frame(
@@ -227,6 +244,50 @@ mod tests {
             demux_frame_repeating(&lldp_frame(), protocols),
             Some(L2Advertisement::Lldp(_))
         ));
+    }
+
+    #[test]
+    fn repeating_listener_emits_without_retaining_history() {
+        let protocols = L2Protocols {
+            lldp: true,
+            cdp: true,
+        };
+        let mut result = L2Advertisements::default();
+        let mut callbacks = 0;
+        for _ in 0..1000 {
+            for frame in [lldp_frame(), cdp_frame()] {
+                let advertisement = demux_frame_repeating(&frame, protocols).unwrap();
+                record_advertisement(
+                    advertisement,
+                    DuplicatePolicy::EmitRepeats,
+                    &mut result,
+                    &mut |_| callbacks += 1,
+                );
+            }
+        }
+        assert_eq!(callbacks, 2000);
+        assert!(result.lldp.is_empty() && result.cdp.is_empty());
+
+        let mut keys = BTreeSet::new();
+        let mut cdp_keys = BTreeSet::new();
+        callbacks = 0;
+        for _ in 0..2 {
+            for frame in [lldp_frame(), cdp_frame()] {
+                if let Some(advertisement) =
+                    demux_frame(&frame, protocols, &mut keys, &mut cdp_keys)
+                {
+                    record_advertisement(
+                        advertisement,
+                        DuplicatePolicy::FirstOnly,
+                        &mut result,
+                        &mut |_| callbacks += 1,
+                    );
+                }
+            }
+        }
+        assert_eq!(callbacks, 2);
+        assert_eq!(result.lldp.len(), 1);
+        assert_eq!(result.cdp.len(), 1);
     }
 
     #[test]
