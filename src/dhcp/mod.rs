@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -112,12 +113,12 @@ fn read_path(path: &Path) -> Result<Vec<DhcpLease>> {
 }
 
 fn parse_isc_leases_at(input: &str, now: DateTime<Utc>) -> Vec<DhcpLease> {
-    let mut leases = Vec::new();
+    let mut bodies = BTreeMap::new();
     let mut current_ip = None;
     let mut current_body = Vec::new();
 
-    // ISC leases are block-oriented. We keep only one block body in memory and
-    // ignore malformed block headers rather than failing the whole lease file.
+    // Later ISC blocks supersede earlier blocks for the same IP, including
+    // free/expired states. Filter only after choosing the final block.
     for line in input.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("lease ")
@@ -128,10 +129,8 @@ fn parse_isc_leases_at(input: &str, now: DateTime<Utc>) -> Vec<DhcpLease> {
             continue;
         }
         if trimmed == "}" {
-            if let Some(ip) = current_ip.take()
-                && let Some(lease) = parse_isc_body(ip, &current_body, now)
-            {
-                leases.push(lease);
+            if let Some(ip) = current_ip.take() {
+                bodies.insert(ip, std::mem::take(&mut current_body));
             }
             current_body.clear();
             continue;
@@ -141,7 +140,10 @@ fn parse_isc_leases_at(input: &str, now: DateTime<Utc>) -> Vec<DhcpLease> {
         }
     }
 
-    leases
+    bodies
+        .into_iter()
+        .filter_map(|(ip, body)| parse_isc_body(ip, &body, now))
+        .collect()
 }
 
 fn parse_dnsmasq_leases_at(input: &str, now: DateTime<Utc>) -> Vec<DhcpLease> {
@@ -364,6 +366,63 @@ mod tests {
 
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].hostname.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn isc_history_uses_only_final_state_per_ip() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        for (final_state, final_end, expected_name) in [
+            ("free", "never", None),
+            ("active", "3 2025/12/31 00:00:00", None),
+            ("active", "never", Some("current-host")),
+        ] {
+            let input = format!(
+                r#"
+                lease 192.0.2.10 {{
+                  client-hostname "obsolete-host";
+                  binding state active;
+                  ends never;
+                }}
+                lease 192.0.2.11 {{
+                  client-hostname "other-host";
+                  binding state active;
+                  ends never;
+                }}
+                lease 192.0.2.10 {{
+                  client-hostname "current-host";
+                  binding state {final_state};
+                  ends {final_end};
+                }}
+                lease not-an-ip {{
+                  client-hostname "malformed-host";
+                  binding state active;
+                  ends never;
+                }}
+                unrelated record
+                "#
+            );
+            let leases = parse_isc_leases_at(&input, now);
+            let final_lease = leases
+                .iter()
+                .find(|lease| lease.ip == "192.0.2.10".parse::<IpAddr>().unwrap());
+            assert_eq!(
+                final_lease.and_then(|lease| lease.hostname.as_deref()),
+                expected_name
+            );
+            // MAC-less input exercises the IP-only scanner enrichment path.
+            assert!(leases.iter().all(|lease| lease.mac.is_none()));
+            assert!(
+                !leases
+                    .iter()
+                    .any(|lease| lease.hostname.as_deref() == Some("obsolete-host"))
+            );
+            assert_eq!(leases.len(), 1 + usize::from(expected_name.is_some()));
+            assert!(
+                leases
+                    .iter()
+                    .any(|lease| lease.hostname.as_deref() == Some("other-host"))
+            );
+        }
     }
 
     #[test]
