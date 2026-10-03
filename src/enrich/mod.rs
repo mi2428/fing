@@ -5,6 +5,7 @@
 //! name service. They return raw protocol facts and leave classification to the
 //! scanner/apply and identity-rule layers.
 
+use crate::net::{self, InterfaceInfo};
 use anyhow::{Context, Result, anyhow, bail};
 use hickory_resolver::{
     TokioResolver,
@@ -312,8 +313,11 @@ fn ptr_hostname(lookup: &Lookup) -> Option<String> {
         })
 }
 
+/// Return advertisements received on the selected interface. An advertised
+/// address can legitimately differ from its UDP sender (a proxy); it is not
+/// independent evidence that the advertised host is reachable.
 pub fn mdns_probe_with_callback<F, ShouldStop>(
-    interface_ip: Ipv4Addr,
+    iface: &InterfaceInfo,
     timeout: Duration,
     mut should_stop: ShouldStop,
     mut on_result: F,
@@ -325,7 +329,7 @@ where
     if should_stop() {
         return Ok(HashMap::new());
     }
-    let socket = mdns_socket(interface_ip)?;
+    let socket = bind_mdns_socket(iface, MDNS_PORT)?;
     // Query a small set of service types that commonly expose device identity.
     // Additional records from responses are still parsed; the query list only
     // nudges devices to answer.
@@ -373,29 +377,52 @@ where
     Ok(records_to_mdns_info(&records))
 }
 
-fn mdns_socket(interface_ip: Ipv4Addr) -> Result<UdpSocket> {
-    // Port 5353 is ideal because devices reply multicast-to-multicast, but some
-    // OSes already have mDNSResponder bound there. Falling back to an ephemeral
-    // port still allows useful unicast answers.
-    match bind_mdns_socket(interface_ip, MDNS_PORT) {
-        Ok(socket) => Ok(socket),
-        Err(_) => bind_mdns_socket(interface_ip, 0),
-    }
-}
-
-fn bind_mdns_socket(interface_ip: Ipv4Addr, port: u16) -> Result<UdpSocket> {
+fn bind_mdns_socket(iface: &InterfaceInfo, port: u16) -> Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    let index = net::bind_interface_v4(&socket, &iface.name)?;
     socket.set_reuse_address(true)?;
     #[cfg(unix)]
     socket.set_reuse_port(true)?;
     socket.set_read_timeout(Some(Duration::from_millis(100)))?;
-    socket.bind(&SockAddr::from(SocketAddrV4::new(
+    match socket.bind(&SockAddr::from(SocketAddrV4::new(
         Ipv4Addr::UNSPECIFIED,
         port,
-    )))?;
-    socket.join_multicast_v4(&MDNS_ADDR, &interface_ip)?;
-    socket.set_multicast_if_v4(&interface_ip)?;
+    ))) {
+        Ok(()) => {}
+        // Preserve legacy-query unicast answers when 5353 is occupied, but never
+        // hide an interface/membership error with an unbound socket or route.
+        Err(err) if port == MDNS_PORT && err.kind() == std::io::ErrorKind::AddrInUse => {
+            socket.bind(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))?;
+        }
+        Err(err) => return Err(err).context("failed to bind mDNS port"),
+    }
+    #[cfg(target_os = "linux")]
+    {
+        socket.join_multicast_v4_n(
+            &MDNS_ADDR,
+            &socket2::InterfaceIndexOrAddress::Index(index.get()),
+        )?;
+        socket.set_multicast_all_v4(false)?;
+        // SO_BINDTODEVICE selects multicast egress too; do not override it with
+        // IP_MULTICAST_IF's potentially ambiguous local-address lookup.
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let interface = darwin_multicast_index(index.get())?;
+        socket.join_multicast_v4(&MDNS_ADDR, &interface)?;
+        socket.set_multicast_if_v4(&interface)?;
+    }
     Ok(socket.into())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_multicast_index(index: u32) -> Result<Ipv4Addr> {
+    // XNU ip_multicast_if (RFC1724 §3.3) interprets 0.0.0.0/8 as an exact
+    // interface index for IP_ADD_MEMBERSHIP and IP_MULTICAST_IF. No route lookup.
+    if index == 0 || index > 0x00ff_ffff {
+        bail!("multicast interface index cannot be represented by Darwin's 24-bit index API");
+    }
+    Ok(Ipv4Addr::from(index))
 }
 
 fn build_mdns_query(names: &[&str]) -> Result<Vec<u8>> {
@@ -1083,12 +1110,20 @@ mod tests {
     fn mdns_stops_before_socket_creation_or_first_send() {
         for stop_on_check in [1, 2] {
             let mut checks = 0;
+            let iface = if stop_on_check == 1 {
+                InterfaceInfo {
+                    name: "fing-no-such-interface".into(),
+                    ip: Ipv4Addr::new(192, 0, 2, 20),
+                    netmask: Ipv4Addr::new(255, 255, 255, 0),
+                    prefix: 24,
+                    network: "192.0.2.0/24".parse().unwrap(),
+                    mac: None,
+                }
+            } else {
+                loopback_interface()
+            };
             let result = mdns_probe_with_callback(
-                if stop_on_check == 1 {
-                    Ipv4Addr::new(192, 0, 2, 20)
-                } else {
-                    Ipv4Addr::LOCALHOST
-                },
+                &iface,
                 Duration::from_secs(1),
                 || {
                     checks += 1;
@@ -1100,6 +1135,101 @@ mod tests {
             assert!(result.is_empty());
             assert_eq!(checks, stop_on_check);
         }
+    }
+
+    fn loopback_interface() -> InterfaceInfo {
+        let iface = if_addrs::get_if_addrs()
+            .unwrap()
+            .into_iter()
+            .find(|iface| iface.is_loopback() && matches!(iface.addr, if_addrs::IfAddr::V4(_)))
+            .unwrap();
+        let if_addrs::IfAddr::V4(v4) = iface.addr else {
+            unreachable!()
+        };
+        InterfaceInfo {
+            name: iface.name,
+            ip: v4.ip,
+            netmask: v4.netmask,
+            prefix: 8,
+            network: "127.0.0.0/8".parse().unwrap(),
+            mac: None,
+        }
+    }
+
+    #[test]
+    fn mdns_membership_is_index_scoped_and_proxy_addresses_are_retained() {
+        assert_eq!(
+            darwin_multicast_index(1).unwrap(),
+            Ipv4Addr::new(0, 0, 0, 1)
+        );
+        assert_eq!(
+            darwin_multicast_index(0x00ff_ffff).unwrap(),
+            Ipv4Addr::new(0, 255, 255, 255)
+        );
+        for index in [0, 0x0100_0000, u32::MAX] {
+            assert!(darwin_multicast_index(index).is_err());
+        }
+        let iface = loopback_interface();
+        let receiver = bind_mdns_socket(&iface, 0).unwrap();
+        let bound = socket2::SockRef::from(&receiver);
+        #[cfg(target_os = "macos")]
+        {
+            let index = bound.device_index_v4().unwrap().unwrap();
+            assert_eq!(
+                bound.multicast_if_v4().unwrap(),
+                darwin_multicast_index(index.get()).unwrap()
+            );
+            assert!(
+                bound
+                    .join_multicast_v4(&MDNS_ADDR, &darwin_multicast_index(0x00ff_ffff).unwrap())
+                    .is_err()
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                bound.device().unwrap().as_deref(),
+                Some(iface.name.as_bytes())
+            );
+            assert!(!bound.multicast_all_v4().unwrap());
+            assert!(
+                bound
+                    .join_multicast_v4_n(
+                        &MDNS_ADDR,
+                        &socket2::InterfaceIndexOrAddress::Index(u32::MAX)
+                    )
+                    .is_err()
+            );
+        }
+        let invalid = InterfaceInfo {
+            name: "fing-no-such-interface".into(),
+            ..iface
+        };
+        assert!(bind_mdns_socket(&invalid, MDNS_PORT).is_err());
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&[0, 0, 0x84, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
+        write_dns_name(&mut packet, "proxy-target.local").unwrap();
+        packet.extend_from_slice(&1_u16.to_be_bytes());
+        packet.extend_from_slice(&1_u16.to_be_bytes());
+        packet.extend_from_slice(&120_u32.to_be_bytes());
+        packet.extend_from_slice(&4_u16.to_be_bytes());
+        packet.extend_from_slice(&[192, 0, 2, 20]);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        sender
+            .send_to(
+                &packet,
+                (Ipv4Addr::LOCALHOST, receiver.local_addr().unwrap().port()),
+            )
+            .unwrap();
+        let mut buffer = [0_u8; 512];
+        let (len, source) = receiver.recv_from(&mut buffer).unwrap();
+        assert_ne!(source.ip(), "192.0.2.20".parse::<IpAddr>().unwrap());
+        let info = records_to_mdns_info(&parse_mdns_packet(&buffer[..len]));
+        assert_eq!(
+            info[&"192.0.2.20".parse().unwrap()].names,
+            ["proxy-target.local"]
+        );
     }
 
     #[test]

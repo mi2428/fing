@@ -39,7 +39,11 @@ pub(super) struct L2Discovery {
 }
 
 pub(super) enum MulticastUpdate {
-    Mdns(IpAddr, enrich::MdnsInfo),
+    Mdns {
+        interface: String,
+        ip: IpAddr,
+        info: enrich::MdnsInfo,
+    },
     Upnp(IpAddr, upnp::UpnpInfo),
 }
 
@@ -198,7 +202,7 @@ pub(super) async fn run_multicast_enrichment(
     // are still running, giving the live UI progressive enrichment.
     let mdns = async {
         if config.mdns {
-            Some(run_mdns(iface.ip, target, config.timeout, mdns_tx).await)
+            Some(run_mdns(iface.clone(), target, config.timeout, mdns_tx).await)
         } else {
             None
         }
@@ -403,7 +407,7 @@ pub(super) async fn run_deep_and_snmp_enrichment(
 }
 
 async fn run_mdns(
-    interface_ip: Ipv4Addr,
+    iface: InterfaceInfo,
     target: Ipv4Net,
     timeout: Duration,
     updates: tokio::sync::mpsc::UnboundedSender<MulticastUpdate>,
@@ -414,13 +418,18 @@ async fn run_mdns(
     // to the selected IPv4 target.
     let mdns = tokio::task::spawn_blocking(move || {
         let stop_updates = updates.clone();
+        let receive_interface = iface.name.clone();
         enrich::mdns_probe_with_callback(
-            interface_ip,
+            &iface,
             timeout,
             || stop_updates.is_closed(),
             move |ip, info| {
                 if target_contains_ip(callback_target, ip) {
-                    let _ = updates.send(MulticastUpdate::Mdns(ip, info));
+                    let _ = updates.send(MulticastUpdate::Mdns {
+                        interface: receive_interface.clone(),
+                        ip,
+                        info,
+                    });
                 }
             },
         )

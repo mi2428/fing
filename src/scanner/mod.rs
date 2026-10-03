@@ -1188,10 +1188,22 @@ async fn scan_inner_running(
         &mut devices,
         &lldp_context,
         |devices, update| match update {
-            MulticastUpdate::Mdns(ip, mdns) => {
-                let device = upsert_device(devices, ip, scanned_at, &iface.name);
-                apply_mdns_info(device, mdns);
-                finish_observed_device_update(&events, device, &identity_rules);
+            MulticastUpdate::Mdns {
+                interface,
+                ip,
+                info,
+            } => {
+                match apply_mdns_update(devices, &iface, target, &interface, ip, info, scanned_at) {
+                    Ok(Some(device)) => {
+                        finish_observed_device_update(&events, device, &identity_rules)
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        let warning = format!("mDNS enrichment failed: {err}");
+                        warnings.push(warning.clone());
+                        emit(&events, ScanEvent::Warning(warning));
+                    }
+                }
             }
             MulticastUpdate::Upnp(ip, info) => {
                 let device = upsert_device(devices, ip, scanned_at, &iface.name);
@@ -1717,6 +1729,29 @@ fn normalize_mac(value: &str) -> String {
         .collect()
 }
 
+fn apply_mdns_update<'a>(
+    devices: &'a mut BTreeMap<IpAddr, Device>,
+    iface: &net::InterfaceInfo,
+    target: ipnet::Ipv4Net,
+    receive_interface: &str,
+    ip: IpAddr,
+    info: enrich::MdnsInfo,
+    now: chrono::DateTime<Utc>,
+) -> Result<Option<&'a mut Device>> {
+    if receive_interface != iface.name {
+        anyhow::bail!("mDNS receive interface does not match selected interface");
+    }
+    if !target_contains_ip(target, ip) {
+        return Ok(None);
+    }
+    let device = upsert_device(devices, ip, now, &iface.name);
+    // Preserve proxy targets and their names/services without treating either
+    // the sender IP or an advertised address as independent reachability proof.
+    device.add_evidence("mdns", "discovery", "advertisement", 0.3);
+    apply_mdns_info(device, info);
+    Ok(Some(device))
+}
+
 fn finish_observed_device_update(
     events: &Option<UnboundedSender<ScanEvent>>,
     device: &mut Device,
@@ -2084,6 +2119,96 @@ mod tests {
             devices.values().next().unwrap().hostname.as_deref(),
             Some("synthetic-switch")
         );
+    }
+
+    #[test]
+    fn mdns_updates_keep_proxy_targets_but_reject_cross_interface_and_range() {
+        let iface = net::InterfaceInfo {
+            name: "fixture-a".into(),
+            ip: "192.0.2.1".parse().unwrap(),
+            netmask: "255.255.255.0".parse().unwrap(),
+            prefix: 24,
+            network: "192.0.2.0/24".parse().unwrap(),
+            mac: None,
+        };
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let ip = "192.0.2.20".parse().unwrap();
+        let info = enrich::MdnsInfo {
+            names: vec!["proxy-target".into()],
+            services: vec![enrich::MdnsService {
+                name: "_ipp._tcp".into(),
+                port: Some(631),
+            }],
+            model: Some("Fixture printer".into()),
+            os: None,
+        };
+        let mut devices = BTreeMap::new();
+        // The same IP/CIDR is not enough to accept another receive interface.
+        assert!(
+            apply_mdns_update(
+                &mut devices,
+                &iface,
+                iface.network,
+                "fixture-b",
+                ip,
+                info.clone(),
+                now
+            )
+            .is_err()
+        );
+        assert!(devices.is_empty());
+        assert!(
+            apply_mdns_update(
+                &mut devices,
+                &iface,
+                iface.network,
+                "fixture-a",
+                "198.51.100.20".parse().unwrap(),
+                info.clone(),
+                now
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(devices.is_empty());
+        let device = apply_mdns_update(
+            &mut devices,
+            &iface,
+            iface.network,
+            "fixture-a",
+            ip,
+            info.clone(),
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(device.interface.as_deref(), Some("fixture-a"));
+        assert_eq!(device.names[0].name, "proxy-target");
+        assert_eq!(device.services[0].port, Some(631));
+        assert!(
+            device
+                .evidence
+                .iter()
+                .any(|e| e.source == "mdns" && e.key == "discovery" && e.value == "advertisement")
+        );
+        assert!(
+            device
+                .evidence
+                .iter()
+                .all(|e| e.source != "arp" && e.source != "deep")
+        );
+        device.add_evidence("arp", "mac", "02:00:00:00:00:20", 0.5);
+        apply_mdns_update(
+            &mut devices,
+            &iface,
+            iface.network,
+            "fixture-a",
+            ip,
+            info,
+            now,
+        )
+        .unwrap();
+        assert!(devices[&ip].evidence.iter().any(|e| e.source == "arp"));
     }
 
     #[test]
