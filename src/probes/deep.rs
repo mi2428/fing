@@ -664,6 +664,109 @@ mod tests {
     }
 
     #[test]
+    fn self_signed_https_preserves_web_and_tls_fingerprints() {
+        use std::io::{BufRead as _, BufReader};
+
+        // Public, generated TEST-ONLY material: never use this key outside tests.
+        // The self-signed DNS name deliberately does not match the loopback IP.
+        const CERT: &[u8] = include_bytes!("fixtures/loopback-test-only-cert.pem");
+        const KEY: &[u8] = include_bytes!("fixtures/loopback-test-only-key.pem");
+        const FAVICON: &[u8] = b"synthetic test-only favicon";
+        let identity = native_tls::Identity::from_pkcs8(CERT, KEY).unwrap();
+        let acceptor = native_tls::TlsAcceptor::new(identity).unwrap();
+        let der = native_tls::Certificate::from_pem(CERT)
+            .unwrap()
+            .to_der()
+            .unwrap();
+        let (_, certificate) = x509_parser::parse_x509_certificate(&der).unwrap();
+        assert_eq!(
+            certificate.subject().to_string(),
+            "CN=fing-fixture.invalid, O=Fing Test Only"
+        );
+        assert_eq!(certificate.subject(), certificate.issuer());
+        assert_eq!(
+            certificate
+                .subject_alternative_name()
+                .unwrap()
+                .unwrap()
+                .value
+                .general_names,
+            [x509_parser::extensions::GeneralName::DNSName(
+                "fing-fixture.invalid"
+            )]
+        );
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let timeout = StdDuration::from_secs(3);
+
+        thread::scope(|scope| {
+            let server = scope.spawn(move || {
+                let deadline = Instant::now() + StdDuration::from_secs(15);
+                for expected in [Some("HEAD / HTTP/1.1"), Some("GET /favicon.ico HTTP/1.1"), None] {
+                    let stream = loop {
+                        assert!(Instant::now() < deadline, "TLS fixture accept timed out");
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(StdDuration::from_millis(10));
+                            }
+                            Err(error) => panic!("TLS fixture accept failed: {error}"),
+                        }
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream.set_read_timeout(Some(timeout)).unwrap();
+                    stream.set_write_timeout(Some(timeout)).unwrap();
+                    let mut tls = acceptor.accept(stream).unwrap();
+                    if let Some(expected) = expected {
+                        let mut request = String::new();
+                        BufReader::new(&mut tls).read_line(&mut request).unwrap();
+                        assert_eq!(request.trim_end(), expected);
+                        let body = if expected.starts_with("GET ") { FAVICON } else { &[] };
+                        write!(tls, "HTTP/1.1 200 OK\r\nServer: fing-fixture\r\nX-Fixture: test-only\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                        tls.write_all(body).unwrap();
+                        tls.flush().unwrap();
+                    }
+                }
+            });
+            let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+            let web = blocking_web_probe(ip, ip, port, true, timeout, true);
+            let tls = blocking_tls_certificate_probe(ip, ip, port, timeout);
+            server.join().unwrap();
+
+            let web = web.expect(
+                "production HTTPS probe must tolerate the self-signed/mismatched certificate",
+            );
+            let banner = web.banner.unwrap();
+            assert!(banner.contains("HTTP 200") && banner.contains("server: fing-fixture"));
+            assert!(web.headers.contains(&HttpHeader {
+                name: "x-fixture".to_string(),
+                value: "test-only".to_string()
+            }));
+            assert_eq!(
+                web.favicon.unwrap(),
+                FaviconFingerprint {
+                    url: format!("https://127.0.0.1:{port}/favicon.ico"),
+                    sha256: hex::encode(Sha256::digest(FAVICON)),
+                    bytes: FAVICON.len(),
+                }
+            );
+            assert_eq!(
+                tls.expect(
+                    "production TLS probe must tolerate the self-signed/mismatched certificate"
+                ),
+                TlsCertificate {
+                    sha256: hex::encode(Sha256::digest(&der)),
+                    subject: Some(certificate.subject().to_string()),
+                    issuer: Some(certificate.issuer().to_string()),
+                    not_before: Some(certificate.validity().not_before.to_string()),
+                    not_after: Some(certificate.validity().not_after.to_string()),
+                }
+            );
+        });
+    }
+
+    #[test]
     fn favicon_fingerprint_rejects_unknown_size_body_above_limit() {
         let body = vec![b'a'; MAX_FAVICON_BYTES + 1];
         let fingerprint = favicon_fingerprint_from_reader(

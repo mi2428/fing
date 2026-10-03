@@ -14,3 +14,31 @@ if output=$(make -n test RUSTUP_TOOLCHAIN=fing-missing-toolchain 2>&1); then
 fi
 case "$output" in *"Rust tools unavailable"*) ;; *) exit 1 ;; esac
 ```
+
+## Dependency decisions
+
+Versions and advisories were rechecked against crates.io, upstream notes and OSV on 2026-10-03. Existing manifest ranges are retained when compatible lockfile updates suffice; no application API, direct dependency or requested feature is added.
+
+| Issue | Resolution and compatibility evidence |
+| --- | --- |
+| #26 | reqwest 0.13.5 (declared Rust 1.85), rustls 0.23.45 (1.71), webpki-root-certs 1.0.9 (1.70), quinn-proto 0.11.15 (1.85). [reqwest notes](https://github.com/seanmonstar/reqwest/blob/master/CHANGELOG.md) describe additive APIs and redirect/proxy fixes; existing blocking/rustls APIs compile unchanged. [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html) requires rustls >=0.23.45. Inactive QUIC lock entries are refreshed for RUSTSEC-2026-0185; HTTP/3 stays disabled, so no reachable QUIC vulnerability is claimed. Redirect denial, local binding, body limits, OUI verification and intentional local-certificate tolerance remain unchanged in source. |
+
+The smallest dependency regression checks the resolved patched versions and disabled HTTP/3 (it fails against the original lockfile; it is not an exploit test):
+
+```sh
+cargo metadata --locked --format-version 1 | python3 -c '
+import json, sys
+m = json.load(sys.stdin)
+floors = {"rustls": "0.23.45", "quinn-proto": "0.11.15"}
+version = lambda v: tuple(map(int, v.split(".")))
+for name, floor in floors.items():
+    packages = [p for p in m["packages"] if p["name"] == name]
+    assert packages and all(version(p["version"]) >= version(floor) for p in packages), name
+reqwest = next(p["id"] for p in m["packages"] if p["name"] == "reqwest")
+features = next(n["features"] for n in m["resolve"]["nodes"] if n["id"] == reqwest)
+assert "http3" not in features and "quinn" not in features, features
+print("dependency version/feature regression: passed")
+'
+```
+
+Each update is checked with `make fmt CHECK_ONLY=1`, `make check`, locked metadata/tree and an all-platform OSV query. macOS arm64 is verified; Linux build/static-link smoke and isolated TLS-certificate extraction are not verified here because the Docker daemon is unavailable. Existing loopback HTTP redirect/body-limit and bundled OUI-root tests pass; these do not substitute for an end-to-end TLS fixture or MSRV build.
