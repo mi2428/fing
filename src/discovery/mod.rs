@@ -299,10 +299,18 @@ pub fn parse_arp_reply(packet: &[u8]) -> Option<ArpHit> {
     }
 
     let arp = ArpPacket::new(ethernet.payload())?;
-    if arp.get_operation() != ArpOperations::Reply {
+    if arp.get_operation() != ArpOperations::Reply
+        || arp.get_hardware_type() != ArpHardwareTypes::Ethernet
+        || arp.get_protocol_type() != EtherTypes::Ipv4
+        || arp.get_hw_addr_len() != 6
+        || arp.get_proto_addr_len() != 4
+        || arp.get_sender_hw_addr() != ethernet.get_source()
+    {
         return None;
     }
 
+    // This is structural validation, not authentication. Keep observing valid
+    // replies addressed to other LAN hosts as well as replies to this scanner.
     Some(ArpHit {
         ip: arp.get_sender_proto_addr(),
         mac: arp.get_sender_hw_addr().to_string(),
@@ -458,6 +466,52 @@ mod tests {
 
         assert_eq!(callbacks, 1);
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn arp_reply_validation_rejects_inconsistent_headers_before_recording() {
+        let sender = "192.0.2.10".parse().unwrap();
+        let mac = MacAddr::new(0x02, 0, 0, 0, 0, 1);
+        let packet = arp_reply_packet(sender, mac);
+        let target = "192.0.2.0/24".parse().unwrap();
+        // Wrong EtherType/opcode, hardware/protocol types, address lengths, and
+        // Ethernet/ARP sender mismatch must never enter the identity callback.
+        for (offset, value) in [
+            (13, 0),
+            (21, 1),
+            (15, 2),
+            (17, 0xdd),
+            (18, 5),
+            (19, 16),
+            (6, 3),
+        ] {
+            let mut malformed = packet;
+            malformed[offset] = value;
+            assert!(parse_arp_reply(&malformed).is_none(), "offset {offset}");
+            let mut hits = BTreeMap::new();
+            record_arp_reply(&malformed, target, &mut hits, &mut |_| {
+                panic!("invalid reply accepted")
+            });
+            assert!(hits.is_empty());
+        }
+        for len in 0..packet.len() {
+            assert!(parse_arp_reply(&packet[..len]).is_none());
+        }
+        assert_eq!(parse_arp_reply(&packet).unwrap().ip, sender);
+        let mut other_host_reply = packet;
+        other_host_reply[..6].copy_from_slice(&[0x02, 0, 0, 0, 0, 2]);
+        assert!(parse_arp_reply(&other_host_reply).is_some());
+        let mut hits = BTreeMap::new();
+        record_arp_reply(
+            &packet,
+            "198.51.100.0/24".parse().unwrap(),
+            &mut hits,
+            &mut |_| panic!("out-of-range reply accepted"),
+        );
+        assert!(hits.is_empty());
+        record_arp_reply(&other_host_reply, target, &mut hits, &mut |_| {});
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[&sender].mac, mac.to_string());
     }
 
     #[test]
