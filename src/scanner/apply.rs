@@ -24,6 +24,7 @@ pub(super) fn apply_mdns_info(device: &mut Device, mdns: enrich::MdnsInfo) {
 }
 
 fn apply_mdns_snapshot(device: &mut Device, mdns: enrich::MdnsInfo) {
+    device.add_evidence("mdns", "discovery", "advertisement", 0.3);
     // mDNS is usually name-rich and often model-rich. Store the raw model as
     // evidence before promoting it so identity rules can still inspect it even
     // if another source later wins the best-guess slot.

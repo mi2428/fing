@@ -1747,7 +1747,6 @@ fn apply_mdns_update<'a>(
     let device = upsert_device(devices, ip, now, &iface.name);
     // Preserve proxy targets and their names/services without treating either
     // the sender IP or an advertised address as independent reachability proof.
-    device.add_evidence("mdns", "discovery", "advertisement", 0.3);
     apply_mdns_info(device, info);
     Ok(Some(device))
 }
