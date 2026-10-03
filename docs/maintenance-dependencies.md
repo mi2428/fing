@@ -26,6 +26,7 @@ Versions and advisories were rechecked against crates.io, upstream notes and OSV
 | #28 | hickory-resolver/net/proto 0.26.3 (declared Rust 1.88) -> existing moka 0.12.15 -> crossbeam-epoch 0.9.20 (1.61). [Resolver notes](https://github.com/hickory-dns/hickory-dns/releases/tag/v0.26.3) include lenient resolv.conf parsing and regression fixes; DNSSEC/QUIC/HTTP/3 features remain disabled. Reverse-DNS Tokio/timeout/semaphore code is unchanged. RUSTSEC-2026-0204 no longer matches; use of its affected pointer-formatting path was not established. |
 | #29 | ratatui 0.30.2/core 0.1.2/widgets 0.3.2 (declared Rust 1.88) -> lru 0.18.5 (1.85), clearing RUSTSEC-2026-0253. [Notes](https://github.com/ratatui/ratatui/releases/tag/ratatui-v0.30.2) fix buffer/scrollbar rendering. Existing crossterm/default features and application rendering/input code are retained. The parent requires bitflags >=2.12 and strum 0.28; optional palette/Termina lock entries do not enable those features. Existing TestBackend, masking, filtering, scrolling and input tests plus example compilation pass; no application panic/Drop exploit is claimed. |
 | #30 | Linux native-tls 0.2.18 -> openssl 0.10.81/sys 0.9.117 (declared Rust 1.80). [Notes](https://github.com/rust-openssl/rust-openssl/blob/master/openssl/CHANGELOG.md) fix AES-KW-PAD overflow in 0.10.80 and verify-mode handling in 0.10.81. GHSA-phqj-4mhp-q6mq no longer matches; the affected cipher API is not used by fing. Linux-target metadata/tree retains `vendored`, and static release configuration is unchanged. Peer-certificate DER extraction and intentional invalid-certificate/hostname tolerance are untouched. **Linux build/tests, static-link smoke and isolated certificate fixture remain pending external validation**, not proven by macOS tests. |
+| #31 | quick-xml 0.41.0 (declared Rust 1.79) clears RUSTSEC-2026-0194/0195. [0.40 notes](https://github.com/tafia/quick-xml/releases/tag/v0.40.0) change unused namespace/read_text/normalization APIs; [0.41 notes](https://github.com/tafia/quick-xml/releases/tag/v0.41.0) supply both fixes. The plain `Reader::read_event`/`BytesText::decode` flow compiles unchanged, with existing root-over-embedded/services/body-limit tests passing and no XML features added. Attribute iteration/NsReader are unused, so these specific DoS paths are not claimed reachable. Latest [0.42](https://github.com/tafia/quick-xml/releases/tag/v0.42.0) removes the used decode API and changes QName from bytes to str: defer that separate source migration, rather than expand this patched update. |
 
 The smallest dependency regression checks the resolved patched versions and disabled HTTP/3 (it fails against the original lockfile; it is not an exploit test):
 
@@ -34,7 +35,8 @@ cargo metadata --locked --format-version 1 | python3 -c '
 import json, sys
 m = json.load(sys.stdin)
 floors = {"rustls": "0.23.45", "quinn-proto": "0.11.15", "anyhow": "1.0.103",
-          "crossbeam-epoch": "0.9.20", "lru": "0.18.2", "openssl": "0.10.80"}
+          "crossbeam-epoch": "0.9.20", "lru": "0.18.2", "openssl": "0.10.80",
+          "quick-xml": "0.41.0"}
 version = lambda v: tuple(map(int, v.split(".")))
 for name, floor in floors.items():
     packages = [p for p in m["packages"] if p["name"] == name]
