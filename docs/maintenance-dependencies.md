@@ -27,6 +27,7 @@ Versions and advisories were rechecked against crates.io, upstream notes and OSV
 | #29 | ratatui 0.30.2/core 0.1.2/widgets 0.3.2 (declared Rust 1.88) -> lru 0.18.5 (1.85), clearing RUSTSEC-2026-0253. [Notes](https://github.com/ratatui/ratatui/releases/tag/ratatui-v0.30.2) fix buffer/scrollbar rendering. Existing crossterm/default features and application rendering/input code are retained. The parent requires bitflags >=2.12 and strum 0.28; optional palette/Termina lock entries do not enable those features. Existing TestBackend, masking, filtering, scrolling and input tests plus example compilation pass; no application panic/Drop exploit is claimed. |
 | #30 | Linux native-tls 0.2.18 -> openssl 0.10.81/sys 0.9.117 (declared Rust 1.80). [Notes](https://github.com/rust-openssl/rust-openssl/blob/master/openssl/CHANGELOG.md) fix AES-KW-PAD overflow in 0.10.80 and verify-mode handling in 0.10.81. GHSA-phqj-4mhp-q6mq no longer matches; the affected cipher API is not used by fing. Linux-target metadata/tree retains `vendored`, and static release configuration is unchanged. Peer-certificate DER extraction and intentional invalid-certificate/hostname tolerance are untouched. **Linux build/tests, static-link smoke and isolated certificate fixture remain pending external validation**, not proven by macOS tests. |
 | #31 | quick-xml 0.41.0 (declared Rust 1.79) clears RUSTSEC-2026-0194/0195. [0.40 notes](https://github.com/tafia/quick-xml/releases/tag/v0.40.0) change unused namespace/read_text/normalization APIs; [0.41 notes](https://github.com/tafia/quick-xml/releases/tag/v0.41.0) supply both fixes. The plain `Reader::read_event`/`BytesText::decode` flow compiles unchanged, with existing root-over-embedded/services/body-limit tests passing and no XML features added. Attribute iteration/NsReader are unused, so these specific DoS paths are not claimed reachable. Latest [0.42](https://github.com/tafia/quick-xml/releases/tag/v0.42.0) removes the used decode API and changes QName from bytes to str: defer that separate source migration, rather than expand this patched update. |
+| #32 | Compatible lock updates: chrono 0.4.45 (declared Rust 1.62), clap 4.6.7 (1.85), ipnet 2.12.2 (no declared floor), serde 1.0.229 (1.56), serde_json 1.0.151 (1.71), socket2 0.6.5 (1.70), tokio 1.53.1 (1.71). [Chrono](https://github.com/chronotope/chrono/releases/tag/v0.4.45) fixes TZ overflow; [clap](https://github.com/clap-rs/clap/blob/master/CHANGELOG.md) changes help formatting and adds opt-in deferred derive initialization (not enabled); [ipnet](https://github.com/krisprice/ipnet/blob/master/RELEASES.md) fixes boundary subnet/aggregation cases; serde updates its derive parser to syn 3; JSON adds an unused unchecked RawValue constructor; [socket2](https://github.com/rust-lang/socket2/blob/master/CHANGELOG.md) expands platform support; [Tokio](https://github.com/tokio-rs/tokio/releases/tag/tokio-1.53.0) fixes channel wakeups/timer/runtime edges. Existing CLI/serialization/subnet/async/loopback tests pass without source or feature changes. Unrelated Windows resolution changes are excluded. All declared graph floors remain <=1.88; this is metadata evidence, not an MSRV build. |
 
 The smallest dependency regression checks the resolved patched versions and disabled HTTP/3 (it fails against the original lockfile; it is not an exploit test):
 
@@ -37,6 +38,9 @@ m = json.load(sys.stdin)
 floors = {"rustls": "0.23.45", "quinn-proto": "0.11.15", "anyhow": "1.0.103",
           "crossbeam-epoch": "0.9.20", "lru": "0.18.2", "openssl": "0.10.80",
           "quick-xml": "0.41.0"}
+floors.update({"chrono": "0.4.45", "clap": "4.6.7", "ipnet": "2.12.2",
+               "serde": "1.0.229", "serde_json": "1.0.151",
+               "socket2": "0.6.5", "tokio": "1.53.1"})
 version = lambda v: tuple(map(int, v.split(".")))
 for name, floor in floors.items():
     packages = [p for p in m["packages"] if p["name"] == name]
@@ -44,6 +48,8 @@ for name, floor in floors.items():
 reqwest = next(p["id"] for p in m["packages"] if p["name"] == "reqwest")
 features = next(n["features"] for n in m["resolve"]["nodes"] if n["id"] == reqwest)
 assert "http3" not in features and "quinn" not in features, features
+assert all(version(p["rust_version"]) <= (1, 88, 0)
+           for p in m["packages"] if p["rust_version"]), "declared compiler floor raised"
 print("dependency version/feature regression: passed")
 '
 ```
