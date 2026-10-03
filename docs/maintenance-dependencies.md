@@ -23,6 +23,7 @@ Versions and advisories were rechecked against crates.io, upstream notes and OSV
 | --- | --- |
 | #26 | reqwest 0.13.5 (declared Rust 1.85), rustls 0.23.45 (1.71), webpki-root-certs 1.0.9 (1.70), quinn-proto 0.11.15 (1.85). [reqwest notes](https://github.com/seanmonstar/reqwest/blob/master/CHANGELOG.md) describe additive APIs and redirect/proxy fixes; existing blocking/rustls APIs compile unchanged. [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html) requires rustls >=0.23.45. Inactive QUIC lock entries are refreshed for RUSTSEC-2026-0185; HTTP/3 stays disabled, so no reachable QUIC vulnerability is claimed. Redirect denial, local binding, body limits, OUI verification and intentional local-certificate tolerance remain unchanged in source. |
 | #27 | anyhow 1.0.104 (declared Rust 1.68). [1.0.103 notes](https://github.com/dtolnay/anyhow/releases/tag/1.0.103) fix `Error::downcast_mut` UB; 1.0.104 only updates a development dependency. Source search finds no downcasting; error contexts/propagation are untouched. RUSTSEC-2026-0190 no longer matches, without claiming reachable application UB. |
+| #28 | hickory-resolver/net/proto 0.26.3 (declared Rust 1.88) -> existing moka 0.12.15 -> crossbeam-epoch 0.9.20 (1.61). [Resolver notes](https://github.com/hickory-dns/hickory-dns/releases/tag/v0.26.3) include lenient resolv.conf parsing and regression fixes; DNSSEC/QUIC/HTTP/3 features remain disabled. Reverse-DNS Tokio/timeout/semaphore code is unchanged. RUSTSEC-2026-0204 no longer matches; use of its affected pointer-formatting path was not established. |
 
 The smallest dependency regression checks the resolved patched versions and disabled HTTP/3 (it fails against the original lockfile; it is not an exploit test):
 
@@ -30,7 +31,8 @@ The smallest dependency regression checks the resolved patched versions and disa
 cargo metadata --locked --format-version 1 | python3 -c '
 import json, sys
 m = json.load(sys.stdin)
-floors = {"rustls": "0.23.45", "quinn-proto": "0.11.15", "anyhow": "1.0.103"}
+floors = {"rustls": "0.23.45", "quinn-proto": "0.11.15", "anyhow": "1.0.103",
+          "crossbeam-epoch": "0.9.20"}
 version = lambda v: tuple(map(int, v.split(".")))
 for name, floor in floors.items():
     packages = [p for p in m["packages"] if p["name"] == name]
