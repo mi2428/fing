@@ -103,7 +103,7 @@ fn mask_guess_identity(guess: &mut Option<Guess>) {
 }
 
 fn mask_identity_text(value: &str) -> String {
-    let masked = mask_compact_mac_tokens(&mask_separated_macs_relaxed(value));
+    let masked = mask_compact_mac_tokens(&mask_separated_macs(value));
     if masked == value {
         value.to_string()
     } else {
@@ -112,7 +112,8 @@ fn mask_identity_text(value: &str) -> String {
 }
 
 fn mask_mac_evidence_value(key: &str, value: &str) -> String {
-    if !evidence_key_may_contain_mac(key) {
+    // Only actual digest fields are exempt, not identity keys such as "share".
+    if key.eq_ignore_ascii_case("tls_cert_sha256") || key.eq_ignore_ascii_case("favicon_sha256") {
         return value.to_string();
     }
 
@@ -122,19 +123,7 @@ fn mask_mac_evidence_value(key: &str, value: &str) -> String {
         return masked;
     }
 
-    let masked = mask_separated_macs(value);
-    if masked != value {
-        return masked;
-    }
-
-    mask_compact_mac(value).unwrap_or_else(|| value.to_string())
-}
-
-fn evidence_key_may_contain_mac(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    key == "mac"
-        || key.ends_with("_mac")
-        || matches!(key.as_str(), "chassis_id" | "port_id" | "client_id")
+    mask_identity_text(value)
 }
 
 fn mask_dhcp_mac_client_id(value: &str) -> Option<String> {
@@ -162,24 +151,10 @@ fn mask_dhcp_mac_client_id(value: &str) -> Option<String> {
 }
 
 fn mask_separated_macs(value: &str) -> String {
-    mask_separated_macs_with_boundary(value, MacBoundary::Strict)
-}
-
-fn mask_separated_macs_relaxed(value: &str) -> String {
-    mask_separated_macs_with_boundary(value, MacBoundary::Relaxed)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MacBoundary {
-    Strict,
-    Relaxed,
-}
-
-fn mask_separated_macs_with_boundary(value: &str, boundary: MacBoundary) -> String {
     let mut masked = String::with_capacity(value.len());
     let mut index = 0;
     while index < value.len() {
-        if let Some((end, mac)) = separated_mac_at(value, index, boundary) {
+        if let Some((end, mac)) = separated_mac_at(value, index) {
             masked.push_str(&mask_lower_24_bits(mac));
             index = end;
         } else {
@@ -194,12 +169,12 @@ fn mask_separated_macs_with_boundary(value: &str, boundary: MacBoundary) -> Stri
     masked
 }
 
-fn separated_mac_at(value: &str, start: usize, boundary: MacBoundary) -> Option<(usize, &str)> {
+fn separated_mac_at(value: &str, start: usize) -> Option<(usize, &str)> {
     let bytes = value.as_bytes();
     if start + 17 > bytes.len() {
         return None;
     }
-    if start > 0 && !mac_start_boundary(bytes[start - 1], boundary) {
+    if start > 0 && bytes[start - 1].is_ascii_hexdigit() {
         return None;
     }
 
@@ -219,25 +194,10 @@ fn separated_mac_at(value: &str, start: usize, boundary: MacBoundary) -> Option<
     }
 
     let end = start + 17;
-    if end < bytes.len() && !mac_end_boundary(bytes[end], boundary) {
+    if end < bytes.len() && bytes[end].is_ascii_hexdigit() {
         return None;
     }
     Some((end, &value[start..end]))
-}
-
-fn mac_start_boundary(byte: u8, boundary: MacBoundary) -> bool {
-    match boundary {
-        MacBoundary::Strict => !is_mac_token_byte(byte),
-        MacBoundary::Relaxed => !byte.is_ascii_hexdigit(),
-    }
-}
-
-fn mac_end_boundary(byte: u8, boundary: MacBoundary) -> bool {
-    mac_start_boundary(byte, boundary)
-}
-
-fn is_mac_token_byte(byte: u8) -> bool {
-    byte.is_ascii_hexdigit() || matches!(byte, b':' | b'-')
 }
 
 fn mask_compact_mac_tokens(value: &str) -> String {
@@ -278,15 +238,6 @@ fn compact_mac_token_at(value: &str, start: usize) -> Option<(usize, &str)> {
         return None;
     }
     Some((end, &value[start..end]))
-}
-
-fn mask_compact_mac(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.len() == 12 && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        Some(mask_lower_24_bits(trimmed))
-    } else {
-        None
-    }
 }
 
 fn mask_lower_24_bits(mac: &str) -> String {

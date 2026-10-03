@@ -262,4 +262,63 @@ mod tests {
             "aa:bb:cc:dd:ee:ff"
         );
     }
+
+    #[test]
+    fn json_masks_identity_evidence_without_changing_hashes_or_source() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut device = Device::new("192.0.2.10".parse().unwrap(), now);
+        device.add_name("host-00:00:5e:00:53:01", "snmp", 0.82);
+        device.add_evidence("snmp", "sysName", "host-00:00:5e:00:53:01", 0.82);
+        device.add_evidence("snmp", "sysDescr", "00-00-5E-00-53-01", 0.82);
+        device.add_evidence("cdp", "device_id", "node-00005e005301", 0.82);
+        device.add_evidence("tls", "tls_cert_sha256", "00005e005301", 0.72);
+        device.add_evidence("http", "favicon_sha256", "00005e005301deadbeef", 0.72);
+        device.add_evidence("smb", "share", "00:00:5e:00:53:01", 0.65);
+        device.add_evidence("test", "shadow", "00-00-5E-00-53-01", 0.65);
+        device.add_evidence("http", "http_header_share", "node-00005e005301", 0.65);
+        device.add_evidence("snmp", "sysObjectID", "1.3.6.1.4.1.9", 0.85);
+        device.add_evidence(
+            "smb",
+            "smb_server_guid",
+            "00005e005301deadbeef0123456789abcd",
+            0.65,
+        );
+        let result = ScanResult {
+            target: "192.0.2.0/24".to_string(),
+            interface: "test0".to_string(),
+            scanned_at: now,
+            devices: vec![device],
+            warnings: Vec::new(),
+        };
+        let original = result.clone();
+        let masked = to_json(
+            &result,
+            OutputOptions {
+                mac: MacAddressDisplay::MaskLower24,
+            },
+        )
+        .unwrap();
+        let output: ScanResult = serde_json::from_str(&masked).unwrap();
+        let values = &output.devices[0].evidence;
+        assert_eq!(
+            output.devices[0].hostname.as_deref(),
+            Some("host-00:00:5e:**:**:**")
+        );
+        assert_eq!(values[0].value, "host-00:00:5e:**:**:**");
+        assert_eq!(values[1].value, "00:00:5e:**:**:**");
+        assert_eq!(values[2].value, "node-00:00:5e:**:**:**");
+        assert_eq!(values[3].value, "00005e005301");
+        assert_eq!(values[4].value, "00005e005301deadbeef");
+        assert_eq!(values[5].value, "00:00:5e:**:**:**");
+        assert_eq!(values[6].value, "00:00:5e:**:**:**");
+        assert_eq!(values[7].value, "node-00:00:5e:**:**:**");
+        assert_eq!(values[8].value, "1.3.6.1.4.1.9");
+        assert_eq!(values[9].value, "00005e005301deadbeef0123456789abcd");
+        assert_eq!(output.devices[0].names[0].name, "host-00:00:5e:**:**:**");
+        assert_eq!(
+            to_json(&result, OutputOptions::default()).unwrap(),
+            serde_json::to_string_pretty(&result).unwrap()
+        );
+        assert_eq!(result, original);
+    }
 }
