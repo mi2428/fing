@@ -21,7 +21,8 @@ use crate::{
 use anyhow::{Context, Result};
 use apply::{
     apply_cdp_info, apply_deep_probes, apply_dhcp_lease, apply_lldp_info, apply_mdns_info,
-    apply_oui, apply_smb_info, apply_snmp_info, apply_upnp_info, merge_devices_by_interface_ip,
+    apply_oui, apply_smb_info, apply_snmp_info, apply_upnp_info, cdp_observation_scope,
+    lldp_observation_scope, merge_devices_by_interface_ip,
 };
 use chrono::{DateTime, Utc};
 use phases::{
@@ -184,6 +185,7 @@ struct PassiveObservation {
     candidate_macs: Vec<String>,
     advertisement: discovery::l2::L2Advertisement,
     observation_round: u64,
+    observation_revision: u64,
 }
 
 impl PassiveObservation {
@@ -195,9 +197,10 @@ impl PassiveObservation {
         advertisement: discovery::l2::L2Advertisement,
         received_at: DateTime<Utc>,
     ) -> Self {
+        let observation_revision = crate::model::next_observation_revision();
         match &advertisement {
             discovery::l2::L2Advertisement::Lldp(info) => Self {
-                key: format!("lldp|{}", info.identity_key()),
+                key: format!("lldp|{}", lldp_observation_scope(info)),
                 received_at,
                 ttl: info
                     .ttl
@@ -207,9 +210,10 @@ impl PassiveObservation {
                 candidate_macs: lldp_candidate_macs(info),
                 advertisement,
                 observation_round: 0,
+                observation_revision,
             },
             discovery::l2::L2Advertisement::Cdp(info) => Self {
-                key: format!("cdp|{}", info.identity_key()),
+                key: format!("cdp|{}", cdp_observation_scope(info)),
                 received_at,
                 ttl: Duration::from_secs(u64::from(info.ttl)),
                 candidate_ips: info
@@ -221,6 +225,7 @@ impl PassiveObservation {
                 candidate_macs: vec![info.source_mac.clone()],
                 advertisement,
                 observation_round: 0,
+                observation_revision,
             },
         }
     }
@@ -271,7 +276,9 @@ impl PassiveObservation {
 
     fn apply_to_device(&self, device: &mut Device, oui_db: Option<&HashMap<String, String>>) {
         let scan_round = device.observation_round;
+        let scan_revision = device.observation_revision;
         device.observation_round = self.observation_round;
+        device.observation_revision = Some(self.observation_revision);
         match &self.advertisement {
             discovery::l2::L2Advertisement::Lldp(info) => {
                 apply_lldp_info(device, info.clone(), oui_db);
@@ -281,6 +288,7 @@ impl PassiveObservation {
             }
         }
         device.observation_round = scan_round;
+        device.observation_revision = scan_revision;
     }
 }
 
@@ -707,16 +715,7 @@ fn merge_device_snapshot(existing: &mut Device, mut incoming: Device) {
     if existing.vendor.is_none() {
         existing.vendor = incoming.vendor.take();
     }
-    existing.merge_identity_snapshot(&mut incoming);
-    for service in incoming.services {
-        existing.add_service(
-            service.name,
-            &service.source,
-            service.port,
-            service.confidence,
-        );
-    }
-    existing.merge_evidence_snapshot(incoming.evidence);
+    existing.merge_observation_snapshot(&mut incoming);
     existing.observation_round = existing.observation_round.max(incoming.observation_round);
     existing.first_seen = existing.first_seen.min(incoming.first_seen);
     existing.last_seen = existing.last_seen.max(incoming.last_seen);
@@ -1741,18 +1740,16 @@ mod tests {
             manager.observe_scan_event(ScanEvent::RoundStarted { round });
             let mut device = Device::new(ip, Utc::now());
             device.interface = Some("en0".into());
-            device.add_evidence(
-                "http",
-                "http_header_x_request_id",
-                format!("{round}-80"),
-                0.75,
-            );
-            device.add_evidence(
-                "http",
-                "http_header_x_request_id",
-                format!("{round}-443"),
-                0.75,
-            );
+            for port in [80, 443] {
+                device.observe("http", port.to_string(), |snapshot| {
+                    snapshot.add_evidence(
+                        "http",
+                        &format!("http_header_x_key_{round}"),
+                        format!("{round}-{port}"),
+                        0.75,
+                    );
+                });
+            }
             manager.observe_scan_event(ScanEvent::DeviceUpdated(Box::new(device)));
             let stored = &manager.states["en0"].devices[&ip];
             assert_eq!(stored.evidence.len(), 2);
@@ -1775,8 +1772,73 @@ mod tests {
             device
                 .evidence
                 .iter()
-                .all(|item| item.observation_round == 1_000)
+                .all(|item| item.value.starts_with("1000-"))
         );
+    }
+
+    #[test]
+    fn evidence_snapshots_replace_passive_advertisements_during_one_paused_round() {
+        let mut manager = passive_manager();
+        manager.states.get_mut("en0").unwrap().targets = vec!["192.0.2.0/24".parse().unwrap()];
+        manager.observe_scan_event(ScanEvent::RoundStarted { round: 1 });
+        let mut delayed = None;
+        let mut evidence_count = 0;
+        for sequence in 1..=1_000 {
+            let advertisement = discovery::l2::L2Advertisement::Lldp(discovery::lldp::LldpInfo {
+                source_mac: "02:00:00:00:00:01".into(),
+                chassis_id: Some("02:00:00:00:00:01".into()),
+                chassis_id_subtype: Some("mac-address".into()),
+                chassis_mac: Some("02:00:00:00:00:01".into()),
+                port_id: Some("port1".into()),
+                port_id_subtype: Some("interface-name".into()),
+                ttl: Some(120),
+                port_description: None,
+                system_name: Some(format!("peer-{sequence}")),
+                system_description: Some(format!("ExampleOS {sequence}")),
+                system_capabilities: vec!["bridge".into(), "router".into()],
+                enabled_capabilities: vec!["bridge".into()],
+                management_addresses: vec![
+                    "192.0.2.10".parse().unwrap(),
+                    "192.0.2.11".parse().unwrap(),
+                ],
+            });
+            manager.apply_passive_update(ContinuousPassiveUpdate::Observation {
+                interface: "en0".into(),
+                observation: Box::new(PassiveObservation::from_advertisement(advertisement)),
+            });
+            let state = &manager.states["en0"];
+            assert_eq!(state.pending_observations.len(), 1);
+            for device in state.devices.values() {
+                if sequence == 1 {
+                    evidence_count = device.evidence.len();
+                    delayed = Some(device.clone());
+                }
+                assert_eq!(device.evidence.len(), evidence_count);
+                assert_eq!(device.names.len(), 1);
+                assert_eq!(
+                    device.hostname.as_deref(),
+                    Some(format!("peer-{sequence}").as_str())
+                );
+                assert_eq!(
+                    device.os.as_ref().unwrap().value,
+                    format!("ExampleOS {sequence}")
+                );
+                assert_eq!(
+                    device
+                        .evidence
+                        .iter()
+                        .filter(|item| item.key == "management_address")
+                        .count(),
+                    2
+                );
+            }
+        }
+        let delayed = delayed.unwrap();
+        let ip = delayed.ip;
+        manager.observe_scan_event(ScanEvent::DeviceUpdated(Box::new(delayed)));
+        let device = &manager.states["en0"].devices[&ip];
+        assert_eq!(device.hostname.as_deref(), Some("peer-1000"));
+        assert_eq!(device.os.as_ref().unwrap().value, "ExampleOS 1000");
     }
 
     #[tokio::test]

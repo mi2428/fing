@@ -769,12 +769,14 @@ mod tests {
             app.apply(ScanEvent::RoundStarted { round });
             for port in [80, 443] {
                 let mut device = Device::new(ip, Utc::now());
-                device.add_evidence(
-                    "http",
-                    "http_header_x_request_id",
-                    format!("{round}-{port}"),
-                    0.75,
-                );
+                device.observe("http", port.to_string(), |snapshot| {
+                    snapshot.add_evidence(
+                        "http",
+                        &format!("http_header_x_key_{round}"),
+                        format!("{round}-{port}"),
+                        0.75,
+                    );
+                });
                 app.apply(ScanEvent::DeviceUpdated(Box::new(device)));
             }
             let stored = app.devices.values().next().unwrap();
@@ -790,11 +792,14 @@ mod tests {
         let retained = app.devices.values().next().unwrap().clone();
         app.apply(ScanEvent::DeviceUpdated(Box::new(retained)));
         let mut fresh = Device::new(ip, Utc::now());
-        fresh.add_evidence("http", "http_header_x_request_id", "fresh", 0.75);
+        fresh.observe("http", "80".into(), |snapshot| {
+            snapshot.add_evidence("http", "http_header_x_request_id", "fresh", 0.75)
+        });
         app.apply(ScanEvent::DeviceUpdated(Box::new(fresh)));
         let stored = app.devices.values().next().unwrap();
-        assert_eq!(stored.evidence.len(), 1);
-        assert_eq!(stored.evidence[0].value, "fresh");
+        assert_eq!(stored.evidence.len(), 2); // nonresponding endpoint 443 remains useful
+        assert!(stored.evidence.iter().any(|item| item.value == "fresh"));
+        assert!(stored.evidence.iter().any(|item| item.value == "1000-443"));
     }
 
     #[test]

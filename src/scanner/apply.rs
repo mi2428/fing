@@ -18,6 +18,12 @@ use std::{
 };
 
 pub(super) fn apply_mdns_info(device: &mut Device, mdns: enrich::MdnsInfo) {
+    device.observe("mdns", String::new(), |device| {
+        apply_mdns_snapshot(device, mdns)
+    });
+}
+
+fn apply_mdns_snapshot(device: &mut Device, mdns: enrich::MdnsInfo) {
     // mDNS is usually name-rich and often model-rich. Store the raw model as
     // evidence before promoting it so identity rules can still inspect it even
     // if another source later wins the best-guess slot.
@@ -38,6 +44,12 @@ pub(super) fn apply_mdns_info(device: &mut Device, mdns: enrich::MdnsInfo) {
 }
 
 pub(super) fn apply_upnp_info(device: &mut Device, info: upnp::UpnpInfo) {
+    device.observe("upnp", String::new(), |device| {
+        apply_upnp_snapshot(device, info)
+    });
+}
+
+fn apply_upnp_snapshot(device: &mut Device, info: upnp::UpnpInfo) {
     // UPnP descriptions provide both human labels and structured device types.
     // Keep the raw URN in evidence and expose the friendly type as the guess.
     for name in info.names {
@@ -81,70 +93,96 @@ pub(super) fn apply_deep_probes(
 ) {
     for probe in probes {
         if options.includes_deep_service(&probe.service) {
-            // An open port is weak identity by itself, but it is still useful as
-            // a service signal and as input to built-in identity rules.
-            device.add_service(probe.service.clone(), "deep", Some(probe.port), 0.7);
-            if let Some((device_type, confidence)) = deep::device_type_hint_from_port(probe.port) {
-                device.set_device_type_guess(device_type, "deep", confidence);
-            }
-            if probe.port == 445 || probe.port == 139 {
-                device.set_os_guess("Windows/SMB capable", "deep", 0.45);
-            }
-            if let Some(banner) = &probe.banner {
-                device.add_evidence(
-                    "deep",
-                    &format!("{}_banner", probe.service),
-                    banner.clone(),
-                    0.75,
-                );
-                if let Some(server) = deep::http_server_from_banner(banner) {
-                    device.add_evidence("deep", "http_server", server, 0.7);
+            device.observe("deep", probe.port.to_string(), |device| {
+                // An open port is weak identity by itself, but it is still useful as
+                // a service signal and as input to built-in identity rules.
+                device.add_service(probe.service.clone(), "deep", Some(probe.port), 0.7);
+                if let Some((device_type, confidence)) =
+                    deep::device_type_hint_from_port(probe.port)
+                {
+                    device.set_device_type_guess(device_type, "deep", confidence);
                 }
-                if let Some((os, confidence)) = deep::os_hint_from_banner(&probe.service, banner) {
-                    device.set_os_guess(os, "deep", confidence);
+                if probe.port == 445 || probe.port == 139 {
+                    device.set_os_guess("Windows/SMB capable", "deep", 0.45);
                 }
-            }
-        }
-
-        if options.http {
-            // HTTP headers get their own source because they often outlive the
-            // generic TCP probe in exports and rule matching.
-            for header in probe.http_headers {
-                let key = deep::header_evidence_key(&header.name);
-                device.add_evidence("http", &key, header.value.clone(), 0.75);
-                if header.name == "server" {
-                    device.add_evidence("http", "http_server", header.value.clone(), 0.75);
-                    if let Some((os, confidence)) = deep::os_hint_from_banner("http", &header.value)
+                if let Some(banner) = &probe.banner {
+                    device.add_evidence(
+                        "deep",
+                        &format!("{}_banner", probe.service),
+                        banner.clone(),
+                        0.75,
+                    );
+                    if let Some(server) = deep::http_server_from_banner(banner) {
+                        device.add_evidence("deep", "http_server", server, 0.7);
+                    }
+                    if let Some((os, confidence)) =
+                        deep::os_hint_from_banner(&probe.service, banner)
                     {
-                        device.set_os_guess(os, "http", confidence);
+                        device.set_os_guess(os, "deep", confidence);
                     }
                 }
-            }
-            if let Some(favicon) = probe.favicon {
-                device.add_evidence("http", "favicon_sha256", favicon.sha256, 0.72);
-                device.add_evidence("http", "favicon_url", favicon.url, 0.55);
-                device.add_evidence("http", "favicon_bytes", favicon.bytes.to_string(), 0.5);
-            }
+            });
+        }
+
+        if options.http && (!probe.http_headers.is_empty() || probe.favicon.is_some()) {
+            device.observe("http", probe.port.to_string(), |device| {
+                // HTTP headers get their own source because they often outlive the
+                // generic TCP probe in exports and rule matching.
+                for header in probe.http_headers {
+                    let key = deep::header_evidence_key(&header.name);
+                    device.add_evidence("http", &key, header.value.clone(), 0.75);
+                    if header.name == "server" {
+                        device.add_evidence("http", "http_server", header.value.clone(), 0.75);
+                        if let Some((os, confidence)) =
+                            deep::os_hint_from_banner("http", &header.value)
+                        {
+                            device.set_os_guess(os, "http", confidence);
+                        }
+                    }
+                }
+                if let Some(favicon) = probe.favicon {
+                    device.add_evidence("http", "favicon_sha256", favicon.sha256, 0.72);
+                    device.add_evidence("http", "favicon_url", favicon.url, 0.55);
+                    device.add_evidence("http", "favicon_bytes", favicon.bytes.to_string(), 0.5);
+                }
+            });
         }
 
         if options.tls
             && let Some(tls) = probe.tls
         {
-            device.add_evidence("tls", "tls_cert_sha256", tls.sha256, 0.72);
-            if let Some(subject) = tls.subject {
-                device.add_evidence("tls", "tls_subject", subject, 0.7);
-            }
-            if let Some(issuer) = tls.issuer {
-                device.add_evidence("tls", "tls_issuer", issuer, 0.65);
-            }
-            if let Some(not_after) = tls.not_after {
-                device.add_evidence("tls", "tls_not_after", not_after, 0.55);
-            }
+            device.observe("tls", probe.port.to_string(), |device| {
+                device.add_evidence("tls", "tls_cert_sha256", tls.sha256, 0.72);
+                if let Some(subject) = tls.subject {
+                    device.add_evidence("tls", "tls_subject", subject, 0.7);
+                }
+                if let Some(issuer) = tls.issuer {
+                    device.add_evidence("tls", "tls_issuer", issuer, 0.65);
+                }
+                if let Some(not_after) = tls.not_after {
+                    device.add_evidence("tls", "tls_not_after", not_after, 0.55);
+                }
+            });
         }
     }
 }
 
 pub(super) fn apply_dhcp_lease(
+    device: &mut Device,
+    lease: dhcp::DhcpLease,
+    oui_db: Option<&HashMap<String, String>>,
+) {
+    let scope = lease
+        .source
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    device.observe("dhcp", scope, |device| {
+        apply_dhcp_snapshot(device, lease, oui_db)
+    });
+}
+
+fn apply_dhcp_snapshot(
     device: &mut Device,
     lease: dhcp::DhcpLease,
     oui_db: Option<&HashMap<String, String>>,
@@ -179,6 +217,12 @@ pub(super) fn apply_dhcp_lease(
 }
 
 pub(super) fn apply_snmp_info(device: &mut Device, info: snmp::SnmpInfo) {
+    device.observe("snmp", String::new(), |device| {
+        apply_snmp_snapshot(device, info)
+    });
+}
+
+fn apply_snmp_snapshot(device: &mut Device, info: snmp::SnmpInfo) {
     // SNMP system group fields are high-signal for routers, switches, printers,
     // and NAS devices. Preserve every field so site-specific rules can refine
     // classification later.
@@ -209,6 +253,26 @@ pub(super) fn apply_snmp_info(device: &mut Device, info: snmp::SnmpInfo) {
 }
 
 pub(super) fn apply_lldp_info(
+    device: &mut Device,
+    info: lldp::LldpInfo,
+    oui_db: Option<&HashMap<String, String>>,
+) {
+    let scope = lldp_observation_scope(&info);
+    device.observe("lldp", scope, |device| {
+        apply_lldp_snapshot(device, info, oui_db)
+    });
+}
+
+pub(super) fn lldp_observation_scope(info: &lldp::LldpInfo) -> String {
+    format!(
+        "{}|{}|{}",
+        info.source_mac,
+        info.port_id_subtype.as_deref().unwrap_or(""),
+        info.port_id.as_deref().unwrap_or("")
+    )
+}
+
+fn apply_lldp_snapshot(
     device: &mut Device,
     info: lldp::LldpInfo,
     oui_db: Option<&HashMap<String, String>>,
@@ -296,6 +360,25 @@ pub(super) fn apply_cdp_info(
     info: cdp::CdpInfo,
     oui_db: Option<&HashMap<String, String>>,
 ) {
+    let scope = cdp_observation_scope(&info);
+    device.observe("cdp", scope, |device| {
+        apply_cdp_snapshot(device, info, oui_db)
+    });
+}
+
+pub(super) fn cdp_observation_scope(info: &cdp::CdpInfo) -> String {
+    format!(
+        "{}|{}",
+        info.source_mac,
+        info.port_id.as_deref().unwrap_or("")
+    )
+}
+
+fn apply_cdp_snapshot(
+    device: &mut Device,
+    info: cdp::CdpInfo,
+    oui_db: Option<&HashMap<String, String>>,
+) {
     device.add_service("cdp", "cdp", None, 0.72);
     if device.mac.is_none() {
         device.mac = Some(info.source_mac.clone());
@@ -365,6 +448,12 @@ pub(super) fn apply_cdp_info(
 }
 
 pub(super) fn apply_smb_info(device: &mut Device, info: smb::SmbInfo) {
+    device.observe("smb", String::new(), |device| {
+        apply_smb_snapshot(device, info)
+    });
+}
+
+fn apply_smb_snapshot(device: &mut Device, info: smb::SmbInfo) {
     // SMB negotiate/session-setup data is intentionally shallow: it identifies
     // the server stack and host names without authenticating or enumerating
     // shares.
@@ -443,16 +532,7 @@ fn merge_device(existing: &mut Device, mut incoming: Device) {
     if existing.vendor.is_none() {
         existing.vendor = incoming.vendor.take();
     }
-    existing.merge_identity_snapshot(&mut incoming);
-    for service in incoming.services {
-        existing.add_service(
-            service.name,
-            &service.source,
-            service.port,
-            service.confidence,
-        );
-    }
-    existing.merge_evidence_snapshot(incoming.evidence);
+    existing.merge_observation_snapshot(&mut incoming);
     existing.observation_round = existing.observation_round.max(incoming.observation_round);
     existing.first_seen = existing.first_seen.min(incoming.first_seen);
     existing.last_seen = existing.last_seen.max(incoming.last_seen);
@@ -463,6 +543,63 @@ mod tests {
     use super::*;
     use crate::enrich::MdnsService;
     use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn evidence_snapshots_replace_http_endpoint_keys_and_keep_current_multi_values() {
+        let mut device = device();
+        let options = deep::ProbeOptions {
+            http: true,
+            ..Default::default()
+        };
+        for sequence in 1..=1_000 {
+            for port in [80, 443] {
+                apply_deep_probes(
+                    &mut device,
+                    vec![deep::PortProbe {
+                        port,
+                        service: "http".into(),
+                        banner: None,
+                        http_headers: vec![
+                            deep::HttpHeader {
+                                name: format!("x-key-{sequence}"),
+                                value: format!("{port}-a"),
+                            },
+                            deep::HttpHeader {
+                                name: format!("x-key-{sequence}"),
+                                value: format!("{port}-b"),
+                            },
+                            deep::HttpHeader {
+                                name: "x-common".into(),
+                                value: "shared".into(),
+                            },
+                        ],
+                        favicon: None,
+                        tls: None,
+                    }],
+                    options,
+                );
+            }
+            assert_eq!(device.evidence.len(), 5);
+            assert_eq!(
+                device
+                    .evidence
+                    .iter()
+                    .filter(|item| item.key == format!("http_header_x_key_{sequence}"))
+                    .count(),
+                4
+            );
+        }
+        let blank = deep::PortProbe {
+            port: 80,
+            service: "http".into(),
+            banner: None,
+            http_headers: Vec::new(),
+            favicon: None,
+            tls: None,
+        };
+        apply_deep_probes(&mut device, vec![blank], options);
+        assert_eq!(device.evidence.len(), 5); // no HTTP observation: retain useful prior snapshot
+    }
 
     #[test]
     fn identity_snapshots_refresh_in_final_merge_and_replace_reused_mac() {
